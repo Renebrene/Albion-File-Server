@@ -2,11 +2,32 @@
 venv/
 __pycache__/
 *.pyc
+*.pyo
 
-# Данные (не коммитим)
-*.json
+# Данные приложения (НЕ коммитим)
+files_db.json
+folders_db.json
+stats.json
+auth.json
+
+# Загруженные файлы
 uploads/
+
+# Логи
+*.log
 
 # OS файлы
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Временные файлы
+*.tmp
+*.bak
+*.backup

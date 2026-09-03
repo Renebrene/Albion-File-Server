@@ -1,0 +1,11 @@
+User-agent: *
+Disallow: /
+Disallow: /uploads/
+Disallow: /f/
+Disallow: /v/
+Disallow: /d/
+Disallow: /api/
+Disallow: /export_xlsx
+
+# Разрешаем только главную страницу
+Allow: /$

@@ -1,6 +1,7 @@
 import os
 import io
 import json
+from functools import wraps
 import uuid
 import re
 import shutil
@@ -11,8 +12,22 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from waitress import serve
+from flask import session, redirect, url_for, request
+from werkzeug.security import check_password_hash, generate_password_hash
+import secrets
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 app = Flask(__name__, static_folder='static')
+app.secret_key = secrets.token_hex(32)
+
+# ===== RATE LIMITING =====
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=["100 per hour", "20 per minute"],
+    storage_uri="memory://"
+)
 
 # ===== КОНФИГУРАЦИЯ =====
 BASE_URL = "https://albion-rostov.cloudpub.ru"
@@ -543,7 +558,7 @@ HTML_TEMPLATE = """
                                     <td class="size-col">{{ f.size }}</td>
                                     <td class="date-col">{{ f.mtime }}</td>
                                     <td class="type-col">{{ f.ext }}</td>
-                                    <td class="dl-col"><span class="dl-badge">⬇ {{ f.download_count }}</span></td>
+                                    <td class="dl-col"><span class="dl-badge">⬇ {{ f.download_count }} | 👁 {{ f.view_count }}</span></td>
                                     <td class="actions-cell">
                                         {% if current_folder %}
                                         <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить на уровень выше">⬆️</button>
@@ -1112,13 +1127,72 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# ===== МАРШРУТЫ =====
+
+# ===== АУТЕНТИФИКАЦИЯ =====
+AUTH_FILE = 'auth.json'
+
+def get_auth():
+    if os.path.exists(AUTH_FILE):
+        with open(AUTH_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    # Дефолтные данные, если файл не создан (пользователь должен запустить change_password.py)
+    return {"username": "admin", "password_hash": generate_password_hash("admin")}
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('logged_in'):
+            return redirect(url_for('login', next=request.url))
+        return f(*args, **kwargs)
+    return decorated_function
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        auth = get_auth()
+        if request.form['username'] == auth['username'] and check_password_hash(auth['password_hash'], request.form['password']):
+            session['logged_in'] = True
+            next_page = request.args.get('next', '/f/')
+            return redirect(next_page)
+        return '''<!DOCTYPE html><html><head><title>Вход - АЛЬБИОН</title>
+        <style>body{font-family:'Segoe UI',Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f9;margin:0}
+        .box{background:white;padding:40px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.1);width:320px;text-align:center}
+        h2{color:#1e3a8a;margin-top:0}input{width:100%;padding:12px;margin:10px 0;border:1px solid #cbd5e1;border-radius:6px;font-size:14px;box-sizing:border-box}
+        button{width:100%;padding:12px;background:#2563eb;color:white;border:none;border-radius:6px;cursor:pointer;font-size:15px;font-weight:600;margin-top:10px}
+        button:hover{background:#1e3a8a}.error{color:#dc3545;font-size:14px;margin-bottom:10px}</style></head><body>
+        <div class="box"><h2>🔒 АЛЬБИОН: Вход</h2>
+        <p class="error">Неверный логин или пароль</p>
+        <form method="post"><input name="username" placeholder="Логин" required>
+        <input type="password" name="password" placeholder="Пароль" required>
+        <button type="submit">Войти</button></form></div></body></html>'''
+    
+    # Если уже залогинен, редирект
+    if session.get('logged_in'):
+        return redirect('/f/')
+        
+    return '''<!DOCTYPE html><html><head><title>Вход - АЛЬБИОН</title>
+    <style>body{font-family:'Segoe UI',Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f9;margin:0}
+    .box{background:white;padding:40px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.1);width:320px;text-align:center}
+    h2{color:#1e3a8a;margin-top:0}input{width:100%;padding:12px;margin:10px 0;border:1px solid #cbd5e1;border-radius:6px;font-size:14px;box-sizing:border-box}
+    button{width:100%;padding:12px;background:#2563eb;color:white;border:none;border-radius:6px;cursor:pointer;font-size:15px;font-weight:600;margin-top:10px}
+    button:hover{background:#1e3a8a}</style></head><body>
+    <div class="box"><h2>🔒 АЛЬБИОН: Вход</h2>
+    <form method="post"><input name="username" placeholder="Логин" required>
+    <input type="password" name="password" placeholder="Пароль" required>
+    <button type="submit">Войти</button></form></div></body></html>'''
+
+@app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect('/login')
+
 @app.route('/')
 def index():
     return redirect('/f/')
 
 @app.route('/f/')
 @app.route('/f/<folder_id>')
+@login_required
 def browse_folder(folder_id=None):
     folders = load_folders()
     
@@ -1160,6 +1234,7 @@ def browse_folder(folder_id=None):
         disk=disk)
 
 @app.route('/upload', methods=['POST'])
+@login_required
 def upload_file():
     if 'files' not in request.files and 'file_0' not in request.files:
         return jsonify({'error': 'Нет файлов'}), 400
@@ -1246,6 +1321,7 @@ def upload_file():
     return jsonify({'count': saved_count})
 
 @app.route('/upload_folder', methods=['POST'])
+@login_required
 def upload_folder():
     folder_id = request.form.get('folder_id') or None
     folders = load_folders()
@@ -1361,6 +1437,7 @@ def upload_folder():
     return jsonify({'count': saved_count, 'folders_created': len(created_folders)})
 
 @app.route('/v/<path:filepath>')
+@limiter.limit("200 per minute")
 def view_file(filepath):
     try:
         filepath = urllib.parse.unquote(filepath)
@@ -1370,13 +1447,14 @@ def view_file(filepath):
     db = load_db()
     for internal_id, record in db.items():
         if record.get('physical_path') == filepath:
-            record['download_count'] = record.get('download_count', 0) + 1
+            record['view_count'] = record.get('view_count', 0) + 1
             save_db(db)
             return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=False)
     
     return "Файл не найден", 404
 
 @app.route('/api/update_file', methods=['POST'])
+@login_required
 def update_file():
     data = request.json
     internal_id = data.get('internal_id')
@@ -1443,6 +1521,7 @@ def update_file():
     return jsonify({'success': True})
 
 @app.route('/api/move_file', methods=['POST'])
+@login_required
 def move_file():
     data = request.json
     file_id = data.get('file_id')
@@ -1507,6 +1586,7 @@ def move_file():
     return jsonify({'success': True})
 
 @app.route('/api/move_files_batch', methods=['POST'])
+@login_required
 def move_files_batch():
     data = request.json
     file_ids = data.get('file_ids', [])
@@ -1576,6 +1656,7 @@ def move_files_batch():
     return jsonify({'success': True, 'count': moved_count})
 
 @app.route('/api/delete_files_batch', methods=['POST'])
+@login_required
 def delete_files_batch():
     data = request.json
     file_ids = data.get('file_ids', [])
@@ -1606,6 +1687,7 @@ def delete_files_batch():
     return jsonify({'success': True, 'count': deleted_count})
 
 @app.route('/api/create_folder', methods=['POST'])
+@login_required
 def create_folder():
     data = request.json
     name = data.get('name', '').strip()
@@ -1637,6 +1719,7 @@ def create_folder():
     return jsonify({'success': True, 'folder_id': folder_id})
 
 @app.route('/api/delete_folder', methods=['POST'])
+@login_required
 def delete_folder():
     data = request.json
     folder_id = data.get('folder_id')
@@ -1675,6 +1758,7 @@ def delete_folder():
     return jsonify({'success': True})
 
 @app.route('/api/delete_file', methods=['POST'])
+@login_required
 def delete_file():
     data = request.json
     internal_id = data.get('internal_id')
@@ -1698,6 +1782,7 @@ def delete_file():
     return jsonify({'success': True})
 
 @app.route('/api/get_all_folders')
+@login_required
 def get_all_folders():
     folders = load_folders()
     result = []
@@ -1719,6 +1804,7 @@ def get_all_folders():
     return jsonify(result)
 
 @app.route('/export_xlsx')
+@login_required
 def export_xlsx():
     """Экспорт в XLSX: папка, физическое имя и ссылка (с кириллицей)"""
     wb = Workbook()
@@ -1773,6 +1859,7 @@ def export_xlsx():
 
 
 @app.route('/<path:filepath>')
+@limiter.limit("30 per minute")
 def direct_file_access(filepath):
     if filepath.startswith('static/') or filepath.startswith('f/') or filepath in [
         'export_xlsx', 'upload', 'upload_folder', 'favicon.ico'
@@ -1792,6 +1879,10 @@ def direct_file_access(filepath):
             return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=True, download_name=record['current_filename'])
 
     return "Файл не найден", 404
+
+@app.route('/robots.txt')
+def robots():
+    return send_from_directory('static', 'robots.txt', mimetype='text/plain')
 
 if __name__ == '__main__':
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
