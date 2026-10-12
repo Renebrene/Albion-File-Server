@@ -15,11 +15,34 @@ from waitress import serve
 from flask import session, redirect, url_for, request
 from werkzeug.security import check_password_hash, generate_password_hash
 import secrets
+import threading
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 app = Flask(__name__, static_folder='static')
-app.secret_key = secrets.token_hex(32)
+
+# ===== СЕКРЕТНЫЙ КЛЮЧ (сохраняется между перезапусками, сессии не слетают) =====
+SECRET_KEY_FILE = '.secret_key'
+
+def _get_or_create_secret_key():
+    if os.path.exists(SECRET_KEY_FILE):
+        try:
+            with open(SECRET_KEY_FILE, 'r', encoding='utf-8') as f:
+                key = f.read().strip()
+                if key:
+                    return key
+        except OSError:
+            pass
+    key = secrets.token_hex(32)
+    with open(SECRET_KEY_FILE, 'w', encoding='utf-8') as f:
+        f.write(key)
+    return key
+
+app.secret_key = _get_or_create_secret_key()
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
+# ===== БЛОКИРОВКА JSON-БД (защита от гонок при многопоточности waitress) =====
+DB_LOCK = threading.Lock()
 
 # ===== RATE LIMITING =====
 limiter = Limiter(
@@ -56,36 +79,51 @@ def is_valid_filename(filename):
 def is_valid_foldername(name):
     if not name or len(name) > 100:
         return False
+    # Защита от path traversal: '..' и '.' не могут быть именем папки
+    if name.strip() in ('.', '..'):
+        return False
     pattern = r'^[\wа-яА-ЯёЁ\s\-\.\(\)]+$'
     return bool(re.match(pattern, name, re.UNICODE))
 
 # ===== БАЗА ДАННЫХ ФАЙЛОВ =====
-def load_db():
-    if os.path.exists(DB_FILE):
+def _load_json(path):
+    """Загрузка JSON. Повреждённый файл переносится в .corrupt-бэкап,
+    чтобы пустая база не затёрла данные при следующем сохранении."""
+    if os.path.exists(path):
         try:
-            with open(DB_FILE, 'r', encoding='utf-8') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except:
-            return {}
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            backup = f"{path}.corrupt-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            try:
+                os.replace(path, backup)
+                print(f"⚠️ {path} повреждён ({e}). Сохранён как {backup}.")
+            except OSError:
+                print(f"⚠️ {path} повреждён ({e}), бэкап создать не удалось.")
     return {}
 
+def _save_json(path, data):
+    """Атомарная запись: сначала во временный файл, затем замена.
+    При сбое питания/процесса старый файл не теряется."""
+    tmp = f"{path}.tmp"
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+def load_db():
+    return _load_json(DB_FILE)
+
 def save_db(db):
-    with open(DB_FILE, 'w', encoding='utf-8') as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
+    with DB_LOCK:
+        _save_json(DB_FILE, db)
 
 # ===== БАЗА ДАННЫХ ПАПОК =====
 def load_folders():
-    if os.path.exists(FOLDERS_DB_FILE):
-        try:
-            with open(FOLDERS_DB_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
+    return _load_json(FOLDERS_DB_FILE)
 
 def save_folders(folders):
-    with open(FOLDERS_DB_FILE, 'w', encoding='utf-8') as f:
-        json.dump(folders, f, ensure_ascii=False, indent=2)
+    with DB_LOCK:
+        _save_json(FOLDERS_DB_FILE, folders)
 
 def get_folder_path(folder_id, folders):
     if not folder_id or folder_id not in folders:
@@ -153,17 +191,32 @@ migrate_files()
 
 # ===== СТАТИСТИКА =====
 def load_stats():
-    if os.path.exists(STATS_FILE):
-        try:
-            with open(STATS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            pass
-    return {'last_upload': None, 'last_export': None}
+    stats = _load_json(STATS_FILE)
+    if not isinstance(stats, dict):
+        return {'last_upload': None, 'last_export': None}
+    stats.setdefault('last_upload', None)
+    stats.setdefault('last_export', None)
+    return stats
 
 def save_stats(stats):
-    with open(STATS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
+    with DB_LOCK:
+        _save_json(STATS_FILE, stats)
+
+def bump_counter(match_fn, counter_field):
+    """Атомарно увеличивает счётчик у записи БД (под блокировкой).
+    Возвращает запись или None, если совпадений нет."""
+    with DB_LOCK:
+        db = _load_json(DB_FILE)
+        target = None
+        for record in db.values():
+            if match_fn(record):
+                target = record
+                break
+        if target is None:
+            return None
+        target[counter_field] = target.get(counter_field, 0) + 1
+        _save_json(DB_FILE, db)
+        return target
 
 def update_last_upload():
     stats = load_stats()
@@ -225,6 +278,7 @@ def get_files_in_folder(folder_id):
                     'custom_alias': record['custom_alias'],
                     'link_rotated': record.get('link_rotated', False),
                     'download_count': record.get('download_count', 0),
+                    'view_count': record.get('view_count', 0),
                     'folder_id': folder_id,
                     # Ссылки с нормальной кириллицей (без URL-кодирования)
                     'download_url': f"{BASE_URL}/{physical_path}",
@@ -599,7 +653,7 @@ HTML_TEMPLATE = """
                                 </div>
                                 {% if f.is_image %}
                                     <a href="{{ f.view_url }}" target="_blank" class="tile-preview-wrap">
-                                        <img src="{{ f.download_url }}" class="tile-preview" alt="">
+                                        <img src="{{ f.view_url }}" class="tile-preview" alt="">
                                     </a>
                                 {% else %}
                                     <a href="{{ f.download_url }}" class="tile-icon-wrap">
@@ -634,7 +688,7 @@ HTML_TEMPLATE = """
                             <div class="list-item" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
                                 <input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" onchange="updateSelection()">
                                 {% if f.is_image %}
-                                    <img src="{{ f.download_url }}" class="thumb-xs" alt="">
+                                    <img src="{{ f.view_url }}" class="thumb-xs" alt="">
                                 {% else %}
                                     <span class="emoji-icon-sm">{{ f.icon }}</span>
                                 {% endif %}
@@ -1150,9 +1204,12 @@ def login_required(f):
 def login():
     if request.method == 'POST':
         auth = get_auth()
-        if request.form['username'] == auth['username'] and check_password_hash(auth['password_hash'], request.form['password']):
+        if request.form.get('username') == auth['username'] and check_password_hash(auth['password_hash'], request.form.get('password', '')):
             session['logged_in'] = True
             next_page = request.args.get('next', '/f/')
+            # Защита от open redirect: только относительные пути внутри сайта
+            if not next_page.startswith('/') or next_page.startswith('//'):
+                next_page = '/f/'
             return redirect(next_page)
         return '''<!DOCTYPE html><html><head><title>Вход - АЛЬБИОН</title>
         <style>body{font-family:'Segoe UI',Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f9;margin:0}
@@ -1246,7 +1303,10 @@ def upload_file():
         return jsonify({'error': 'Папка не найдена'}), 404
     
     files = []
-    count = int(request.form.get('count', 0))
+    try:
+        count = int(request.form.get('count', 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Некорректное значение count'}), 400
     for i in range(count):
         file = request.files.get(f'file_{i}')
         if file and file.filename:
@@ -1329,7 +1389,10 @@ def upload_folder():
     if folder_id and folder_id not in folders:
         return jsonify({'error': 'Папка не найдена'}), 404
 
-    count = int(request.form.get('count', 0))
+    try:
+        count = int(request.form.get('count', 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Некорректное значение count'}), 400
     if count == 0:
         return jsonify({'error': 'Нет файлов'}), 400
 
@@ -1354,13 +1417,15 @@ def upload_folder():
         
         if not folder_parts:
             continue
-        
+
+        # Защита от path traversal: '..' и '.' в пути папки запрещают загрузку файла
+        if any(not is_valid_foldername(p) for p in folder_parts):
+            continue
+
         current_parent = folder_id
         current_physical = get_folder_physical_path(folder_id, folders)
-        
+
         for folder_name in folder_parts:
-            if not is_valid_foldername(folder_name):
-                continue
             
             found = None
             for fid, f in folders.items():
@@ -1393,7 +1458,9 @@ def upload_folder():
         for record in db.values():
             if record.get('folder_id') == current_parent:
                 existing_names.add(record['current_filename'])
-        
+        if os.path.isdir(current_physical):
+            existing_names.update(os.listdir(current_physical))
+
         current_filename = filename
         if is_valid_filename(filename):
             if current_filename in existing_names:
@@ -1409,7 +1476,12 @@ def upload_folder():
         
         physical_path = os.path.relpath(os.path.join(current_physical, current_filename), UPLOAD_FOLDER)
         save_path = os.path.join(UPLOAD_FOLDER, physical_path)
-        
+
+        # Страховка от выхода за пределы uploads
+        upload_root = os.path.realpath(UPLOAD_FOLDER)
+        if not os.path.realpath(save_path).startswith(upload_root + os.sep):
+            continue
+
         file.save(save_path)
         
         db[internal_id] = {
@@ -1443,15 +1515,16 @@ def view_file(filepath):
         filepath = urllib.parse.unquote(filepath)
     except:
         pass
-    
-    db = load_db()
-    for internal_id, record in db.items():
-        if record.get('physical_path') == filepath:
-            record['view_count'] = record.get('view_count', 0) + 1
-            save_db(db)
-            return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=False)
-    
-    return "Файл не найден", 404
+
+    # Счётчик растёт только для реальных файлов в БД
+    full_path = os.path.join(UPLOAD_FOLDER, filepath)
+    if not os.path.isfile(full_path):
+        return "Файл не найден", 404
+
+    if bump_counter(lambda r: r.get('physical_path') == filepath, 'view_count') is None:
+        return "Файл не найден", 404
+
+    return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=False)
 
 @app.route('/api/update_file', methods=['POST'])
 @login_required
@@ -1477,6 +1550,12 @@ def update_file():
 
     if not is_valid_filename(physical_filename):
         return jsonify({'error': 'Недопустимые символы'}), 400
+
+    # Дубли имён проверяем и по БД, а не только по диску
+    for fid, other in db.items():
+        if fid != internal_id and other.get('folder_id') == new_folder_id \
+                and other.get('current_filename') == physical_filename:
+            return jsonify({'error': 'Файл с таким именем уже есть в этой папке'}), 400
 
     new_folder_physical = get_folder_physical_path(new_folder_id, folders)
     os.makedirs(new_folder_physical, exist_ok=True)
@@ -1512,6 +1591,10 @@ def update_file():
     if custom_alias:
         if not re.match(r'^[a-zA-Z0-9_-]+$', custom_alias):
             return jsonify({'error': 'Алиас: только латиница, цифры, дефис'}), 400
+        # Алиас не может маскироваться под системный маршрут
+        if custom_alias.lower() in {'login', 'logout', 'export_xlsx', 'upload', 'upload_folder',
+                                    'robots.txt', 'favicon.ico', 'v', 'f', 'static', 'api'}:
+            return jsonify({'error': 'Этот алиас зарезервирован системой'}), 400
         for fid, rec in db.items():
             if fid != internal_id and rec.get('custom_alias') == custom_alias:
                 return jsonify({'error': 'Алиас уже занят'}), 400
@@ -1871,14 +1954,27 @@ def direct_file_access(filepath):
     except:
         pass
 
-    db = load_db()
-    for internal_id, record in db.items():
-        if record.get('physical_path') == filepath:
-            record['download_count'] = record.get('download_count', 0) + 1
-            save_db(db)
-            return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=True, download_name=record['current_filename'])
+    full_path = os.path.join(UPLOAD_FOLDER, filepath)
+    record = None
 
-    return "Файл не найден", 404
+    # 1) Прямая ссылка по физическому пути (счётчик растёт только для реальных файлов)
+    if os.path.isfile(full_path):
+        record = bump_counter(lambda r: r.get('physical_path') == filepath, 'download_count')
+
+    # 2) Индивидуальная ссылка (алиас)
+    if record is None:
+        record = bump_counter(
+            lambda r: r.get('custom_alias') and r.get('custom_alias') == filepath,
+            'download_count')
+        if record is not None:
+            filepath = record.get('physical_path', record['current_filename'])
+            if not os.path.isfile(os.path.join(UPLOAD_FOLDER, filepath)):
+                return "Файл не найден", 404
+
+    if record is None:
+        return "Файл не найден", 404
+
+    return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=True, download_name=record['current_filename'])
 
 @app.route('/robots.txt')
 def robots():

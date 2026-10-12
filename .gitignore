@@ -9,6 +9,12 @@ files_db.json
 folders_db.json
 stats.json
 auth.json
+.secret_key
+*.tmp
+*.corrupt-*
+
+# Экспорты чатов (содержат JWT в метаданных)
+chat-export-*.json
 
 # Загруженные файлы
 uploads/
