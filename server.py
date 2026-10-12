@@ -16,6 +16,8 @@ from flask import session, redirect, url_for, request
 from werkzeug.security import check_password_hash, generate_password_hash
 import secrets
 import threading
+import logging
+from logging.handlers import RotatingFileHandler
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
@@ -41,16 +43,56 @@ def _get_or_create_secret_key():
 app.secret_key = _get_or_create_secret_key()
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
+# ===== ЛОГИРОВАНИЕ (файл + консоль/journal) =====
+LOG_FILE = 'albion.log'
+
+_log_file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024,
+                                        backupCount=3, encoding='utf-8')
+_log_file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s %(levelname)s [%(threadName)s] %(message)s'))
+_log_console_handler = logging.StreamHandler()
+_log_console_handler.setFormatter(logging.Formatter(
+    '%(asctime)s %(levelname)s [%(threadName)s] %(message)s'))
+
+app.logger.setLevel(logging.INFO)
+app.logger.addHandler(_log_file_handler)
+app.logger.addHandler(_log_console_handler)
+
 # ===== БЛОКИРОВКА JSON-БД (защита от гонок при многопоточности waitress) =====
 DB_LOCK = threading.Lock()
+# Сериализует read-modify-write всей files_db в upload-эндпоинтах:
+# параллельные батчи иначе затирают записи друг друга (last writer wins)
+UPLOAD_LOCK = threading.Lock()
 
 # ===== RATE LIMITING =====
+# Локальные адреса (LAN/localhost) не лимитируем — лимит нужен против роботов из интернета.
+# Если key_func вернёт None, flask-limiter пропускает запрос без учёта.
+_PRIVATE_RE = re.compile(r'^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1|localhost)')
+
+def _rate_limit_key():
+    addr = get_remote_address()
+    return None if (not addr or _PRIVATE_RE.match(addr)) else addr
+
 limiter = Limiter(
-    key_func=get_remote_address,
+    key_func=_rate_limit_key,
     app=app,
     default_limits=["100 per hour", "20 per minute"],
     storage_uri="memory://"
 )
+
+# ===== ОБРАБОТЧИКИ ОШИБОК =====
+@app.errorhandler(413)
+def request_too_large(e):
+    size = request.content_length or 0
+    app.logger.error('Слишком большой запрос на %s: %s от %s (частей формы: лимит %s)',
+                     request.path, format_size(size), request.remote_addr,
+                     app.config.get('MAX_FORM_PARTS'))
+    return jsonify({'error': f'Запрос слишком большой ({format_size(size)}). Проверьте размер и число файлов в папке'}), 413
+
+@app.errorhandler(500)
+def internal_error(e):
+    app.logger.error('Внутренняя ошибка на %s от %s', request.path, request.remote_addr, exc_info=True)
+    return jsonify({'error': 'Внутренняя ошибка сервера — подробности в albion.log'}), 500
 
 # ===== КОНФИГУРАЦИЯ =====
 BASE_URL = "https://albion-rostov.cloudpub.ru"
@@ -64,26 +106,35 @@ ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar',
 IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024
+# Лимит размера загрузки снят (по запросу владельца) — контроль места в статус-баре и albion.log
+app.config['MAX_CONTENT_LENGTH'] = None
+# Werkzeug по умолчанию допускает всего 1000 частей формы (~500 файлов за раз).
+# Каждый файл в загрузке папки = 2 части (file_N + path_N) — поднимаем лимит.
+app.config['MAX_FORM_PARTS'] = 50000
 
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
 # ===== ПРОВЕРКА ИМЕНИ =====
+# Имя файла: белый список (расширен реальным миром: запятые, '!', '+', '&', '#', '@', ';', '=', '№')
 def is_valid_filename(filename):
     if not filename or len(filename) > 255:
         return False
-    pattern = r'^[\wа-яА-ЯёЁ\s\-\.\(\)]+$'
+    pattern = r'^[\wа-яА-ЯёЁ\s\-\.\(\),!+&#@;=№]+$'
     return bool(re.match(pattern, filename, re.UNICODE))
 
+# Имя папки: чёрный список — как в Windows (запрещены \ / : * ? " < > |, точки/пробелы по краям).
+# Так папки вида "Фото 2024, лето" или "Иванов & Ко" загружаются без ошибок.
 def is_valid_foldername(name):
     if not name or len(name) > 100:
         return False
-    # Защита от path traversal: '..' и '.' не могут быть именем папки
     if name.strip() in ('.', '..'):
         return False
-    pattern = r'^[\wа-яА-ЯёЁ\s\-\.\(\)]+$'
-    return bool(re.match(pattern, name, re.UNICODE))
+    if re.search(r'[\\/:*?"<>|\x00-\x1f]', name):
+        return False
+    if name != name.strip(' .'):
+        return False
+    return True
 
 # ===== БАЗА ДАННЫХ ФАЙЛОВ =====
 def _load_json(path):
@@ -141,6 +192,36 @@ def get_folder_physical_path(folder_id, folders):
 
 def get_subfolders(parent_id, folders):
     return [f for fid, f in folders.items() if f.get('parent_id') == parent_id]
+
+def ensure_folder_path(folder_parts, parent_id):
+    """Находит или создаёт цепочку вложенных папок. Потокобезопасно:
+    под блокировкой перечитывает folders_db, поэтому параллельные батчи
+    не создадут дубли одной и той же папки.
+    Возвращает (folder_id, физический_путь, список_созданных_id)."""
+    with DB_LOCK:
+        folders = _load_json(FOLDERS_DB_FILE)
+        current_parent = parent_id
+        current_physical = get_folder_physical_path(parent_id, folders)
+        created_ids = []
+        for folder_name in folder_parts:
+            found = None
+            for fid, f in folders.items():
+                if f.get('parent_id') == current_parent and f['name'] == folder_name:
+                    found = fid
+                    break
+            if not found:
+                found = str(uuid.uuid4())
+                folders[found] = {
+                    'name': folder_name,
+                    'parent_id': current_parent,
+                    'created': datetime.now().strftime('%d.%m.%Y %H:%M')
+                }
+                created_ids.append(found)
+            current_parent = found
+            current_physical = os.path.join(current_physical, folder_name)
+        if created_ids:
+            _save_json(FOLDERS_DB_FILE, folders)
+        return current_parent, current_physical, created_ids
 
 # ===== МИГРАЦИЯ =====
 def get_file_ext(filename):
@@ -583,7 +664,7 @@ HTML_TEMPLATE = """
                                     <td class="type-col">Папка</td>
                                     <td class="dl-col">—</td>
                                     <td class="actions-cell">
-                                        <button class="btn btn-sm btn-icon btn-icon-danger" onclick="confirmDeleteFolder('{{ folder.id }}', '{{ folder.name }}')" title="Удалить папку">🗑️</button>
+                                        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить папку">🗑️</button>
                                     </td>
                                 </tr>
                                 {% endfor %}
@@ -617,9 +698,9 @@ HTML_TEMPLATE = """
                                         {% if current_folder %}
                                         <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить на уровень выше">⬆️</button>
                                         {% endif %}
-                                        <button class="btn btn-sm btn-icon" onclick="openEditModal('{{ f.internal_id }}', '{{ f.name | replace("'", "\\'") }}', '{{ f.current_filename | replace("'", "\\'") }}', '{{ f.custom_alias }}', '{{ f.folder_id }}')" title="Редактировать">✏️</button>
+                                        <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать">✏️</button>
                                         <button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.download_url }}')" title="Копировать ссылку">🔗</button>
-                                        <button class="btn btn-sm btn-icon btn-icon-danger" onclick="confirmDelete('{{ f.internal_id }}', '{{ f.name | replace("'", "\\'") }}')" title="Удалить">🗑️</button>
+                                        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить">🗑️</button>
                                     </td>
                                 </tr>
                                 {% endfor %}
@@ -636,7 +717,7 @@ HTML_TEMPLATE = """
                                     <div class="tile-folder-name">{{ folder.name }}</div>
                                 </a>
                                 <div class="tile-name">
-                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick="confirmDeleteFolder('{{ folder.id }}', '{{ folder.name }}')" title="Удалить">🗑️</button>
+                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить">🗑️</button>
                                 </div>
                             </div>
                             {% endfor %}
@@ -647,9 +728,9 @@ HTML_TEMPLATE = """
                                     {% if current_folder %}
                                     <button onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше">⬆️</button>
                                     {% endif %}
-                                    <button onclick="openEditModal('{{ f.internal_id }}', '{{ f.name | replace("'", "\\'") }}', '{{ f.current_filename | replace("'", "\\'") }}', '{{ f.custom_alias }}', '{{ f.folder_id }}')" title="Редактировать">✏️</button>
+                                    <button onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать">✏️</button>
                                     <button onclick="copyToClipboard('{{ f.download_url }}')" title="Копировать ссылку">🔗</button>
-                                    <button class="del-btn" onclick="confirmDelete('{{ f.internal_id }}', '{{ f.name | replace("'", "\\'") }}')" title="Удалить">🗑️</button>
+                                    <button class="del-btn" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить">🗑️</button>
                                 </div>
                                 {% if f.is_image %}
                                     <a href="{{ f.view_url }}" target="_blank" class="tile-preview-wrap">
@@ -680,7 +761,7 @@ HTML_TEMPLATE = """
                                 </div>
                                 <span class="list-date">{{ folder.created }}</span>
                                 <div class="list-actions">
-                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick="confirmDeleteFolder('{{ folder.id }}', '{{ folder.name }}')" title="Удалить">🗑️</button>
+                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить">🗑️</button>
                                 </div>
                             </div>
                             {% endfor %}
@@ -703,9 +784,9 @@ HTML_TEMPLATE = """
                                     {% if current_folder %}
                                     <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше">⬆️</button>
                                     {% endif %}
-                                    <button class="btn btn-sm btn-icon" onclick="openEditModal('{{ f.internal_id }}', '{{ f.name | replace("'", "\\'") }}', '{{ f.current_filename | replace("'", "\\'") }}', '{{ f.custom_alias }}', '{{ f.folder_id }}')" title="Редактировать">✏️</button>
+                                    <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать">✏️</button>
                                     <button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.download_url }}')" title="Копировать ссылку">🔗</button>
-                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick="confirmDelete('{{ f.internal_id }}', '{{ f.name | replace("'", "\\'") }}')" title="Удалить">🗑️</button>
+                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить">🗑️</button>
                                 </div>
                             </div>
                             {% endfor %}
@@ -1132,45 +1213,93 @@ HTML_TEMPLATE = """
             navigator.clipboard.writeText(text).then(() => showToast('✅ Ссылка скопирована')).catch(() => showToast('❌ Не удалось', true));
         }
 
+        // ===== Параллельная загрузка: батчи файлов в несколько потоков =====
+        const PARALLEL_UPLOADS = 4;   // одновременных запросов
+        const FILES_PER_BATCH = 25;   // файлов в одном запросе
+
         uploadBtn.addEventListener('click', async () => {
             if (selectedUploadFiles.length === 0) return;
             uploadBtn.disabled = true;
             progressContainer.style.display = 'block';
             progressFill.style.width = '0%'; progressFill.textContent = '0%';
-            
-            const formData = new FormData();
-            formData.append('folder_id', currentFolderId);
-            formData.append('is_folder_upload', isFolderUpload);
-            
-            selectedUploadFiles.forEach((f, i) => {
-                formData.append(`file_${i}`, f);
-                if (isFolderUpload && f.webkitRelativePath) {
-                    formData.append(`path_${i}`, f.webkitRelativePath);
-                }
-            });
-            formData.append('count', selectedUploadFiles.length);
 
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', isFolderUpload ? '/upload_folder' : '/upload');
-            xhr.upload.onprogress = (e) => {
-                if (e.lengthComputable) {
-                    const percent = Math.round((e.loaded / e.total) * 100);
-                    progressFill.style.width = percent + '%'; progressFill.textContent = percent + '%';
+            // Группируем по целевой папке: файлы одной папки не должны попасть
+            // в разные параллельные запросы (иначе гонка имён)
+            const groups = new Map();
+            for (const f of selectedUploadFiles) {
+                const key = isFolderUpload
+                    ? (f.webkitRelativePath || f.name).split('/').slice(0, -1).join('/')
+                    : '__plain__';
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push(f);
+            }
+            const batches = [];
+            for (const files of groups.values()) {
+                for (let i = 0; i < files.length; i += FILES_PER_BATCH)
+                    batches.push(files.slice(i, i + FILES_PER_BATCH));
+            }
+
+            const totalBytes = selectedUploadFiles.reduce((s, f) => s + f.size, 0);
+            const loadedByBatch = new Map();
+            let savedTotal = 0, failedTotal = 0, lastError = '';
+
+            const updateProgress = () => {
+                let loaded = 0;
+                loadedByBatch.forEach(v => loaded += v);
+                const pct = totalBytes ? Math.min(100, Math.round(loaded / totalBytes * 100)) : 100;
+                progressFill.style.width = pct + '%'; progressFill.textContent = pct + '%';
+            };
+
+            const uploadBatch = (batch) => new Promise((resolve) => {
+                const fd = new FormData();
+                fd.append('folder_id', currentFolderId);
+                batch.forEach((f, i) => {
+                    fd.append(`file_${i}`, f);
+                    if (isFolderUpload) fd.append(`path_${i}`, f.webkitRelativePath || f.name);
+                });
+                fd.append('count', String(batch.length));
+
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', isFolderUpload ? '/upload_folder' : '/upload');
+                xhr.upload.onprogress = (e) => {
+                    if (e.lengthComputable) { loadedByBatch.set(batch, e.loaded); updateProgress(); }
+                };
+                xhr.onload = () => {
+                    if (xhr.status === 200) {
+                        try { savedTotal += JSON.parse(xhr.responseText).count || 0; }
+                        catch (e) { savedTotal += batch.length; }
+                    } else {
+                        failedTotal += batch.length;
+                        let msg = `Ошибка ${xhr.status}`;
+                        try { const d = JSON.parse(xhr.responseText); if (d.error) msg = d.error; } catch (e) {}
+                        lastError = msg;
+                        console.error('Ошибка батча:', xhr.status, xhr.responseText);
+                    }
+                    resolve();
+                };
+                xhr.onerror = () => { failedTotal += batch.length; lastError = 'Ошибка сети'; resolve(); };
+                xhr.send(fd);
+            });
+
+            // Очередь батчей, PARALLEL_UPLOADS воркеров
+            let idx = 0;
+            const worker = async () => {
+                while (idx < batches.length) {
+                    await uploadBatch(batches[idx++]);
                 }
             };
-            xhr.onload = () => {
-                if (xhr.status === 200) {
-                    const data = JSON.parse(xhr.responseText);
-                    showToast(`✅ Загружено: ${data.count}`);
-                    selectedUploadFiles = []; renderFileList(); fileInput.value = ''; folderInput.value = '';
-                    setTimeout(() => location.reload(), 1000);
-                } else {
-                    showToast('❌ Ошибка загрузки', true);
-                    progressContainer.style.display = 'none'; uploadBtn.disabled = false;
-                }
-            };
-            xhr.onerror = () => { showToast('❌ Ошибка', true); progressContainer.style.display = 'none'; uploadBtn.disabled = false; };
-            xhr.send(formData);
+            await Promise.all(Array.from({ length: Math.min(PARALLEL_UPLOADS, batches.length) }, worker));
+
+            if (failedTotal === 0) {
+                progressFill.style.width = '100%'; progressFill.textContent = '100%';
+                showToast(`✅ Загружено: ${savedTotal}`);
+                selectedUploadFiles = []; renderFileList(); fileInput.value = ''; folderInput.value = '';
+                setTimeout(() => location.reload(), 800);
+            } else {
+                showToast(`❌ Загружено: ${savedTotal}, не удалось: ${failedTotal}. ${lastError}`, true);
+                progressContainer.style.display = 'none'; uploadBtn.disabled = false;
+                setTimeout(() => location.reload(), 2000);
+            }
         });
 
         document.querySelectorAll('.modal-overlay').forEach(m => {
@@ -1206,11 +1335,14 @@ def login():
         auth = get_auth()
         if request.form.get('username') == auth['username'] and check_password_hash(auth['password_hash'], request.form.get('password', '')):
             session['logged_in'] = True
+            app.logger.info('Вход: пользователь "%s" с %s', request.form.get('username'), request.remote_addr)
             next_page = request.args.get('next', '/f/')
             # Защита от open redirect: только относительные пути внутри сайта
             if not next_page.startswith('/') or next_page.startswith('//'):
                 next_page = '/f/'
             return redirect(next_page)
+        app.logger.warning('Неудачная попытка входа: логин "%s" с %s',
+                           request.form.get('username'), request.remote_addr)
         return '''<!DOCTYPE html><html><head><title>Вход - АЛЬБИОН</title>
         <style>body{font-family:'Segoe UI',Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f9;margin:0}
         .box{background:white;padding:40px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.1);width:320px;text-align:center}
@@ -1316,67 +1448,71 @@ def upload_file():
         files_list = request.files.getlist('files')
         files = [(f, '') for f in files_list if f.filename]
 
-    saved_count = 0
-    db = load_db()
-    
-    folder_physical_path = get_folder_physical_path(folder_id, folders)
-    os.makedirs(folder_physical_path, exist_ok=True)
-    
-    existing_names = set()
-    for record in db.values():
-        if record.get('folder_id') == folder_id:
-            existing_names.add(record['current_filename'])
-    for fname in os.listdir(folder_physical_path):
-        if os.path.isfile(os.path.join(folder_physical_path, fname)):
-            existing_names.add(fname)
+    with UPLOAD_LOCK:
+        saved_count = 0
+        db = load_db()
 
-    for file, _ in files:
-        if not allowed_file(file.filename):
-            continue
+        folder_physical_path = get_folder_physical_path(folder_id, folders)
+        os.makedirs(folder_physical_path, exist_ok=True)
 
-        internal_id = str(uuid.uuid4())
-        ext = get_file_ext(file.filename)
-        original_name = file.filename
+        existing_names = set()
+        for record in db.values():
+            if record.get('folder_id') == folder_id:
+                existing_names.add(record['current_filename'])
+        for fname in os.listdir(folder_physical_path):
+            if os.path.isfile(os.path.join(folder_physical_path, fname)):
+                existing_names.add(fname)
 
-        if is_valid_filename(original_name):
-            current_filename = original_name
-            if current_filename in existing_names:
-                name_part = original_name.rsplit('.', 1)[0] if '.' in original_name else original_name
-                counter = 1
-                while True:
-                    current_filename = f"{name_part}_{counter}.{ext}" if ext else f"{name_part}_{counter}"
-                    if current_filename not in existing_names:
-                        break
-                    counter += 1
-        else:
-            current_filename = f"{internal_id}.{ext}" if ext else internal_id
+        for file, _ in files:
+            if not allowed_file(file.filename):
+                app.logger.warning('Загрузка: "%s" отклонён — расширение не в белом списке', file.filename)
+                continue
 
-        physical_path = os.path.relpath(os.path.join(folder_physical_path, current_filename), UPLOAD_FOLDER)
-        
-        save_path = os.path.join(UPLOAD_FOLDER, physical_path)
-        file.save(save_path)
-        existing_names.add(current_filename)
+            internal_id = str(uuid.uuid4())
+            ext = get_file_ext(file.filename)
+            original_name = file.filename
 
-        db[internal_id] = {
-            'access_id': internal_id,
-            'current_filename': current_filename,
-            'physical_path': physical_path,
-            'original_filename': original_name,
-            'display_name': original_name,
-            'folder_id': folder_id,
-            'custom_alias': '',
-            'link_rotated': False,
-            'download_count': 0,
-            'size': os.path.getsize(save_path),
-            'mtime': datetime.fromtimestamp(os.path.getmtime(save_path)).strftime('%d.%m.%Y %H:%M'),
-            'ext': ext.upper() if ext else '—',
-            'is_image': ext in IMAGE_EXTENSIONS
-        }
-        saved_count += 1
+            if is_valid_filename(original_name):
+                current_filename = original_name
+                if current_filename in existing_names:
+                    name_part = original_name.rsplit('.', 1)[0] if '.' in original_name else original_name
+                    counter = 1
+                    while True:
+                        current_filename = f"{name_part}_{counter}.{ext}" if ext else f"{name_part}_{counter}"
+                        if current_filename not in existing_names:
+                            break
+                        counter += 1
+            else:
+                current_filename = f"{internal_id}.{ext}" if ext else internal_id
 
-    if saved_count > 0:
-        save_db(db)
-        update_last_upload()
+            physical_path = os.path.relpath(os.path.join(folder_physical_path, current_filename), UPLOAD_FOLDER)
+
+            save_path = os.path.join(UPLOAD_FOLDER, physical_path)
+            file.save(save_path)
+            existing_names.add(current_filename)
+
+            db[internal_id] = {
+                'access_id': internal_id,
+                'current_filename': current_filename,
+                'physical_path': physical_path,
+                'original_filename': original_name,
+                'display_name': original_name,
+                'folder_id': folder_id,
+                'custom_alias': '',
+                'link_rotated': False,
+                'download_count': 0,
+                'size': os.path.getsize(save_path),
+                'mtime': datetime.fromtimestamp(os.path.getmtime(save_path)).strftime('%d.%m.%Y %H:%M'),
+                'ext': ext.upper() if ext else '—',
+                'is_image': ext in IMAGE_EXTENSIONS
+            }
+            saved_count += 1
+            app.logger.info('Загружен файл: %s (%s)', physical_path, format_size(os.path.getsize(save_path)))
+
+        if saved_count > 0:
+            save_db(db)
+            update_last_upload()
+            app.logger.info('Загрузка завершена: %d файл(ов) в папку %s', saved_count, folder_id or 'корень')
 
     return jsonify({'count': saved_count})
 
@@ -1398,8 +1534,7 @@ def upload_folder():
 
     saved_count = 0
     created_folders = set()
-    db = load_db()
-    
+
     file_data = []
     for i in range(count):
         file = request.files.get(f'file_{i}')
@@ -1407,105 +1542,96 @@ def upload_folder():
         if file and file.filename:
             file_data.append((file, rel_path))
 
-    for file, rel_path in file_data:
-        if not rel_path:
-            continue
-        
-        parts = rel_path.replace('\\', '/').split('/')
-        filename = parts[-1]
-        folder_parts = parts[:-1]
-        
-        if not folder_parts:
-            continue
+    with UPLOAD_LOCK:
+        db = load_db()
 
-        # Защита от path traversal: '..' и '.' в пути папки запрещают загрузку файла
-        if any(not is_valid_foldername(p) for p in folder_parts):
-            continue
+        for file, rel_path in file_data:
+            if not rel_path:
+                app.logger.warning('Загрузка папки: "%s" без пути (path_%d отсутствует) — пропущен',
+                                   file.filename, file_data.index((file, rel_path)))
+                continue
 
-        current_parent = folder_id
-        current_physical = get_folder_physical_path(folder_id, folders)
+            parts = rel_path.replace('\\', '/').split('/')
+            filename = parts[-1]
+            folder_parts = parts[:-1]
 
-        for folder_name in folder_parts:
-            
-            found = None
-            for fid, f in folders.items():
-                if f.get('parent_id') == current_parent and f['name'] == folder_name:
-                    found = fid
-                    break
-            
-            if found:
-                current_parent = found
-                current_physical = os.path.join(current_physical, folder_name)
+            if not folder_parts:
+                app.logger.warning('Загрузка папки: "%s" без подпапки в пути — пропущен', rel_path)
+                continue
+
+            # Защита от path traversal: '..' и '.' в пути папки запрещают загрузку файла
+            if any(not is_valid_foldername(p) for p in folder_parts):
+                app.logger.warning('Загрузка папки: "%s" отклонён — недопустимое имя папки в пути %s',
+                                   rel_path, folder_parts)
+                continue
+
+            if not allowed_file(filename):
+                app.logger.warning('Загрузка папки: "%s" отклонён — расширение не в белом списке', rel_path)
+                continue
+
+            # Потокобезопасный поиск/создание цепочки папок (важно при параллельных батчах)
+            current_parent, current_physical, new_folder_ids = ensure_folder_path(folder_parts, folder_id)
+            created_folders.update(new_folder_ids)
+            os.makedirs(current_physical, exist_ok=True)
+
+            internal_id = str(uuid.uuid4())
+            ext = get_file_ext(filename)
+
+            existing_names = set()
+            for record in db.values():
+                if record.get('folder_id') == current_parent:
+                    existing_names.add(record['current_filename'])
+            if os.path.isdir(current_physical):
+                existing_names.update(os.listdir(current_physical))
+
+            current_filename = filename
+            if is_valid_filename(filename):
+                if current_filename in existing_names:
+                    name_part = filename.rsplit('.', 1)[0] if '.' in filename else filename
+                    counter = 1
+                    while True:
+                        current_filename = f"{name_part}_{counter}.{ext}" if ext else f"{name_part}_{counter}"
+                        if current_filename not in existing_names:
+                            break
+                        counter += 1
             else:
-                new_folder_id = str(uuid.uuid4())
-                folders[new_folder_id] = {
-                    'name': folder_name,
-                    'parent_id': current_parent,
-                    'created': datetime.now().strftime('%d.%m.%Y %H:%M')
-                }
-                created_folders.add(new_folder_id)
-                current_parent = new_folder_id
-                current_physical = os.path.join(current_physical, folder_name)
-                os.makedirs(current_physical, exist_ok=True)
-        
-        if not allowed_file(filename):
-            continue
-        
-        internal_id = str(uuid.uuid4())
-        ext = get_file_ext(filename)
-        
-        existing_names = set()
-        for record in db.values():
-            if record.get('folder_id') == current_parent:
-                existing_names.add(record['current_filename'])
-        if os.path.isdir(current_physical):
-            existing_names.update(os.listdir(current_physical))
+                current_filename = f"{internal_id}.{ext}" if ext else internal_id
 
-        current_filename = filename
-        if is_valid_filename(filename):
-            if current_filename in existing_names:
-                name_part = filename.rsplit('.', 1)[0] if '.' in filename else filename
-                counter = 1
-                while True:
-                    current_filename = f"{name_part}_{counter}.{ext}" if ext else f"{name_part}_{counter}"
-                    if current_filename not in existing_names:
-                        break
-                    counter += 1
-        else:
-            current_filename = f"{internal_id}.{ext}" if ext else internal_id
-        
-        physical_path = os.path.relpath(os.path.join(current_physical, current_filename), UPLOAD_FOLDER)
-        save_path = os.path.join(UPLOAD_FOLDER, physical_path)
+            physical_path = os.path.relpath(os.path.join(current_physical, current_filename), UPLOAD_FOLDER)
+            save_path = os.path.join(UPLOAD_FOLDER, physical_path)
 
-        # Страховка от выхода за пределы uploads
-        upload_root = os.path.realpath(UPLOAD_FOLDER)
-        if not os.path.realpath(save_path).startswith(upload_root + os.sep):
-            continue
+            # Страховка от выхода за пределы uploads
+            upload_root = os.path.realpath(UPLOAD_FOLDER)
+            if not os.path.realpath(save_path).startswith(upload_root + os.sep):
+                app.logger.error('Загрузка папки: "%s" отклонён страховкой realpath (%s)', rel_path, save_path)
+                continue
 
-        file.save(save_path)
-        
-        db[internal_id] = {
-            'access_id': internal_id,
-            'current_filename': current_filename,
-            'physical_path': physical_path,
-            'original_filename': filename,
-            'display_name': filename,
-            'folder_id': current_parent,
-            'custom_alias': '',
-            'link_rotated': False,
-            'download_count': 0,
-            'size': os.path.getsize(save_path),
-            'mtime': datetime.fromtimestamp(os.path.getmtime(save_path)).strftime('%d.%m.%Y %H:%M'),
-            'ext': ext.upper() if ext else '—',
-            'is_image': ext in IMAGE_EXTENSIONS
-        }
-        saved_count += 1
+            file.save(save_path)
 
-    if saved_count > 0 or created_folders:
-        save_db(db)
-        save_folders(folders)
-        update_last_upload()
+            db[internal_id] = {
+                'access_id': internal_id,
+                'current_filename': current_filename,
+                'physical_path': physical_path,
+                'original_filename': filename,
+                'display_name': filename,
+                'folder_id': current_parent,
+                'custom_alias': '',
+                'link_rotated': False,
+                'download_count': 0,
+                'size': os.path.getsize(save_path),
+                'mtime': datetime.fromtimestamp(os.path.getmtime(save_path)).strftime('%d.%m.%Y %H:%M'),
+                'ext': ext.upper() if ext else '—',
+                'is_image': ext in IMAGE_EXTENSIONS
+            }
+            saved_count += 1
+            app.logger.info('Загружен файл из папки: %s (%s)', physical_path, format_size(os.path.getsize(save_path)))
 
+        if saved_count > 0 or created_folders:
+            save_db(db)
+            update_last_upload()
+
+    app.logger.info('Загрузка папки завершена: %d файл(ов), %d папок создано (принято в запросе: %d)',
+                    saved_count, len(created_folders), count)
     return jsonify({'count': saved_count, 'folders_created': len(created_folders)})
 
 @app.route('/v/<path:filepath>')
@@ -1521,9 +1647,11 @@ def view_file(filepath):
     if not os.path.isfile(full_path):
         return "Файл не найден", 404
 
-    if bump_counter(lambda r: r.get('physical_path') == filepath, 'view_count') is None:
+    record = bump_counter(lambda r: r.get('physical_path') == filepath, 'view_count')
+    if record is None:
         return "Файл не найден", 404
 
+    app.logger.info('Просмотр: %s (👁=%d)', filepath, record.get('view_count', 0))
     return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=False)
 
 @app.route('/api/update_file', methods=['POST'])
@@ -1974,6 +2102,8 @@ def direct_file_access(filepath):
     if record is None:
         return "Файл не найден", 404
 
+    app.logger.info('Скачивание: %s (⬇=%d) от %s', filepath,
+                    record.get('download_count', 0), request.remote_addr)
     return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=True, download_name=record['current_filename'])
 
 @app.route('/robots.txt')
@@ -1987,4 +2117,5 @@ if __name__ == '__main__':
     print(f"Локально: http://127.0.0.1:5000")
     print("=" * 60)
     serve(app, host='0.0.0.0', port=5000, threads=8,
-          max_request_body_size=2*1024*1024*1024, channel_timeout=120)
+          max_request_body_size=100 * 1024 * 1024 * 1024,  # 100 ГБ (None waitress не принимает)
+          channel_timeout=300)
