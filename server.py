@@ -6,7 +6,7 @@ import uuid
 import re
 import shutil
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, send_from_directory, render_template_string, send_file, jsonify, abort, redirect, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 from openpyxl import Workbook
@@ -18,6 +18,7 @@ import secrets
 import threading
 import logging
 import hashlib
+import hmac
 import time
 import zipfile
 from collections import deque
@@ -40,16 +41,24 @@ def _get_or_create_secret_key():
             with open(SECRET_KEY_FILE, 'r', encoding='utf-8') as f:
                 key = f.read().strip()
                 if key:
+                    try:
+                        os.chmod(SECRET_KEY_FILE, 0o600)
+                    except OSError:
+                        pass
                     return key
         except OSError:
             pass
+    os.makedirs(os.path.dirname(SECRET_KEY_FILE) or '.', exist_ok=True)
     key = secrets.token_hex(32)
-    with open(SECRET_KEY_FILE, 'w', encoding='utf-8') as f:
+    fd = os.open(SECRET_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
         f.write(key)
     return key
 
 app.secret_key = _get_or_create_secret_key()
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = os.environ.get('ALBION_COOKIE_SECURE', '0').lower() in {'1', 'true', 'yes'}
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=int(os.environ.get('ALBION_SESSION_HOURS', '12')))
 
 # ===== ЛОГИРОВАНИЕ (файл + консоль/journal) =====
 LOG_FILE = os.path.join(DATA_DIR, 'albion.log')
@@ -103,7 +112,7 @@ def internal_error(e):
     return jsonify({'error': 'Внутренняя ошибка сервера — подробности в albion.log'}), 500
 
 # ===== КОНФИГУРАЦИЯ =====
-BASE_URL = "https://albion-rostov.cloudpub.ru"
+BASE_URL = os.environ.get('ALBION_BASE_URL', 'https://albion-rostov.cloudpub.ru').rstrip('/')
 UPLOAD_FOLDER = os.path.join(DATA_DIR, 'uploads')
 STATS_FILE = os.path.join(DATA_DIR, 'stats.json')
 DB_FILE = os.path.join(DATA_DIR, 'files_db.json')
@@ -235,11 +244,14 @@ def _load_json(path):
     return {}
 
 def _save_json(path, data):
-    """Атомарная запись: сначала во временный файл, затем замена.
-    При сбое питания/процесса старый файл не теряется."""
+    """Атомарная запись приватной JSON-БД (режим 0600) через tmp + replace."""
     tmp = f"{path}.tmp"
-    with open(tmp, 'w', encoding='utf-8') as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 def load_db():
@@ -270,6 +282,26 @@ def get_folder_path(folder_id, folders):
 def get_folder_physical_path(folder_id, folders):
     path_parts = get_folder_path(folder_id, folders)
     return os.path.join(UPLOAD_FOLDER, *path_parts) if path_parts else UPLOAD_FOLDER
+
+def safe_upload_path(relative_path, allow_root=False):
+    """Return a real path inside uploads, or None for unsafe DB paths/symlinks."""
+    if not isinstance(relative_path, str) or not relative_path:
+        return None
+    root = os.path.realpath(UPLOAD_FOLDER)
+    target = os.path.realpath(os.path.join(root, relative_path))
+    try:
+        if target == root:
+            return root if allow_root else None
+        if os.path.commonpath((root, target)) != root:
+            return None
+    except (ValueError, OSError):
+        return None
+    return target
+
+def get_json_object():
+    """Read a JSON object; arrays, scalars, null and malformed bodies are rejected."""
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else None
 
 def get_subfolders(parent_id, folders):
     return [f for fid, f in folders.items() if f.get('parent_id') == parent_id]
@@ -344,6 +376,7 @@ def migrate_files():
                     'display_name': filename,
                     'folder_id': None,
                     'custom_alias': '',
+                    'slug': make_short_slug(filename, db, exclude_id=internal_id),
                     'link_rotated': False,
                     'download_count': 0,
                     'size': os.path.getsize(filepath),
@@ -427,6 +460,10 @@ def get_file_icon(ext):
     }
     return icons.get(ext.lower(), '📄')
 
+def url_path(path):
+    """Encode a stored path for use in a URL while preserving directory separators."""
+    return urllib.parse.quote(path, safe='/')
+
 def format_size(size):
     if size < 1024: return f"{size} Б"
     if size < 1024 * 1024: return f"{size / 1024:.1f} КБ"
@@ -448,8 +485,8 @@ def get_files_in_folder(folder_id):
     for internal_id, record in db.items():
         if record.get('folder_id') == folder_id:
             physical_path = record.get('physical_path', record['current_filename'])
-            filepath = os.path.join(UPLOAD_FOLDER, physical_path)
-            if os.path.exists(filepath):
+            filepath = safe_upload_path(physical_path)
+            if filepath and os.path.isfile(filepath):
                 files.append({
                     'internal_id': internal_id,
                     'name': record['display_name'],
@@ -467,10 +504,10 @@ def get_files_in_folder(folder_id):
                     'view_count': record.get('view_count', 0),
                     'folder_id': folder_id,
                     # Ссылки с нормальной кириллицей (без URL-кодирования)
-                    'download_url': f"{BASE_URL}/{physical_path}",
-                    'view_url': f"{BASE_URL}/v/{physical_path}",
+                    'download_url': f"{BASE_URL}/{url_path(physical_path)}",
+                    'view_url': f"{BASE_URL}/v/{url_path(physical_path)}",
                     # Короткая латинизированная ссылка (переживает переименование)
-                    'short_url': f"{BASE_URL}/{record['slug']}" if record.get('slug') else f"{BASE_URL}/{physical_path}",
+                    'short_url': f"{BASE_URL}/{record['slug']}" if record.get('slug') else f"{BASE_URL}/{url_path(physical_path)}",
                 })
     return sorted(files, key=lambda x: x['mtime'], reverse=True)
 
@@ -524,6 +561,7 @@ HTML_TEMPLATE = """
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
+    <meta name="csrf-token" content="{{ csrf_token }}">
     <title>АЛЬБИОН: Файлы</title>
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
     <style>
@@ -611,6 +649,7 @@ HTML_TEMPLATE = """
         .rotated-badge { display: inline-flex; align-items: center; gap: 4px; background: #fef3c7; color: #92400e; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; margin-left: 8px; cursor: help; }
         .folder-row { background: #fefce8 !important; }
         .folder-row:hover { background: #fef3c7 !important; }
+        .folder-row.selected { background: #dbeafe !important; }
         .folder-row.drag-over { background: #dbeafe !important; border: 2px dashed #2563eb; }
         .file-row.dragging { opacity: 0.5; }
         .file-row.selected { background: #dbeafe !important; }
@@ -771,8 +810,8 @@ HTML_TEMPLATE = """
             <div class="batch-actions" id="batchActions">
                 <span class="count">Выбрано: <span id="selectedCount">0</span></span>
                 <button class="btn btn-sm btn-success" onclick="executeBatchZip()">⬇ Скачать архив</button>
-                <button class="btn btn-sm btn-danger" onclick="batchDelete()">🗑️ Удалить выбранные</button>
-                <button class="btn btn-sm" onclick="openBatchMoveModal()">📁 Переместить</button>
+                <button class="btn btn-sm btn-danger file-selection-action" onclick="batchDelete()">🗑️ Удалить выбранные</button>
+                <button class="btn btn-sm file-selection-action" onclick="openBatchMoveModal()">📁 Переместить</button>
                 <button class="btn btn-sm btn-secondary" onclick="clearSelection()">✕ Снять выделение</button>
             </div>
 
@@ -1066,6 +1105,17 @@ HTML_TEMPLATE = """
     <script>
         const currentFolderId = '{{ current_folder_id or "" }}';
         const parentFolderId = '{{ (current_folder.parent_id or "") if current_folder else "" }}';
+        const csrfToken = '{{ csrf_token }}';
+        const nativeFetch = window.fetch.bind(window);
+        window.fetch = (input, init = {}) => {
+            const method = (init.method || 'GET').toUpperCase();
+            if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+                const headers = new Headers(init.headers || {});
+                headers.set('X-CSRF-Token', csrfToken);
+                init = { ...init, headers };
+            }
+            return nativeFetch(input, init);
+        };
         let draggedFileId = null;
         let selectedFiles = new Set();
         let selectedFolders = new Set();
@@ -1127,7 +1177,7 @@ HTML_TEMPLATE = """
             document.querySelectorAll('.file-checkbox:checked').forEach(cb => selectedFiles.add(cb.dataset.fileId));
             selectedFolders.clear();
             document.querySelectorAll('.folder-checkbox:checked').forEach(cb => selectedFolders.add(cb.dataset.folderId));
-            document.querySelectorAll('.file-row, .tile, .list-item').forEach(el => {
+            document.querySelectorAll('.file-row, .folder-row, .tile, .list-item').forEach(el => {
                 const fileId = el.dataset.fileId;
                 const folderId = el.dataset.folderId;
                 const on = (fileId && selectedFiles.has(fileId)) || (folderId && selectedFolders.has(folderId));
@@ -1138,6 +1188,9 @@ HTML_TEMPLATE = """
             const total = selectedFiles.size + selectedFolders.size;
             if (total > 0) { batchActions.classList.add('active'); selectedCount.textContent = total; }
             else { batchActions.classList.remove('active'); }
+            document.querySelectorAll('.file-selection-action').forEach(btn => {
+                btn.hidden = selectedFiles.size === 0;
+            });
         }
 
         function toggleSelectAll() {
@@ -1246,7 +1299,7 @@ HTML_TEMPLATE = """
         
         function updateAliasPreview() {
             const alias = document.getElementById('editCustomAlias').value.trim();
-            const url = alias ? `https://albion-rostov.cloudpub.ru/${alias}` : '';
+            const url = alias ? `{{ base_url }}/${alias}` : '';
             document.getElementById('aliasPreview').textContent = url || '(прямая ссылка на файл)';
             document.getElementById('aliasPreview').href = url || '#';
         }
@@ -1356,7 +1409,12 @@ HTML_TEMPLATE = """
 
         function addFiles(files) {
             for (const file of files) {
-                if (!selectedUploadFiles.some(f => f.name === file.name && f.size === file.size)) selectedUploadFiles.push(file);
+                const key = isFolderUpload ? (file.webkitRelativePath || file.name) : file.name;
+                const duplicate = selectedUploadFiles.some(f => {
+                    const existingKey = isFolderUpload ? (f.webkitRelativePath || f.name) : f.name;
+                    return existingKey === key && f.size === file.size;
+                });
+                if (!duplicate) selectedUploadFiles.push(file);
             }
             renderFileList();
         }
@@ -1438,6 +1496,7 @@ HTML_TEMPLATE = """
 
                 const xhr = new XMLHttpRequest();
                 xhr.open('POST', isFolderUpload ? '/upload_folder' : '/upload');
+                xhr.setRequestHeader('X-CSRF-Token', csrfToken);
                 xhr.upload.onprogress = (e) => {
                     if (e.lengthComputable) { loadedByBatch.set(batch, e.loaded); updateProgress(); }
                 };
@@ -1584,23 +1643,46 @@ AUTH_FILE = os.path.join(DATA_DIR, 'auth.json')
 
 # ===== API-КЛЮЧИ ДЛЯ АВТОМАТИКИ (tokens.json: {sha256(ключ): {name, created}}) =====
 def load_tokens():
-    return _load_json(TOKENS_FILE)
+    tokens = _load_json(TOKENS_FILE)
+    if os.path.exists(TOKENS_FILE):
+        try:
+            os.chmod(TOKENS_FILE, 0o600)
+        except OSError:
+            pass
+    return tokens
 
 def check_api_key(provided):
-    """Имя ключа, если предоставлен валидный API-ключ, иначе None."""
+    """Метаданные ключа + его hash-id, либо None."""
     if not provided:
         return None
     key_hash = hashlib.sha256(provided.encode('utf-8')).hexdigest()
     meta = load_tokens().get(key_hash)
-    return meta.get('name') if meta else None
+    if not meta:
+        return None
+    return {'id': key_hash, 'name': meta.get('name', 'без имени')}
 
 @app.before_request
 def _resolve_api_key():
-    """Определяем API-ключ один раз на запрос (заголовок X-API-Key или ?api_key=)."""
-    g.api_key = check_api_key(request.headers.get('X-API-Key') or request.args.get('api_key'))
+    """API-ключ принимается только заголовком, чтобы секрет не попадал в URL/логи."""
+    key = check_api_key(request.headers.get('X-API-Key'))
+    g.api_key = key['name'] if key else None
+    g.api_key_id = key['id'] if key else None
 
-# ===== БЮДЖЕТ СКАЧИВАНИЯ: скользящее окно на IP =====
+@app.before_request
+def _enforce_csrf():
+    """Защита авторизованных изменений от межсайтовых POST/PUT/PATCH/DELETE."""
+    if request.method not in {'POST', 'PUT', 'PATCH', 'DELETE'} or not session.get('logged_in'):
+        return None
+    expected = session.get('_csrf_token')
+    provided = request.headers.get('X-CSRF-Token')
+    if not expected or not provided or not hmac.compare_digest(expected, provided):
+        app.logger.warning('CSRF token missing/invalid: %s %s from %s', request.method, request.path, request.remote_addr)
+        return jsonify({'error': 'CSRF-токен отсутствует или неверен'}), 403
+    return None
+
+# ===== БЮДЖЕТ СКАЧИВАНИЯ: скользящее окно на IP/API-ключ =====
 _download_windows = {}
+_DOWNLOAD_BUDGET_LOCK = threading.Lock()
 
 def check_download_budget(ip, size_bytes):
     """None — скачивание разрешено (usage записан); иначе сколько секунд ждать.
@@ -1611,41 +1693,87 @@ def check_download_budget(ip, size_bytes):
         limit, window = TOKEN_DL_BUDGET_BYTES, TOKEN_DL_WINDOW
     else:
         limit, window = ANON_DL_BUDGET_BYTES, ANON_DL_WINDOW
-    dq = _download_windows.setdefault(ip, deque())
-    while dq and now - dq[0][0] > window:
-        dq.popleft()
-    used = sum(b for _, b in dq)
-    if used > 0 and used + size_bytes > limit:
-        return max(1, int(window - (now - dq[0][0])))
-    dq.append((now, size_bytes))
-    if len(dq) > 4096:  # страховка памяти на экзотических клиентах
-        dq.popleft()
-    return None
+    scope = f"key:{g.api_key_id}" if g.get('api_key_id') else f"ip:{ip}"
+    with _DOWNLOAD_BUDGET_LOCK:
+        dq = _download_windows.setdefault(scope, deque())
+        while dq and now - dq[0][0] > window:
+            dq.popleft()
+        used = sum(b for _, b in dq)
+        if used > 0 and used + size_bytes > limit:
+            return max(1, int(window - (now - dq[0][0])))
+        dq.append((now, size_bytes))
+        if len(dq) > 4096:  # страховка от чрезмерного числа запросов
+            dq.popleft()
+        if len(_download_windows) > 10000:
+            # Удаляем пустые окна; если все активны, очищаем самый старый scope.
+            empty = [key for key, entries in _download_windows.items() if not entries]
+            for key in empty[:2000]:
+                _download_windows.pop(key, None)
+            if len(_download_windows) > 10000:
+                oldest = min(_download_windows, key=lambda key: _download_windows[key][0][0] if _download_windows[key] else 0)
+                _download_windows.pop(oldest, None)
+        return None
 
 # Массовый экспорт: последнее время на область (IP или ключ)
 _export_all_scopes = {}
+_EXPORT_ALL_LOCK = threading.Lock()
 
 def get_auth():
-    if os.path.exists(AUTH_FILE):
+    if not os.path.exists(AUTH_FILE):
+        app.logger.critical('Файл авторизации отсутствует: %s; вход закрыт до настройки пароля', AUTH_FILE)
+        return None
+    try:
         with open(AUTH_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    # Дефолтные данные, если файл не создан (пользователь должен запустить change_password.py)
-    return {"username": "admin", "password_hash": generate_password_hash("admin")}
+            auth = json.load(f)
+        try:
+            os.chmod(AUTH_FILE, 0o600)
+        except OSError:
+            pass
+        if not isinstance(auth, dict) or not auth.get('username') or not auth.get('password_hash'):
+            raise ValueError('auth.json должен содержать username и password_hash')
+        return auth
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        app.logger.exception('Не удалось прочитать файл авторизации %s: %s', AUTH_FILE, e)
+        return None
+
+def serialized_mutation(f):
+    """Serialize DB read-modify-write admin operations against parallel uploads."""
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        with UPLOAD_LOCK:
+            return f(*args, **kwargs)
+    return wrapped
 
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not session.get('logged_in'):
+        if not session.get('logged_in') or get_auth() is None:
+            session.clear()
             return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
     return decorated_function
 
+def _login_csrf_input():
+    token = session.setdefault('_csrf_token', secrets.token_urlsafe(32))
+    return f'<input type="hidden" name="csrf_token" value="{token}">'
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    auth = get_auth()
+    if auth is None:
+        return '''<!DOCTYPE html><html lang="ru"><meta charset="utf-8"><title>Требуется настройка</title>
+        <h1>Вход отключён: не настроены учётные данные</h1>
+        <p>Администратор должен создать auth.json через change_password.py и перезапустить сервис.</p></html>''', 503
     if request.method == 'POST':
-        auth = get_auth()
+        expected_csrf = session.get('_csrf_token')
+        provided_csrf = request.form.get('csrf_token', '')
+        if not expected_csrf or not hmac.compare_digest(expected_csrf, provided_csrf):
+            return 'CSRF-токен отсутствует или неверен', 400
         if request.form.get('username') == auth['username'] and check_password_hash(auth['password_hash'], request.form.get('password', '')):
+            session.clear()
             session['logged_in'] = True
+            session['_csrf_token'] = secrets.token_urlsafe(32)
+            session.permanent = True
             app.logger.info('Вход: пользователь "%s" с %s', request.form.get('username'), request.remote_addr)
             next_page = request.args.get('next', '/f/')
             # Защита от open redirect: только относительные пути внутри сайта
@@ -1654,7 +1782,7 @@ def login():
             return redirect(next_page)
         app.logger.warning('Неудачная попытка входа: логин "%s" с %s',
                            request.form.get('username'), request.remote_addr)
-        return '''<!DOCTYPE html><html><head><title>Вход - АЛЬБИОН</title>
+        page = '''<!DOCTYPE html><html><head><title>Вход - АЛЬБИОН</title>
         <style>body{font-family:'Segoe UI',Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f9;margin:0}
         .box{background:white;padding:40px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.1);width:320px;text-align:center}
         h2{color:#1e3a8a;margin-top:0}input{width:100%;padding:12px;margin:10px 0;border:1px solid #cbd5e1;border-radius:6px;font-size:14px;box-sizing:border-box}
@@ -1665,12 +1793,13 @@ def login():
         <form method="post"><input name="username" placeholder="Логин" required>
         <input type="password" name="password" placeholder="Пароль" required>
         <button type="submit">Войти</button></form></div></body></html>'''
-    
+        return page.replace('<form method="post">', '<form method="post">' + _login_csrf_input())
+
     # Если уже залогинен, редирект
     if session.get('logged_in'):
         return redirect('/f/')
         
-    return '''<!DOCTYPE html><html><head><title>Вход - АЛЬБИОН</title>
+    page = '''<!DOCTYPE html><html><head><title>Вход - АЛЬБИОН</title>
     <style>body{font-family:'Segoe UI',Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f9;margin:0}
     .box{background:white;padding:40px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.1);width:320px;text-align:center}
     h2{color:#1e3a8a;margin-top:0}input{width:100%;padding:12px;margin:10px 0;border:1px solid #cbd5e1;border-radius:6px;font-size:14px;box-sizing:border-box}
@@ -1680,6 +1809,7 @@ def login():
     <form method="post"><input name="username" placeholder="Логин" required>
     <input type="password" name="password" placeholder="Пароль" required>
     <button type="submit">Войти</button></form></div></body></html>'''
+    return page.replace('<form method="post">', '<form method="post">' + _login_csrf_input())
 
 @app.route('/logout')
 def logout():
@@ -1740,7 +1870,8 @@ def browse_folder(folder_id=None):
         stats_info=stats_info,
         stats=stats,
         disk=disk,
-        base_url=BASE_URL)
+        base_url=BASE_URL,
+        csrf_token=session.setdefault('_csrf_token', secrets.token_urlsafe(32)))
 
 @app.route('/d/<folder_ref>')
 @limiter.limit("60 per minute")
@@ -1777,7 +1908,8 @@ def public_folder(folder_ref):
         if record.get('folder_id') != fid:
             continue
         physical_path = record.get('physical_path', record['current_filename'])
-        if not os.path.isfile(os.path.join(UPLOAD_FOLDER, physical_path)):
+        safe_path = safe_upload_path(physical_path)
+        if not safe_path or not os.path.isfile(safe_path):
             continue
         files_data.append({
             'name': record['display_name'],
@@ -1786,8 +1918,8 @@ def public_folder(folder_ref):
             'is_image': record.get('is_image', False),
             'size': format_size(record.get('size', 0)),
             'mtime': record['mtime'],
-            'download_url': f"{BASE_URL}/{physical_path}",
-            'view_url': f"{BASE_URL}/v/{physical_path}",
+            'download_url': f"{BASE_URL}/{url_path(physical_path)}",
+            'view_url': f"{BASE_URL}/v/{url_path(physical_path)}",
         })
     files_data.sort(key=lambda x: x['mtime'], reverse=True)
 
@@ -1865,7 +1997,10 @@ def upload_file():
 
             physical_path = os.path.relpath(os.path.join(folder_physical_path, current_filename), UPLOAD_FOLDER)
 
-            save_path = os.path.join(UPLOAD_FOLDER, physical_path)
+            save_path = safe_upload_path(physical_path)
+            if save_path is None:
+                app.logger.error('Загрузка отклонена: небезопасный путь %r', physical_path)
+                continue
             file.save(save_path)
             existing_names.add(current_filename)
 
@@ -1952,7 +2087,12 @@ def upload_folder():
             # Потокобезопасный поиск/создание цепочки папок (важно при параллельных батчах)
             current_parent, current_physical, new_folder_ids = ensure_folder_path(folder_parts, folder_id)
             created_folders.update(new_folder_ids)
-            os.makedirs(current_physical, exist_ok=True)
+            current_rel = os.path.relpath(current_physical, UPLOAD_FOLDER)
+            safe_current = safe_upload_path(current_rel)
+            if safe_current is None:
+                app.logger.error('Загрузка папки отклонена: небезопасная папка %r', current_rel)
+                continue
+            os.makedirs(safe_current, exist_ok=True)
 
             internal_id = str(uuid.uuid4())
             ext = get_file_ext(filename)
@@ -1978,12 +2118,9 @@ def upload_folder():
                 current_filename = f"{internal_id}.{ext}" if ext else internal_id
 
             physical_path = os.path.relpath(os.path.join(current_physical, current_filename), UPLOAD_FOLDER)
-            save_path = os.path.join(UPLOAD_FOLDER, physical_path)
-
-            # Страховка от выхода за пределы uploads
-            upload_root = os.path.realpath(UPLOAD_FOLDER)
-            if not os.path.realpath(save_path).startswith(upload_root + os.sep):
-                app.logger.error('Загрузка папки: "%s" отклонён страховкой realpath (%s)', rel_path, save_path)
+            save_path = safe_upload_path(physical_path)
+            if save_path is None:
+                app.logger.error('Загрузка папки: "%s" отклонена страховкой realpath (%s)', rel_path, physical_path)
                 continue
 
             file.save(save_path)
@@ -2025,30 +2162,40 @@ def view_file(filepath):
         pass
 
     # Счётчик растёт только для реальных файлов в БД
-    full_path = os.path.join(UPLOAD_FOLDER, filepath)
-    if not os.path.isfile(full_path):
+    full_path = safe_upload_path(filepath)
+    if not full_path or not os.path.isfile(full_path):
         return "Файл не найден", 404
 
-    record = bump_counter(lambda r: r.get('physical_path') == filepath, 'view_count')
+    db = load_db()
+    record = next((r for r in db.values() if r.get('physical_path') == filepath), None)
     if record is None:
         return "Файл не найден", 404
 
+    if request.method == 'HEAD':
+        return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=False)
+
     retry_after = check_download_budget(request.remote_addr, record.get('size', 0) or 0)
     if retry_after:
-        app.logger.warning('Бюджет скачивания исчерпан (%s), файл %s, retry через %d c',
+        app.logger.warning('Бюджет просмотра исчерпан (%s), файл %s, retry через %d c',
                            request.remote_addr, filepath, retry_after)
         resp = jsonify({'error': f'Слишком много скачиваний, повторите через {max(1, retry_after // 60)} мин'})
         resp.headers['Retry-After'] = str(retry_after)
         return resp, 429
 
-    app.logger.info('Просмотр: %s (👁=%d) [%s]', filepath, record.get('view_count', 0),
+    updated = bump_counter(lambda r: r.get('physical_path') == filepath, 'view_count')
+    if updated is None:
+        return "Файл не найден", 404
+    app.logger.info('Просмотр: %s (👁=%d) [%s]', filepath, updated.get('view_count', 0),
                     g.get('api_key') or 'анонимно')
     return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=False)
 
 @app.route('/api/update_file', methods=['POST'])
 @login_required
+@serialized_mutation
 def update_file():
-    data = request.json
+    data = get_json_object()
+    if data is None:
+        return jsonify({'error': 'Ожидается JSON-объект'}), 400
     internal_id = data.get('internal_id')
     display_name = data.get('display_name', '').strip()
     physical_filename = data.get('physical_filename', '').strip().replace('+', '_')
@@ -2076,12 +2223,19 @@ def update_file():
                 and other.get('current_filename') == physical_filename:
             return jsonify({'error': 'Файл с таким именем уже есть в этой папке'}), 400
 
-    new_folder_physical = get_folder_physical_path(new_folder_id, folders)
+    new_folder_candidate = get_folder_physical_path(new_folder_id, folders)
+    new_folder_rel = os.path.relpath(new_folder_candidate, UPLOAD_FOLDER)
+    new_folder_physical = safe_upload_path(new_folder_rel, allow_root=True)
+    old_full_path = safe_upload_path(old_physical_path)
+    if new_folder_physical is None or old_full_path is None:
+        return jsonify({'error': 'Небезопасный путь файла или папки'}), 400
     os.makedirs(new_folder_physical, exist_ok=True)
-    
-    old_full_path = os.path.join(UPLOAD_FOLDER, old_physical_path)
+
     new_physical_path = os.path.join(new_folder_physical, physical_filename)
     new_rel_path = os.path.relpath(new_physical_path, UPLOAD_FOLDER)
+    new_physical_path = safe_upload_path(new_rel_path)
+    if new_physical_path is None:
+        return jsonify({'error': 'Небезопасный путь назначения'}), 400
 
     if os.path.exists(old_full_path):
         if os.path.exists(new_physical_path) and old_physical_path != new_rel_path:
@@ -2123,8 +2277,11 @@ def update_file():
 
 @app.route('/api/move_file', methods=['POST'])
 @login_required
+@serialized_mutation
 def move_file():
-    data = request.json
+    data = get_json_object()
+    if data is None:
+        return jsonify({'error': 'Ожидается JSON-объект'}), 400
     file_id = data.get('file_id')
     target_folder_id = data.get('target_folder_id') or None
 
@@ -2144,12 +2301,19 @@ def move_file():
     if record.get('folder_id') == target_folder_id:
         return jsonify({'error': 'Файл уже в этой папке'}), 400
 
-    new_folder_physical = get_folder_physical_path(target_folder_id, folders)
+    new_folder_candidate = get_folder_physical_path(target_folder_id, folders)
+    new_folder_rel = os.path.relpath(new_folder_candidate, UPLOAD_FOLDER)
+    new_folder_physical = safe_upload_path(new_folder_rel, allow_root=True)
+    old_full_path = safe_upload_path(old_physical_path)
+    if new_folder_physical is None or old_full_path is None:
+        return jsonify({'error': 'Небезопасный путь файла или папки'}), 400
     os.makedirs(new_folder_physical, exist_ok=True)
 
-    old_full_path = os.path.join(UPLOAD_FOLDER, old_physical_path)
     new_physical_path = os.path.join(new_folder_physical, old_filename)
     new_rel_path = os.path.relpath(new_physical_path, UPLOAD_FOLDER)
+    new_physical_path = safe_upload_path(new_rel_path)
+    if new_physical_path is None:
+        return jsonify({'error': 'Небезопасный путь назначения'}), 400
 
     existing_names = set()
     for rid, rec in db.items():
@@ -2188,8 +2352,11 @@ def move_file():
 
 @app.route('/api/move_files_batch', methods=['POST'])
 @login_required
+@serialized_mutation
 def move_files_batch():
-    data = request.json
+    data = get_json_object()
+    if data is None:
+        return jsonify({'error': 'Ожидается JSON-объект'}), 400
     file_ids = data.get('file_ids', [])
     target_folder_id = data.get('target_folder_id') or None
 
@@ -2203,7 +2370,11 @@ def move_files_batch():
         return jsonify({'error': 'Целевая папка не найдена'}), 404
 
     moved_count = 0
-    new_folder_physical = get_folder_physical_path(target_folder_id, folders)
+    new_folder_candidate = get_folder_physical_path(target_folder_id, folders)
+    new_folder_rel = os.path.relpath(new_folder_candidate, UPLOAD_FOLDER)
+    new_folder_physical = safe_upload_path(new_folder_rel, allow_root=True)
+    if new_folder_physical is None:
+        return jsonify({'error': 'Небезопасный путь назначения'}), 400
     os.makedirs(new_folder_physical, exist_ok=True)
 
     for file_id in file_ids:
@@ -2216,7 +2387,10 @@ def move_files_batch():
 
         old_physical_path = record.get('physical_path', record['current_filename'])
         old_filename = record['current_filename']
-        old_full_path = os.path.join(UPLOAD_FOLDER, old_physical_path)
+        old_full_path = safe_upload_path(old_physical_path)
+        if old_full_path is None:
+            app.logger.error('Перемещение отклонено: небезопасный путь %r', old_physical_path)
+            continue
 
         existing_names = set()
         for rid, rec in db.items():
@@ -2236,6 +2410,9 @@ def move_files_batch():
 
         new_physical_path = os.path.join(new_folder_physical, final_filename)
         new_rel_path = os.path.relpath(new_physical_path, UPLOAD_FOLDER)
+        new_physical_path = safe_upload_path(new_rel_path)
+        if new_physical_path is None:
+            continue
 
         if os.path.exists(old_full_path):
             try:
@@ -2258,8 +2435,11 @@ def move_files_batch():
 
 @app.route('/api/delete_files_batch', methods=['POST'])
 @login_required
+@serialized_mutation
 def delete_files_batch():
-    data = request.json
+    data = get_json_object()
+    if data is None:
+        return jsonify({'error': 'Ожидается JSON-объект'}), 400
     file_ids = data.get('file_ids', [])
 
     if not file_ids:
@@ -2274,7 +2454,10 @@ def delete_files_batch():
 
         record = db[file_id]
         physical_path = record.get('physical_path', record['current_filename'])
-        filepath = os.path.join(UPLOAD_FOLDER, physical_path)
+        filepath = safe_upload_path(physical_path)
+        if filepath is None:
+            app.logger.error('Удаление отклонено: небезопасный путь %r', physical_path)
+            continue
 
         if os.path.exists(filepath):
             try:
@@ -2289,8 +2472,11 @@ def delete_files_batch():
 
 @app.route('/api/create_folder', methods=['POST'])
 @login_required
+@serialized_mutation
 def create_folder():
-    data = request.json
+    data = get_json_object()
+    if data is None:
+        return jsonify({'error': 'Ожидается JSON-объект'}), 400
     name = data.get('name', '').strip()
     parent_id = data.get('parent_id') or None
 
@@ -2314,16 +2500,23 @@ def create_folder():
     }
     folders[folder_id]['slug'] = make_short_slug(name, folders=folders)
     
-    physical_path = get_folder_physical_path(folder_id, folders)
+    folder_candidate = get_folder_physical_path(folder_id, folders)
+    folder_rel = os.path.relpath(folder_candidate, UPLOAD_FOLDER)
+    physical_path = safe_upload_path(folder_rel)
+    if physical_path is None:
+        return jsonify({'error': 'Небезопасный путь папки'}), 400
     os.makedirs(physical_path, exist_ok=True)
-    
+
     save_folders(folders)
     return jsonify({'success': True, 'folder_id': folder_id})
 
 @app.route('/api/delete_folder', methods=['POST'])
 @login_required
+@serialized_mutation
 def delete_folder():
-    data = request.json
+    data = get_json_object()
+    if data is None:
+        return jsonify({'error': 'Ожидается JSON-объект'}), 400
     folder_id = data.get('folder_id')
 
     folders = load_folders()
@@ -2332,25 +2525,47 @@ def delete_folder():
     if folder_id not in folders:
         return jsonify({'error': 'Папка не найдена'}), 404
 
+    subtree = set()
+    stack = [folder_id]
+    while stack:
+        current_id = stack.pop()
+        if current_id in subtree or current_id not in folders:
+            continue
+        subtree.add(current_id)
+        stack.extend(fid for fid, rec in folders.items() if rec.get('parent_id') == current_id)
+    for rec in db.values():
+        if rec.get('folder_id') in subtree:
+            phys = rec.get('physical_path', rec['current_filename'])
+            if safe_upload_path(phys) is None:
+                return jsonify({'error': 'В БД найден небезопасный путь; удаление отменено'}), 400
+    for current_id in subtree:
+        candidate = get_folder_physical_path(current_id, folders)
+        rel = os.path.relpath(candidate, UPLOAD_FOLDER)
+        if safe_upload_path(rel) is None:
+            return jsonify({'error': 'В БД найден небезопасный путь папки; удаление отменено'}), 400
+
     def delete_recursive(fid):
         files_to_delete = [internal_id for internal_id, record in db.items() if record.get('folder_id') == fid]
         for internal_id in files_to_delete:
             physical_path = db[internal_id].get('physical_path', db[internal_id]['current_filename'])
-            full_path = os.path.join(UPLOAD_FOLDER, physical_path)
+            full_path = safe_upload_path(physical_path)
+            if full_path is None:
+                raise ValueError(f'Небезопасный путь файла: {physical_path!r}')
             if os.path.exists(full_path):
                 os.remove(full_path)
             del db[internal_id]
-        
+
         subfolders = [fid2 for fid2, f in folders.items() if f.get('parent_id') == fid]
         for subfolder_id in subfolders:
             delete_recursive(subfolder_id)
-        
-        physical_path = get_folder_physical_path(fid, folders)
+
+        folder_candidate = get_folder_physical_path(fid, folders)
+        folder_rel = os.path.relpath(folder_candidate, UPLOAD_FOLDER)
+        physical_path = safe_upload_path(folder_rel)
+        if physical_path is None:
+            raise ValueError(f'Небезопасный путь папки: {folder_rel!r}')
         if os.path.exists(physical_path):
-            try:
-                shutil.rmtree(physical_path)
-            except:
-                pass
+            shutil.rmtree(physical_path)
         del folders[fid]
 
     delete_recursive(folder_id)
@@ -2361,8 +2576,11 @@ def delete_folder():
 
 @app.route('/api/delete_file', methods=['POST'])
 @login_required
+@serialized_mutation
 def delete_file():
-    data = request.json
+    data = get_json_object()
+    if data is None:
+        return jsonify({'error': 'Ожидается JSON-объект'}), 400
     internal_id = data.get('internal_id')
 
     db = load_db()
@@ -2371,7 +2589,9 @@ def delete_file():
 
     record = db[internal_id]
     physical_path = record.get('physical_path', record['current_filename'])
-    filepath = os.path.join(UPLOAD_FOLDER, physical_path)
+    filepath = safe_upload_path(physical_path)
+    if filepath is None:
+        return jsonify({'error': 'Небезопасный путь файла'}), 400
 
     if os.path.exists(filepath):
         try:
@@ -2429,7 +2649,7 @@ def export_xlsx():
         folder_path = '/'.join(get_folder_path(record.get('folder_id'), folders)) if record.get('folder_id') else 'Корень'
         physical_path = record.get('physical_path', record['current_filename'])
         # Ссылка с нормальной кириллицей (без URL-кодирования)
-        download_url = f"{BASE_URL}/{physical_path}"
+        download_url = f"{BASE_URL}/{url_path(physical_path)}"
         
         ws.append([
             folder_path,
@@ -2474,26 +2694,30 @@ def direct_file_access(filepath):
     except:
         pass
 
-    full_path = os.path.join(UPLOAD_FOLDER, filepath)
+    full_path = safe_upload_path(filepath)
     record = None
 
-    # 1) Прямая ссылка по физическому пути (счётчик растёт только для реальных файлов)
-    if os.path.isfile(full_path):
-        record = bump_counter(lambda r: r.get('physical_path') == filepath, 'download_count')
-
-    # 2) Индивидуальная ссылка (алиас) или короткая ссылка (слаг)
+    # Сначала находим запись, проверяем файл и бюджет; счётчик качания меняем
+    # только после принятия запроса, чтобы ответы 404/429 не засоряли статистику.
+    db = load_db()
+    if full_path and os.path.isfile(full_path):
+        record = next((r for r in db.values() if r.get('physical_path') == filepath), None)
     if record is None:
-        record = bump_counter(
-            lambda r: (r.get('custom_alias') and r.get('custom_alias') == filepath)
-                   or (r.get('slug') and r.get('slug') == filepath),
-            'download_count')
+        record = next((r for r in db.values()
+                       if (r.get('custom_alias') and r.get('custom_alias') == filepath)
+                       or (r.get('slug') and r.get('slug') == filepath)), None)
         if record is not None:
             filepath = record.get('physical_path', record['current_filename'])
-            if not os.path.isfile(os.path.join(UPLOAD_FOLDER, filepath)):
+            full_path = safe_upload_path(filepath)
+            if not full_path or not os.path.isfile(full_path):
                 return "Файл не найден", 404
 
     if record is None:
         return "Файл не найден", 404
+
+    if request.method == 'HEAD':
+        return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=True,
+                                   download_name=record['current_filename'].replace('+', '_'))
 
     retry_after = check_download_budget(request.remote_addr, record.get('size', 0) or 0)
     if retry_after:
@@ -2503,6 +2727,10 @@ def direct_file_access(filepath):
         resp.headers['Retry-After'] = str(retry_after)
         return resp, 429
 
+    updated = bump_counter(lambda r: r.get('physical_path') == filepath, 'download_count')
+    if updated is None:
+        return "Файл не найден", 404
+    record = updated
     app.logger.info('Скачивание: %s (⬇=%d) от %s [%s]', filepath,
                     record.get('download_count', 0), request.remote_addr,
                     g.get('api_key') or 'анонимно')
@@ -2510,44 +2738,63 @@ def direct_file_access(filepath):
     return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=True,
                                download_name=record['current_filename'].replace('+', '_'))
 
-@app.route('/export_all')
+@app.route('/export_all', methods=['GET', 'HEAD'])
 @limiter.limit("2 per minute")
 def export_all():
     """Массовое скачивание всего хранилища одним ZIP.
     Не чаще раза в час на IP (анонимно) или на API-ключ."""
-    now = time.time()
-    scope = f"key:{g.api_key}" if g.get('api_key') else f"ip:{request.remote_addr}"
-    last = _export_all_scopes.get(scope)
-    if last and now - last < EXPORT_ALL_INTERVAL:
-        retry = int(EXPORT_ALL_INTERVAL - (now - last))
-        app.logger.warning('Экспорт всего: отказ (повтор раньше часа), scope=%s, retry %d c', scope, retry)
-        resp = jsonify({'error': f'Массовое скачивание доступно раз в час, повторите через {max(1, retry // 60)} мин'})
-        resp.headers['Retry-After'] = str(retry)
-        return resp, 429
+    if request.method == 'HEAD':
+        return '', 405
+    scope = f"key:{g.api_key_id}" if g.get('api_key_id') else f"ip:{request.remote_addr}"
+    with _EXPORT_ALL_LOCK:
+        now = time.time()
+        last = _export_all_scopes.get(scope)
+        if last and now - last < EXPORT_ALL_INTERVAL:
+            retry = int(EXPORT_ALL_INTERVAL - (now - last))
+            app.logger.warning('Экспорт всего: отказ (повтор раньше часа), scope=%s, retry %d c', scope, retry)
+            resp = jsonify({'error': f'Массовое скачивание доступно раз в час, повторите через {max(1, retry // 60)} мин'})
+            resp.headers['Retry-After'] = str(retry)
+            return resp, 429
 
-    db = load_db()
-    items = []
-    for rec in db.values():
-        phys = rec.get('physical_path', rec['current_filename'])
-        if os.path.isfile(os.path.join(UPLOAD_FOLDER, phys)):
-            items.append((phys, rec['current_filename']))
-    if not items:
-        return jsonify({'error': 'Нет файлов для архивирования'}), 404
+        db = load_db()
+        items = []
+        for rec in db.values():
+            phys = rec.get('physical_path', rec['current_filename'])
+            full = safe_upload_path(phys)
+            if full and os.path.isfile(full):
+                arcname = os.path.relpath(full, os.path.realpath(UPLOAD_FOLDER))
+                items.append((full, arcname))
+        if not items:
+            return jsonify({'error': 'Нет файлов для архивирования'}), 404
+        total_bytes = sum(os.path.getsize(path) for path, _ in items)
+        retry_after = check_download_budget(request.remote_addr, total_bytes)
+        if retry_after:
+            resp = jsonify({'error': f'Бюджет скачивания исчерпан; повторите через {max(1, retry_after // 60)} мин'})
+            resp.headers['Retry-After'] = str(retry_after)
+            return resp, 429
+        if shutil.disk_usage(UPLOAD_FOLDER).free < total_bytes + 64 * 1024 * 1024:
+            return jsonify({'error': 'Недостаточно свободного места для временного архива'}), 507
 
-    # Подчистка старых временных архивов (старше 2 часов)
-    for fn in os.listdir(UPLOAD_FOLDER):
-        if fn.startswith('.export_all-') and fn.endswith('.zip'):
+        for fn in os.listdir(UPLOAD_FOLDER):
+            if fn.startswith('.export_all-') and fn.endswith('.zip'):
+                try:
+                    if now - os.path.getmtime(os.path.join(UPLOAD_FOLDER, fn)) > 7200:
+                        os.remove(os.path.join(UPLOAD_FOLDER, fn))
+                except OSError:
+                    pass
+
+        tmp_path = os.path.join(UPLOAD_FOLDER, f".export_all-{uuid.uuid4()}.zip")
+        try:
+            with zipfile.ZipFile(tmp_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+                for full_path, arcname in items:
+                    zf.write(full_path, arcname=arcname.replace('+', '_'))
+            _export_all_scopes[scope] = now
+        except Exception:
             try:
-                if now - os.path.getmtime(os.path.join(UPLOAD_FOLDER, fn)) > 7200:
-                    os.remove(os.path.join(UPLOAD_FOLDER, fn))
+                os.remove(tmp_path)
             except OSError:
                 pass
-
-    _export_all_scopes[scope] = now
-    tmp_path = os.path.join(UPLOAD_FOLDER, f".export_all-{int(now)}.zip")
-    with zipfile.ZipFile(tmp_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
-        for phys, _orig in items:
-            zf.write(os.path.join(UPLOAD_FOLDER, phys), arcname=phys.replace('+', '_'))
+            raise
 
     app.logger.info('Экспорт всего хранилища: %d файл(ов), %s, scope=%s',
                     len(items), format_size(os.path.getsize(tmp_path)), scope)
@@ -2559,7 +2806,9 @@ def export_all():
 def export_zip():
     """ZIP по выделению: выбранные файлы + выбранные папки (рекурсивно).
     Возвращает публичную ссылку на архив (id — uuid, неугадываемый), живёт сутки."""
-    data = request.json or {}
+    data = get_json_object()
+    if data is None:
+        return jsonify({'error': 'Ожидается JSON-объект'}), 400
     file_ids = data.get('file_ids', [])
     folder_ids = data.get('folder_ids', [])
     if not file_ids and not folder_ids:
@@ -2592,8 +2841,12 @@ def export_zip():
         if rec.get('folder_id') in seen_folders:
             phys = rec.get('physical_path', rec['current_filename'])
             items_map[phys] = phys
-    items = [(phys, phys) for phys in items_map
-             if os.path.isfile(os.path.join(UPLOAD_FOLDER, phys))]
+    items = []
+    for phys in items_map:
+        safe_path = safe_upload_path(phys)
+        if safe_path and os.path.isfile(safe_path):
+            arcname = os.path.relpath(safe_path, os.path.realpath(UPLOAD_FOLDER))
+            items.append((safe_path, arcname))
     if not items:
         return jsonify({'error': 'Нет файлов для архивирования'}), 404
 
@@ -2611,8 +2864,8 @@ def export_zip():
     zip_id = str(uuid.uuid4())
     zip_path = os.path.join(ZIPLINKS_DIR, zip_id + '.zip')
     with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
-        for phys, _ in items:
-            zf.write(os.path.join(UPLOAD_FOLDER, phys), arcname=phys.replace('+', '_'))
+        for safe_path, arcname in items:
+            zf.write(safe_path, arcname=arcname.replace('+', '_'))
 
     size = os.path.getsize(zip_path)
     app.logger.info('Создан архив по выборке: %d файл(ов), %s, /z/%s, от %s',
@@ -2626,12 +2879,25 @@ def download_zip(zip_id):
     if not re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', zip_id):
         abort(404)
     path = os.path.join(ZIPLINKS_DIR, zip_id + '.zip')
-    if not os.path.isfile(path):
+    if not os.path.isfile(path) or time.time() - os.path.getmtime(path) > 86400:
         abort(404)
-    app.logger.info('Скачивание архива /z/%s (%s) от %s', zip_id,
-                    format_size(os.path.getsize(path)), request.remote_addr)
+    size = os.path.getsize(path)
+    if request.method == 'HEAD':
+        return send_file(path, as_attachment=True,
+                         download_name=f"albion-archive-{datetime.now().strftime('%Y%m%d-%H%M')}.zip")
+    retry_after = check_download_budget(request.remote_addr, size)
+    if retry_after:
+        resp = jsonify({'error': f'Бюджет скачивания исчерпан; повторите через {max(1, retry_after // 60)} мин'})
+        resp.headers['Retry-After'] = str(retry_after)
+        return resp, 429
+    app.logger.info('Скачивание архива /z/%s (%s) от %s [%s]', zip_id,
+                    format_size(size), request.remote_addr, g.get('api_key') or 'анонимно')
     return send_file(path, as_attachment=True,
                      download_name=f"albion-archive-{datetime.now().strftime('%Y%m%d-%H%M')}.zip")
+
+@app.route('/favicon.ico')
+def favicon():
+    return send_from_directory('static', 'logo.png', mimetype='image/png')
 
 @app.route('/robots.txt')
 def robots():

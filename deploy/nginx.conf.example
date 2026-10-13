@@ -1,12 +1,7 @@
 # Пример nginx для офисного деплоя АЛЬБИОН.
 # Скопируйте в deploy/nginx.conf, подставьте домен и пути к сертификатам.
-# Зоны лимитов — на уровне http (в conf.d допустимо).
-
-# Скачивание файлов: 30/мин на IP (анонимы; с X-API-Key лимитирует приложение)
-limit_req_zone  $binary_remote_addr zone=files:10m rate=30r/m;
-# Страницы папок и просмотр
-limit_req_zone  $binary_remote_addr zone=pages:10m rate=60r/m;
-# Параллельные соединения на IP
+# Лимиты запросов выполняет Flask-Limiter в приложении.
+# nginx дополнительно ограничивает параллельные соединения и скорость ответа.
 limit_conn_zone $binary_remote_addr zone=conn:10m;
 
 server {
@@ -32,7 +27,8 @@ server {
     add_header Strict-Transport-Security "max-age=31536000" always;
     add_header X-Content-Type-Options nosniff always;
 
-    # Скачивание файлов: умеренная скорость и число соединений на IP
+    # Публичные скачивания/страницы: ограничить параллельность и скорость.
+    # API-загрузка также идёт через этот location; настройте limit_rate под канал офиса.
     location / {
         limit_conn conn 5;
         limit_rate 20m;                      # 20 МБ/с на соединение, настройте под канал

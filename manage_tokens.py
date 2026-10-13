@@ -26,9 +26,14 @@ def load_tokens():
 
 
 def save_tokens(tokens):
+    os.makedirs(os.path.dirname(TOKENS_FILE) or '.', exist_ok=True)
     tmp = TOKENS_FILE + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
         json.dump(tokens, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
     os.replace(tmp, TOKENS_FILE)
 
 
