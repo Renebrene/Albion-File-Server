@@ -9,6 +9,7 @@ files_db.json
 folders_db.json
 stats.json
 auth.json
+tokens.json
 .secret_key
 *.tmp
 *.corrupt-*
@@ -18,6 +19,7 @@ chat-export-*.json
 
 # Загруженные файлы
 uploads/
+ziplinks/
 
 # Логи
 *.log

@@ -1,0 +1,56 @@
+# Пример nginx для офисного деплоя АЛЬБИОН.
+# Скопируйте в deploy/nginx.conf, подставьте домен и пути к сертификатам.
+# Зоны лимитов — на уровне http (в conf.d допустимо).
+
+# Скачивание файлов: 30/мин на IP (анонимы; с X-API-Key лимитирует приложение)
+limit_req_zone  $binary_remote_addr zone=files:10m rate=30r/m;
+# Страницы папок и просмотр
+limit_req_zone  $binary_remote_addr zone=pages:10m rate=60r/m;
+# Параллельные соединения на IP
+limit_conn_zone $binary_remote_addr zone=conn:10m;
+
+server {
+    listen 80;
+    server_name files.example.ru;
+    # Для Let's Encrypt: вебрут оставляем, остальное редиректим
+    location /.well-known/acme-challenge/ { root /var/www/certbot; }
+    location / { return 301 https://$host$request_uri; }
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name files.example.ru;
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    # Лимит размера загрузки контролирует приложение (сейчас — снят)
+    client_max_body_size 0;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options nosniff always;
+
+    # Скачивание файлов: умеренная скорость и число соединений на IP
+    location / {
+        limit_conn conn 5;
+        limit_rate 20m;                      # 20 МБ/с на соединение, настройте под канал
+        proxy_pass http://app:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+        client_body_temp_path /var/cache/nginx/client_temp;
+    }
+
+    # Админка (после логина) — без файловых лимитов скорости
+    location /f/ {
+        proxy_pass http://app:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+    }
+}

@@ -17,14 +17,22 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import secrets
 import threading
 import logging
+import hashlib
+import time
+import zipfile
+from collections import deque
 from logging.handlers import RotatingFileHandler
+from flask import Flask, request, send_from_directory, render_template_string, send_file, jsonify, abort, redirect, url_for, g
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+
+# Каталог данных (uploads + json-базы): '.' по умолчанию, в Docker — /app/data
+DATA_DIR = os.environ.get('ALBION_DATA_DIR', '.')
 
 app = Flask(__name__, static_folder='static')
 
 # ===== СЕКРЕТНЫЙ КЛЮЧ (сохраняется между перезапусками, сессии не слетают) =====
-SECRET_KEY_FILE = '.secret_key'
+SECRET_KEY_FILE = os.path.join(DATA_DIR, '.secret_key')
 
 def _get_or_create_secret_key():
     if os.path.exists(SECRET_KEY_FILE):
@@ -44,7 +52,7 @@ app.secret_key = _get_or_create_secret_key()
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
 # ===== ЛОГИРОВАНИЕ (файл + консоль/journal) =====
-LOG_FILE = 'albion.log'
+LOG_FILE = os.path.join(DATA_DIR, 'albion.log')
 
 _log_file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024,
                                         backupCount=3, encoding='utf-8')
@@ -96,10 +104,12 @@ def internal_error(e):
 
 # ===== КОНФИГУРАЦИЯ =====
 BASE_URL = "https://albion-rostov.cloudpub.ru"
-UPLOAD_FOLDER = 'uploads'
-STATS_FILE = 'stats.json'
-DB_FILE = 'files_db.json'
-FOLDERS_DB_FILE = 'folders_db.json'
+UPLOAD_FOLDER = os.path.join(DATA_DIR, 'uploads')
+STATS_FILE = os.path.join(DATA_DIR, 'stats.json')
+DB_FILE = os.path.join(DATA_DIR, 'files_db.json')
+FOLDERS_DB_FILE = os.path.join(DATA_DIR, 'folders_db.json')
+TOKENS_FILE = os.path.join(DATA_DIR, 'tokens.json')
+ZIPLINKS_DIR = os.path.join(DATA_DIR, 'ziplinks')
 
 ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar',
                       'docx', 'xlsx', 'mp4', 'mkv', 'doc', 'xls', 'pptx', '7z'}
@@ -122,6 +132,77 @@ def is_valid_filename(filename):
         return False
     pattern = r'^[\wа-яА-ЯёЁ\s\-\.\(\),!+&#@;=№]+$'
     return bool(re.match(pattern, filename, re.UNICODE))
+
+# ===== КОРОТКИЕ ССЫЛКИ (латинизированный слаг из имени файла) =====
+# Путь, занятый системой: короткая ссылка не может его замаскировать
+RESERVED_PATHS = {'login', 'logout', 'export_xlsx', 'export_all', 'upload', 'upload_folder',
+                  'robots.txt', 'favicon.ico', 'v', 'f', 'd', 'z', 'static', 'api'}
+
+# ===== БЮДЖЕТ СКАЧИВАНИЯ (защита от массового выкачивания из интернета) =====
+# Аноним: ГБ в скользящем окне часа; с API-ключом: ГБ в сутки (настраивается env)
+ANON_DL_BUDGET_BYTES = int(os.environ.get('ALBION_DL_BUDGET_GB', '10')) * 1024 ** 3
+TOKEN_DL_BUDGET_BYTES = int(os.environ.get('ALBION_TOKEN_DL_BUDGET_GB', '100')) * 1024 ** 3
+ANON_DL_WINDOW = 3600          # 1 час
+TOKEN_DL_WINDOW = 86400        # сутки
+EXPORT_ALL_INTERVAL = 3600     # массовое скачивание всего — не чаще раза в час
+
+# Русская латинизация для слагов
+TRANSLIT_MAP = str.maketrans({
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo', 'ж': 'zh',
+    'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o',
+    'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'h', 'ц': 'ts',
+    'ч': 'ch', 'ш': 'sh', 'щ': 'shch', 'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e',
+    'ю': 'yu', 'я': 'ya',
+})
+
+def unique_slug(base, db=None, exclude_id=None, folders=None):
+    """Обеспечивает уникальность слага среди slug/алиасов файлов И слагов папок."""
+    if db is None:
+        db = load_db()
+    taken = {rec.get('slug') for rec in db.values() if rec.get('slug')}
+    taken |= {rec.get('custom_alias') for rec in db.values() if rec.get('custom_alias')}
+    if folders is None:
+        folders = load_folders()
+    taken |= {f.get('slug') for f in folders.values() if f.get('slug')}
+    if exclude_id and exclude_id in db:
+        taken.discard(db[exclude_id].get('slug'))
+        taken.discard(db[exclude_id].get('custom_alias'))
+    if base not in taken:
+        return base
+    for i in range(2, 100):
+        cand = f"{base}-{i}"
+        if cand not in taken:
+            return cand
+    return f"{base}-{secrets.token_hex(4)}"
+
+def make_short_slug(name, db=None, exclude_id=None, folders=None):
+    """Короткая ссылка из имени: 'Ростов-на-Дону-Театральная пл. 2, РОЛЛЕР-B(4).jpg'
+    -> 'rostov-donu-teatra2-roller4'. Слова <=2 символов без цифр выбрасываются,
+    цифры приклеиваются к предыдущему слову, капа 48 символов."""
+    # Отрезаем только похоже на расширение хвост (jpg, docx...), но не «пл.» из адреса
+    text = name
+    dot_parts = name.rsplit('.', 1)
+    if len(dot_parts) == 2 and dot_parts[1].isalnum() and len(dot_parts[1]) <= 5:
+        text = dot_parts[0]
+    tokens = re.split(r'[^a-z0-9]+', text.lower().translate(TRANSLIT_MAP))
+    filtered = [t for t in tokens if len(t) > 2 or any(c.isdigit() for c in t)]
+    merged = []
+    for t in filtered:
+        if t.isdigit() and merged:
+            merged[-1] = (merged[-1] + t)[:8]
+        else:
+            merged.append(t[:6])
+    parts = []
+    total = 0
+    for t in merged:
+        if parts and total + len(t) + 1 > 48:
+            break
+        parts.append(t)
+        total += len(t) + 1
+    base = '-'.join(parts) if parts else 'f-' + secrets.token_hex(4)
+    if base in RESERVED_PATHS:
+        base += '-f'
+    return unique_slug(base, db, exclude_id, folders)
 
 # Имя папки: чёрный список — как в Windows (запрещены \ / : * ? " < > |, точки/пробелы по краям).
 # Так папки вида "Фото 2024, лето" или "Иванов & Ко" загружаются без ошибок.
@@ -216,6 +297,7 @@ def ensure_folder_path(folder_parts, parent_id):
                     'parent_id': current_parent,
                     'created': datetime.now().strftime('%d.%m.%Y %H:%M')
                 }
+                folders[found]['slug'] = make_short_slug(folder_name, folders=folders)
                 created_ids.append(found)
             current_parent = found
             current_physical = os.path.join(current_physical, folder_name)
@@ -240,8 +322,15 @@ def migrate_files():
         if 'download_count' not in record:
             record['download_count'] = 0
             changed = True
+        if not record.get('slug'):
+            record['slug'] = make_short_slug(
+                record.get('display_name') or record.get('original_filename') or record.get('current_filename', ''),
+                db, exclude_id=internal_id)
+            changed = True
     
     for filename in os.listdir(UPLOAD_FOLDER):
+        if filename.startswith('.'):  # служебные/временные файлы (.export_all-*.zip и пр.)
+            continue
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         if os.path.isfile(filepath):
             if not any(r.get('physical_path') == filename for r in db.values()):
@@ -269,6 +358,22 @@ def migrate_files():
     return db
 
 migrate_files()
+
+def migrate_folders():
+    """Добавляет короткие слаги папкам, у которых их ещё нет."""
+    folders = load_folders()
+    if not folders:
+        return
+    changed = False
+    db = load_db()
+    for f in folders.values():
+        if not f.get('slug'):
+            f['slug'] = make_short_slug(f['name'], db, folders=folders)
+            changed = True
+    if changed:
+        save_folders(folders)
+
+migrate_folders()
 
 # ===== СТАТИСТИКА =====
 def load_stats():
@@ -363,7 +468,9 @@ def get_files_in_folder(folder_id):
                     'folder_id': folder_id,
                     # Ссылки с нормальной кириллицей (без URL-кодирования)
                     'download_url': f"{BASE_URL}/{physical_path}",
-                    'view_url': f"{BASE_URL}/v/{physical_path}"
+                    'view_url': f"{BASE_URL}/v/{physical_path}",
+                    # Короткая латинизированная ссылка (переживает переименование)
+                    'short_url': f"{BASE_URL}/{record['slug']}" if record.get('slug') else f"{BASE_URL}/{physical_path}",
                 })
     return sorted(files, key=lambda x: x['mtime'], reverse=True)
 
@@ -378,6 +485,38 @@ def get_all_files():
         'total_size': format_size(total_size),
         'total_downloads': total_downloads
     }
+
+def get_folder_stats_map(folders, db):
+    """Рекурсивная статистика по каждой папке: (файлов, суммарный размер, подпапок).
+    Один проход по БД + мемоизация — дёшево даже на тысячах папок."""
+    files_agg = {}   # folder_id -> [файлов, байт]
+    children = {}    # parent_id -> [folder_id, ...]
+    for rec in db.values():
+        fid = rec.get('folder_id')
+        if fid in folders:
+            agg = files_agg.setdefault(fid, [0, 0])
+            agg[0] += 1
+            agg[1] += rec.get('size', 0)
+    for fid, f in folders.items():
+        children.setdefault(f.get('parent_id'), []).append(fid)
+
+    memo = {}
+    def stats(fid):
+        if fid in memo:
+            return memo[fid]
+        count, size = files_agg.get(fid, (0, 0))
+        subdirs = 0
+        for ch in children.get(fid, []):
+            c, s, sd = stats(ch)
+            count += c
+            size += s
+            subdirs += 1 + sd
+        memo[fid] = (count, size, subdirs)
+        return memo[fid]
+
+    for fid in folders:
+        stats(fid)
+    return memo
 
 # ===== HTML ШАБЛОН =====
 HTML_TEMPLATE = """
@@ -502,6 +641,7 @@ HTML_TEMPLATE = """
         .tile-name { padding: 8px; font-size: 12px; text-align: center; word-break: break-word; border-top: 1px solid #f1f5f9; background: #fafbfc; display: flex; flex-direction: column; align-items: center; gap: 4px; }
         .tile-name a { color: #1e293b; text-decoration: none; display: block; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; width: 100%; }
         .tile-name a:hover { color: #2563eb; }
+        .tile-name.row-actions { flex-direction: row; justify-content: space-between; align-items: center; padding: 6px 10px; }
         .tile-dl { font-size: 10px; color: #2563eb; font-weight: 600; }
 
         .files-list { display: flex; flex-direction: column; }
@@ -610,7 +750,11 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="card card-files">
-            <h2>📂 {{ 'Корень' if not current_folder else current_folder.name }} <span style="color:#64748b; font-weight:400; font-size:13px;">({{ files|length }} файлов, {{ subfolders|length }} папок)</span></h2>
+            <h2>📂 {{ 'Корень' if not current_folder else current_folder.name }} <span style="color:#64748b; font-weight:400; font-size:13px;">({{ files|length }} файлов, {{ subfolders|length }} папок)</span>
+                {% if current_folder %}
+                <button class="btn btn-sm" style="margin:0 0 0 8px; vertical-align:middle;" onclick='copyToClipboard("{{ base_url }}/d/{{ current_folder_slug or current_folder_id }}")' title="Скопировать публичную ссылку на эту папку">🔗 Ссылка на папку</button>
+                {% endif %}
+            </h2>
 
             <div class="breadcrumbs">
                 <a href="/f/">🏠 Корень</a>
@@ -626,6 +770,7 @@ HTML_TEMPLATE = """
 
             <div class="batch-actions" id="batchActions">
                 <span class="count">Выбрано: <span id="selectedCount">0</span></span>
+                <button class="btn btn-sm btn-success" onclick="executeBatchZip()">⬇ Скачать архив</button>
                 <button class="btn btn-sm btn-danger" onclick="batchDelete()">🗑️ Удалить выбранные</button>
                 <button class="btn btn-sm" onclick="openBatchMoveModal()">📁 Переместить</button>
                 <button class="btn btn-sm btn-secondary" onclick="clearSelection()">✕ Снять выделение</button>
@@ -656,14 +801,15 @@ HTML_TEMPLATE = """
                             <tbody>
                                 {% for folder in subfolders %}
                                 <tr class="folder-row" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
-                                    <td class="checkbox-cell"></td>
+                                    <td class="checkbox-cell"><input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" onchange="updateSelection()"></td>
                                     <td class="icon-cell"><span class="folder-icon">📁</span></td>
                                     <td><a href="/f/{{ folder.id }}" style="font-weight: 600;">{{ folder.name }}</a></td>
-                                    <td class="size-col">—</td>
+                                    <td class="size-col">{% if folder.file_count %}{{ folder.size }}{% else %}—{% endif %}</td>
                                     <td class="date-col">{{ folder.created }}</td>
-                                    <td class="type-col">Папка</td>
+                                    <td class="type-col">Папка · 📄 {{ folder.file_count }} · 📁 {{ folder.subdir_count }}</td>
                                     <td class="dl-col">—</td>
                                     <td class="actions-cell">
+                                        <button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку">🔗</button>
                                         <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить папку">🗑️</button>
                                     </td>
                                 </tr>
@@ -699,7 +845,7 @@ HTML_TEMPLATE = """
                                         <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить на уровень выше">⬆️</button>
                                         {% endif %}
                                         <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать">✏️</button>
-                                        <button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.download_url }}')" title="Копировать ссылку">🔗</button>
+                                        <button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку">🔗</button>
                                         <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить">🗑️</button>
                                     </td>
                                 </tr>
@@ -712,11 +858,13 @@ HTML_TEMPLATE = """
                         <div class="files-grid">
                             {% for folder in subfolders %}
                             <div class="tile" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
+                                <div class="tile-checkbox"><input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" onchange="updateSelection()"></div>
                                 <a href="/f/{{ folder.id }}" class="tile-folder">
                                     <div class="tile-folder-icon">📁</div>
                                     <div class="tile-folder-name">{{ folder.name }}</div>
                                 </a>
-                                <div class="tile-name">
+                                <div class="tile-name row-actions">
+                                    <button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку">🔗</button>
                                     <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить">🗑️</button>
                                 </div>
                             </div>
@@ -729,7 +877,7 @@ HTML_TEMPLATE = """
                                     <button onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше">⬆️</button>
                                     {% endif %}
                                     <button onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать">✏️</button>
-                                    <button onclick="copyToClipboard('{{ f.download_url }}')" title="Копировать ссылку">🔗</button>
+                                    <button onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку">🔗</button>
                                     <button class="del-btn" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить">🗑️</button>
                                 </div>
                                 {% if f.is_image %}
@@ -755,12 +903,14 @@ HTML_TEMPLATE = """
                         <div class="files-list">
                             {% for folder in subfolders %}
                             <div class="list-item folder-item" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
+                                <input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" onchange="updateSelection()">
                                 <span class="emoji-icon-sm">📁</span>
                                 <div class="list-name-wrap">
                                     <a href="/f/{{ folder.id }}" class="list-name" style="font-weight: 600;">{{ folder.name }}</a>
                                 </div>
                                 <span class="list-date">{{ folder.created }}</span>
                                 <div class="list-actions">
+                                    <button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку">🔗</button>
                                     <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить">🗑️</button>
                                 </div>
                             </div>
@@ -785,7 +935,7 @@ HTML_TEMPLATE = """
                                     <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше">⬆️</button>
                                     {% endif %}
                                     <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать">✏️</button>
-                                    <button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.download_url }}')" title="Копировать ссылку">🔗</button>
+                                    <button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку">🔗</button>
                                     <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить">🗑️</button>
                                 </div>
                             </div>
@@ -914,10 +1064,11 @@ HTML_TEMPLATE = """
     <div class="toast" id="toast"></div>
 
     <script>
-        const currentFolderId = '{{ current_folder.id if current_folder else "" }}';
-        const parentFolderId = '{{ current_folder.parent_id if current_folder else "" }}';
+        const currentFolderId = '{{ current_folder_id or "" }}';
+        const parentFolderId = '{{ (current_folder.parent_id or "") if current_folder else "" }}';
         let draggedFileId = null;
         let selectedFiles = new Set();
+        let selectedFolders = new Set();
         
         const viewBtns = document.querySelectorAll('.view-btn');
         const viewContainers = { table: document.getElementById('view-table'), grid: document.getElementById('view-grid'), list: document.getElementById('view-list') };
@@ -974,25 +1125,29 @@ HTML_TEMPLATE = """
         function updateSelection() {
             selectedFiles.clear();
             document.querySelectorAll('.file-checkbox:checked').forEach(cb => selectedFiles.add(cb.dataset.fileId));
+            selectedFolders.clear();
+            document.querySelectorAll('.folder-checkbox:checked').forEach(cb => selectedFolders.add(cb.dataset.folderId));
             document.querySelectorAll('.file-row, .tile, .list-item').forEach(el => {
                 const fileId = el.dataset.fileId;
-                if (fileId && selectedFiles.has(fileId)) el.classList.add('selected');
-                else el.classList.remove('selected');
+                const folderId = el.dataset.folderId;
+                const on = (fileId && selectedFiles.has(fileId)) || (folderId && selectedFolders.has(folderId));
+                el.classList.toggle('selected', !!on);
             });
             const batchActions = document.getElementById('batchActions');
             const selectedCount = document.getElementById('selectedCount');
-            if (selectedFiles.size > 0) { batchActions.classList.add('active'); selectedCount.textContent = selectedFiles.size; }
+            const total = selectedFiles.size + selectedFolders.size;
+            if (total > 0) { batchActions.classList.add('active'); selectedCount.textContent = total; }
             else { batchActions.classList.remove('active'); }
         }
 
         function toggleSelectAll() {
             const selectAll = document.getElementById('selectAll');
-            document.querySelectorAll('.file-checkbox').forEach(cb => { cb.checked = selectAll.checked; });
+            document.querySelectorAll('.file-checkbox, .folder-checkbox').forEach(cb => { cb.checked = selectAll.checked; });
             updateSelection();
         }
 
         function clearSelection() {
-            document.querySelectorAll('.file-checkbox').forEach(cb => { cb.checked = false; });
+            document.querySelectorAll('.file-checkbox, .folder-checkbox').forEach(cb => { cb.checked = false; });
             document.getElementById('selectAll').checked = false;
             updateSelection();
         }
@@ -1009,6 +1164,28 @@ HTML_TEMPLATE = """
                 if (response.ok) { showToast(`✅ Удалено: ${result.count}`); setTimeout(() => location.reload(), 800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
+        }
+
+        async function executeBatchZip() {
+            if (selectedFiles.size === 0 && selectedFolders.size === 0) return;
+            const btn = document.querySelector('#batchActions .btn-success');
+            btn.disabled = true; btn.textContent = '⏳ Создание архива...';
+            try {
+                const response = await fetch('/api/export_zip', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ file_ids: Array.from(selectedFiles), folder_ids: Array.from(selectedFolders) })
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    copyToClipboard(result.url);
+                    showToast(`✅ Архив: ${result.count} файл(ов), ${result.size}. Ссылка скопирована`);
+                    const a = document.createElement('a');
+                    a.href = result.url; a.download = '';
+                    document.body.appendChild(a); a.click(); a.remove();
+                    clearSelection();
+                } else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
+            } catch (err) { showToast('❌ Ошибка сети', true); }
+            finally { btn.disabled = false; btn.textContent = '⬇ Скачать архив'; }
         }
 
         function openBatchMoveModal() {
@@ -1310,9 +1487,143 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# ===== ПУБЛИЧНАЯ СТРАНИЦА ПАПКИ (без логина, по неугадываемому id) =====
+PUBLIC_FOLDER_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>АЛЬБИОН: {{ folder.name }}</title>
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
+    <meta name="robots" content="noindex">
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: #f4f4f9; margin: 0; min-height: 100vh; display: flex; flex-direction: column; }
+        .header { background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%); color: white; padding: 15px 30px; display: flex; align-items: center; gap: 15px; }
+        .header img { height: 42px; background: white; padding: 4px 7px; border-radius: 6px; }
+        .header h1 { margin: 0; font-size: 19px; font-weight: 700; }
+        .header .crumbs { font-size: 12px; opacity: 0.85; margin-top: 3px; }
+        .header .crumbs span.sep { opacity: 0.6; margin: 0 4px; }
+        .main { flex: 1; width: 100%; max-width: 950px; margin: 0 auto; padding: 20px 15px; }
+        .card { background: white; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); overflow: hidden; }
+        .item { display: flex; align-items: center; gap: 12px; padding: 10px 18px; border-bottom: 1px solid #f1f5f9; }
+        .item:last-child { border-bottom: none; }
+        .item:hover { background: #f8fafc; }
+        .item .icon { font-size: 22px; width: 28px; text-align: center; flex-shrink: 0; }
+        .item img.thumb { width: 32px; height: 32px; object-fit: cover; border-radius: 3px; }
+        .item .name { flex: 1; min-width: 0; }
+        .item .name a { color: #1e293b; text-decoration: none; font-size: 14px; word-break: break-all; }
+        .item .name a:hover { color: #2563eb; text-decoration: underline; }
+        .item .name .sub { font-size: 11px; color: #94a3b8; }
+        .item .meta { color: #64748b; font-size: 12px; white-space: nowrap; }
+        .item .actions a { color: #2563eb; font-size: 12px; text-decoration: none; background: #eff6ff; padding: 4px 10px; border-radius: 5px; font-weight: 600; }
+        .item .actions a:hover { background: #dbeafe; }
+        .folder-item { background: #fefce8; }
+        .folder-item:hover { background: #fef3c7; }
+        .empty { text-align: center; padding: 50px 20px; color: #94a3b8; }
+        .empty .icon { font-size: 44px; margin-bottom: 8px; }
+        .footer { text-align: center; color: #94a3b8; font-size: 11px; padding: 12px; }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <img src="{{ url_for('static', filename='logo.png') }}" alt="АЛЬБИОН">
+        <div>
+            <h1>📁 {{ folder.name }}</h1>
+            <div class="crumbs">
+                {% for crumb in breadcrumbs %}{{ crumb.name }}{% if not loop.last %}<span class="sep">/</span>{% endif %}{% endfor %}
+            </div>
+        </div>
+    </header>
+    <div class="main">
+        <div class="card">
+            {% if subfolders or files %}
+                {% for sf in subfolders %}
+                <div class="item folder-item">
+                    <span class="icon">📁</span>
+                    <div class="name">
+                        <a href="/d/{{ sf.slug or sf.id }}">{{ sf.name }}</a>
+                        <div class="sub">папка</div>
+                    </div>
+                </div>
+                {% endfor %}
+                {% for f in files %}
+                <div class="item">
+                    {% if f.is_image %}
+                        <img class="thumb" src="{{ f.view_url }}" alt="">
+                    {% else %}
+                        <span class="icon">{{ f.icon }}</span>
+                    {% endif %}
+                    <div class="name">
+                        <a href="{{ f.view_url if f.is_image else f.download_url }}" {% if not f.is_image %}download{% endif %} target="_blank">{{ f.name }}</a>
+                        <div class="sub">{{ f.ext }}</div>
+                    </div>
+                    <span class="meta">{{ f.size }} · {{ f.mtime }}</span>
+                    <span class="actions">
+                        <a href="{{ f.view_url }}" target="_blank">Открыть</a>
+                        <a href="{{ f.download_url }}" download>Скачать</a>
+                    </span>
+                </div>
+                {% endfor %}
+            {% else %}
+                <div class="empty">
+                    <div class="icon">📭</div>
+                    <div>Папка пуста</div>
+                </div>
+            {% endif %}
+        </div>
+    </div>
+    <div class="footer">АЛЬБИОН: Файловый сервер</div>
+</body>
+</html>
+"""
+
 
 # ===== АУТЕНТИФИКАЦИЯ =====
-AUTH_FILE = 'auth.json'
+AUTH_FILE = os.path.join(DATA_DIR, 'auth.json')
+
+# ===== API-КЛЮЧИ ДЛЯ АВТОМАТИКИ (tokens.json: {sha256(ключ): {name, created}}) =====
+def load_tokens():
+    return _load_json(TOKENS_FILE)
+
+def check_api_key(provided):
+    """Имя ключа, если предоставлен валидный API-ключ, иначе None."""
+    if not provided:
+        return None
+    key_hash = hashlib.sha256(provided.encode('utf-8')).hexdigest()
+    meta = load_tokens().get(key_hash)
+    return meta.get('name') if meta else None
+
+@app.before_request
+def _resolve_api_key():
+    """Определяем API-ключ один раз на запрос (заголовок X-API-Key или ?api_key=)."""
+    g.api_key = check_api_key(request.headers.get('X-API-Key') or request.args.get('api_key'))
+
+# ===== БЮДЖЕТ СКАЧИВАНИЯ: скользящее окно на IP =====
+_download_windows = {}
+
+def check_download_budget(ip, size_bytes):
+    """None — скачивание разрешено (usage записан); иначе сколько секунд ждать.
+    Одиночный файл больше лимита пропускается (used == 0), чтобы не блокировать
+    легитимное скачивание одного большого файла."""
+    now = time.time()
+    if g.get('api_key'):
+        limit, window = TOKEN_DL_BUDGET_BYTES, TOKEN_DL_WINDOW
+    else:
+        limit, window = ANON_DL_BUDGET_BYTES, ANON_DL_WINDOW
+    dq = _download_windows.setdefault(ip, deque())
+    while dq and now - dq[0][0] > window:
+        dq.popleft()
+    used = sum(b for _, b in dq)
+    if used > 0 and used + size_bytes > limit:
+        return max(1, int(window - (now - dq[0][0])))
+    dq.append((now, size_bytes))
+    if len(dq) > 4096:  # страховка памяти на экзотических клиентах
+        dq.popleft()
+    return None
+
+# Массовый экспорт: последнее время на область (IP или ключ)
+_export_all_scopes = {}
 
 def get_auth():
     if os.path.exists(AUTH_FILE):
@@ -1399,13 +1710,19 @@ def browse_folder(folder_id=None):
             current = folders[current].get('parent_id')
         breadcrumbs_data.reverse()
     
+    stats_map = get_folder_stats_map(folders, load_db())
     subfolders_data = []
     for fid, f in folders.items():
         if f.get('parent_id') == folder_id:
+            f_count, f_size, f_subdirs = stats_map.get(fid, (0, 0, 0))
             subfolders_data.append({
                 'id': fid,
                 'name': f['name'],
-                'created': f.get('created', '')
+                'created': f.get('created', ''),
+                'slug': f.get('slug', ''),
+                'file_count': f_count,
+                'subdir_count': f_subdirs,
+                'size': format_size(f_size),
             })
     
     files = get_files_in_folder(folder_id)
@@ -1415,12 +1732,73 @@ def browse_folder(folder_id=None):
     
     return render_template_string(HTML_TEMPLATE,
         current_folder=current_folder,
+        current_folder_id=folder_id,
+        current_folder_slug=(folders[folder_id].get('slug', '') if folder_id else ''),
         breadcrumbs=breadcrumbs_data,
         subfolders=subfolders_data,
         files=files,
         stats_info=stats_info,
         stats=stats,
-        disk=disk)
+        disk=disk,
+        base_url=BASE_URL)
+
+@app.route('/d/<folder_ref>')
+@limiter.limit("60 per minute")
+def public_folder(folder_ref):
+    """Публичный просмотр папки: по короткой ссылке (слагу) или по uuid.
+    Без логина: скачивание в проекте публичное, ссылка лишь открывает доступ
+    к содержимому конкретной папки."""
+    folders = load_folders()
+    fid = folder_ref if folder_ref in folders else None
+    if fid is None:
+        for cand_id, cand in folders.items():
+            if cand.get('slug') == folder_ref:
+                fid = cand_id
+                break
+    if fid is None:
+        abort(404)
+
+    folder = folders[fid]
+
+    breadcrumbs_data = []
+    path = get_folder_path(fid, folders)
+    current = fid
+    for name in reversed(path):
+        breadcrumbs_data.append({'id': current, 'name': name})
+        current = folders[current].get('parent_id')
+    breadcrumbs_data.reverse()
+
+    subfolders_data = [{'id': fid2, 'name': f['name'], 'slug': f.get('slug', '')}
+                       for fid2, f in folders.items() if f.get('parent_id') == fid]
+
+    files_data = []
+    db = load_db()
+    for record in db.values():
+        if record.get('folder_id') != fid:
+            continue
+        physical_path = record.get('physical_path', record['current_filename'])
+        if not os.path.isfile(os.path.join(UPLOAD_FOLDER, physical_path)):
+            continue
+        files_data.append({
+            'name': record['display_name'],
+            'ext': record['ext'],
+            'icon': get_file_icon(record['ext']),
+            'is_image': record.get('is_image', False),
+            'size': format_size(record.get('size', 0)),
+            'mtime': record['mtime'],
+            'download_url': f"{BASE_URL}/{physical_path}",
+            'view_url': f"{BASE_URL}/v/{physical_path}",
+        })
+    files_data.sort(key=lambda x: x['mtime'], reverse=True)
+
+    app.logger.info('Публичный просмотр папки "%s" (%s) от %s',
+                    folder['name'], fid, request.remote_addr)
+
+    return render_template_string(PUBLIC_FOLDER_TEMPLATE,
+        folder=folder,
+        breadcrumbs=breadcrumbs_data,
+        subfolders=subfolders_data,
+        files=files_data)
 
 @app.route('/upload', methods=['POST'])
 @login_required
@@ -1470,7 +1848,7 @@ def upload_file():
 
             internal_id = str(uuid.uuid4())
             ext = get_file_ext(file.filename)
-            original_name = file.filename
+            original_name = file.filename.replace('+', '_')
 
             if is_valid_filename(original_name):
                 current_filename = original_name
@@ -1499,6 +1877,7 @@ def upload_file():
                 'display_name': original_name,
                 'folder_id': folder_id,
                 'custom_alias': '',
+                'slug': make_short_slug(original_name, db, exclude_id=internal_id),
                 'link_rotated': False,
                 'download_count': 0,
                 'size': os.path.getsize(save_path),
@@ -1507,7 +1886,8 @@ def upload_file():
                 'is_image': ext in IMAGE_EXTENSIONS
             }
             saved_count += 1
-            app.logger.info('Загружен файл: %s (%s)', physical_path, format_size(os.path.getsize(save_path)))
+            app.logger.info('Загружен файл: %s (%s), короткая ссылка: /%s',
+                            physical_path, format_size(os.path.getsize(save_path)), db[internal_id]['slug'])
 
         if saved_count > 0:
             save_db(db)
@@ -1552,7 +1932,7 @@ def upload_folder():
                 continue
 
             parts = rel_path.replace('\\', '/').split('/')
-            filename = parts[-1]
+            filename = parts[-1].replace('+', '_')
             folder_parts = parts[:-1]
 
             if not folder_parts:
@@ -1616,6 +1996,7 @@ def upload_folder():
                 'display_name': filename,
                 'folder_id': current_parent,
                 'custom_alias': '',
+                'slug': make_short_slug(filename, db, exclude_id=internal_id),
                 'link_rotated': False,
                 'download_count': 0,
                 'size': os.path.getsize(save_path),
@@ -1624,7 +2005,8 @@ def upload_folder():
                 'is_image': ext in IMAGE_EXTENSIONS
             }
             saved_count += 1
-            app.logger.info('Загружен файл из папки: %s (%s)', physical_path, format_size(os.path.getsize(save_path)))
+            app.logger.info('Загружен файл из папки: %s (%s), короткая ссылка: /%s',
+                            physical_path, format_size(os.path.getsize(save_path)), db[internal_id]['slug'])
 
         if saved_count > 0 or created_folders:
             save_db(db)
@@ -1635,7 +2017,7 @@ def upload_folder():
     return jsonify({'count': saved_count, 'folders_created': len(created_folders)})
 
 @app.route('/v/<path:filepath>')
-@limiter.limit("200 per minute")
+@limiter.limit("200 per minute", deduct_when=lambda response: g.get('api_key') is None)
 def view_file(filepath):
     try:
         filepath = urllib.parse.unquote(filepath)
@@ -1651,7 +2033,16 @@ def view_file(filepath):
     if record is None:
         return "Файл не найден", 404
 
-    app.logger.info('Просмотр: %s (👁=%d)', filepath, record.get('view_count', 0))
+    retry_after = check_download_budget(request.remote_addr, record.get('size', 0) or 0)
+    if retry_after:
+        app.logger.warning('Бюджет скачивания исчерпан (%s), файл %s, retry через %d c',
+                           request.remote_addr, filepath, retry_after)
+        resp = jsonify({'error': f'Слишком много скачиваний, повторите через {max(1, retry_after // 60)} мин'})
+        resp.headers['Retry-After'] = str(retry_after)
+        return resp, 429
+
+    app.logger.info('Просмотр: %s (👁=%d) [%s]', filepath, record.get('view_count', 0),
+                    g.get('api_key') or 'анонимно')
     return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=False)
 
 @app.route('/api/update_file', methods=['POST'])
@@ -1660,7 +2051,7 @@ def update_file():
     data = request.json
     internal_id = data.get('internal_id')
     display_name = data.get('display_name', '').strip()
-    physical_filename = data.get('physical_filename', '').strip()
+    physical_filename = data.get('physical_filename', '').strip().replace('+', '_')
     custom_alias = data.get('custom_alias', '').strip()
     new_folder_id = data.get('folder_id') or None
 
@@ -1720,8 +2111,7 @@ def update_file():
         if not re.match(r'^[a-zA-Z0-9_-]+$', custom_alias):
             return jsonify({'error': 'Алиас: только латиница, цифры, дефис'}), 400
         # Алиас не может маскироваться под системный маршрут
-        if custom_alias.lower() in {'login', 'logout', 'export_xlsx', 'upload', 'upload_folder',
-                                    'robots.txt', 'favicon.ico', 'v', 'f', 'static', 'api'}:
+        if custom_alias.lower() in RESERVED_PATHS:
             return jsonify({'error': 'Этот алиас зарезервирован системой'}), 400
         for fid, rec in db.items():
             if fid != internal_id and rec.get('custom_alias') == custom_alias:
@@ -1922,6 +2312,7 @@ def create_folder():
         'parent_id': parent_id,
         'created': datetime.now().strftime('%d.%m.%Y %H:%M')
     }
+    folders[folder_id]['slug'] = make_short_slug(name, folders=folders)
     
     physical_path = get_folder_physical_path(folder_id, folders)
     os.makedirs(physical_path, exist_ok=True)
@@ -2022,8 +2413,8 @@ def export_xlsx():
     ws = wb.active
     ws.title = "Список файлов"
     
-    # 3 колонки
-    ws.append(["Папка", "Физическое имя", "Ссылка"])
+    # 4 колонки
+    ws.append(["Папка", "Физическое имя", "Ссылка", "Короткая ссылка"])
 
     # Стилизация заголовка
     for cell in ws[1]:
@@ -2043,7 +2434,8 @@ def export_xlsx():
         ws.append([
             folder_path,
             record['current_filename'],
-            download_url
+            download_url,
+            f"{BASE_URL}/{record['slug']}" if record.get('slug') else download_url
         ])
 
     # Автоширина колонок
@@ -2070,10 +2462,10 @@ def export_xlsx():
 
 
 @app.route('/<path:filepath>')
-@limiter.limit("30 per minute")
+@limiter.limit("30 per minute", deduct_when=lambda response: g.get('api_key') is None)
 def direct_file_access(filepath):
-    if filepath.startswith('static/') or filepath.startswith('f/') or filepath in [
-        'export_xlsx', 'upload', 'upload_folder', 'favicon.ico'
+    if filepath.startswith('static/') or filepath.startswith('f/') or filepath.startswith('d/') or filepath.startswith('z/') or filepath in [
+        'export_xlsx', 'export_all', 'upload', 'upload_folder', 'favicon.ico'
     ] or filepath.startswith('api/'):
         abort(404)
 
@@ -2089,10 +2481,11 @@ def direct_file_access(filepath):
     if os.path.isfile(full_path):
         record = bump_counter(lambda r: r.get('physical_path') == filepath, 'download_count')
 
-    # 2) Индивидуальная ссылка (алиас)
+    # 2) Индивидуальная ссылка (алиас) или короткая ссылка (слаг)
     if record is None:
         record = bump_counter(
-            lambda r: r.get('custom_alias') and r.get('custom_alias') == filepath,
+            lambda r: (r.get('custom_alias') and r.get('custom_alias') == filepath)
+                   or (r.get('slug') and r.get('slug') == filepath),
             'download_count')
         if record is not None:
             filepath = record.get('physical_path', record['current_filename'])
@@ -2102,9 +2495,143 @@ def direct_file_access(filepath):
     if record is None:
         return "Файл не найден", 404
 
-    app.logger.info('Скачивание: %s (⬇=%d) от %s', filepath,
-                    record.get('download_count', 0), request.remote_addr)
-    return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=True, download_name=record['current_filename'])
+    retry_after = check_download_budget(request.remote_addr, record.get('size', 0) or 0)
+    if retry_after:
+        app.logger.warning('Бюджет скачивания исчерпан (%s), файл %s, retry через %d c',
+                           request.remote_addr, filepath, retry_after)
+        resp = jsonify({'error': f'Слишком много скачиваний, повторите через {max(1, retry_after // 60)} мин'})
+        resp.headers['Retry-After'] = str(retry_after)
+        return resp, 429
+
+    app.logger.info('Скачивание: %s (⬇=%d) от %s [%s]', filepath,
+                    record.get('download_count', 0), request.remote_addr,
+                    g.get('api_key') or 'анонимно')
+    # '+' в имени файла браузеры трактовали по-разному — отдаём с '_'
+    return send_from_directory(UPLOAD_FOLDER, filepath, as_attachment=True,
+                               download_name=record['current_filename'].replace('+', '_'))
+
+@app.route('/export_all')
+@limiter.limit("2 per minute")
+def export_all():
+    """Массовое скачивание всего хранилища одним ZIP.
+    Не чаще раза в час на IP (анонимно) или на API-ключ."""
+    now = time.time()
+    scope = f"key:{g.api_key}" if g.get('api_key') else f"ip:{request.remote_addr}"
+    last = _export_all_scopes.get(scope)
+    if last and now - last < EXPORT_ALL_INTERVAL:
+        retry = int(EXPORT_ALL_INTERVAL - (now - last))
+        app.logger.warning('Экспорт всего: отказ (повтор раньше часа), scope=%s, retry %d c', scope, retry)
+        resp = jsonify({'error': f'Массовое скачивание доступно раз в час, повторите через {max(1, retry // 60)} мин'})
+        resp.headers['Retry-After'] = str(retry)
+        return resp, 429
+
+    db = load_db()
+    items = []
+    for rec in db.values():
+        phys = rec.get('physical_path', rec['current_filename'])
+        if os.path.isfile(os.path.join(UPLOAD_FOLDER, phys)):
+            items.append((phys, rec['current_filename']))
+    if not items:
+        return jsonify({'error': 'Нет файлов для архивирования'}), 404
+
+    # Подчистка старых временных архивов (старше 2 часов)
+    for fn in os.listdir(UPLOAD_FOLDER):
+        if fn.startswith('.export_all-') and fn.endswith('.zip'):
+            try:
+                if now - os.path.getmtime(os.path.join(UPLOAD_FOLDER, fn)) > 7200:
+                    os.remove(os.path.join(UPLOAD_FOLDER, fn))
+            except OSError:
+                pass
+
+    _export_all_scopes[scope] = now
+    tmp_path = os.path.join(UPLOAD_FOLDER, f".export_all-{int(now)}.zip")
+    with zipfile.ZipFile(tmp_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for phys, _orig in items:
+            zf.write(os.path.join(UPLOAD_FOLDER, phys), arcname=phys.replace('+', '_'))
+
+    app.logger.info('Экспорт всего хранилища: %d файл(ов), %s, scope=%s',
+                    len(items), format_size(os.path.getsize(tmp_path)), scope)
+    return send_file(tmp_path, as_attachment=True,
+                     download_name=f"albion-files-{datetime.now().strftime('%Y%m%d-%H%M')}.zip")
+
+@app.route('/api/export_zip', methods=['POST'])
+@login_required
+def export_zip():
+    """ZIP по выделению: выбранные файлы + выбранные папки (рекурсивно).
+    Возвращает публичную ссылку на архив (id — uuid, неугадываемый), живёт сутки."""
+    data = request.json or {}
+    file_ids = data.get('file_ids', [])
+    folder_ids = data.get('folder_ids', [])
+    if not file_ids and not folder_ids:
+        return jsonify({'error': 'Ничего не выбрано'}), 400
+
+    db = load_db()
+    folders = load_folders()
+
+    children = {}
+    for fid, f in folders.items():
+        children.setdefault(f.get('parent_id'), []).append(fid)
+
+    # Файлы выбранных папок — рекурсивно
+    seen_folders = set()
+    stack = list(folder_ids)
+    while stack:
+        fid = stack.pop()
+        if fid in seen_folders or fid not in folders:
+            continue
+        seen_folders.add(fid)
+        stack.extend(children.get(fid, []))
+
+    items_map = {}  # physical_path -> имя; словарь убирает дубли (файл и его папка выбраны вместе)
+    for file_id in file_ids:
+        rec = db.get(file_id)
+        if rec:
+            phys = rec.get('physical_path', rec['current_filename'])
+            items_map[phys] = phys
+    for rec in db.values():
+        if rec.get('folder_id') in seen_folders:
+            phys = rec.get('physical_path', rec['current_filename'])
+            items_map[phys] = phys
+    items = [(phys, phys) for phys in items_map
+             if os.path.isfile(os.path.join(UPLOAD_FOLDER, phys))]
+    if not items:
+        return jsonify({'error': 'Нет файлов для архивирования'}), 404
+
+    os.makedirs(ZIPLINKS_DIR, exist_ok=True)
+    # Архивы-ссылки живут сутки, старые подчищаем
+    now = time.time()
+    for fn in os.listdir(ZIPLINKS_DIR):
+        if fn.endswith('.zip'):
+            try:
+                if now - os.path.getmtime(os.path.join(ZIPLINKS_DIR, fn)) > 86400:
+                    os.remove(os.path.join(ZIPLINKS_DIR, fn))
+            except OSError:
+                pass
+
+    zip_id = str(uuid.uuid4())
+    zip_path = os.path.join(ZIPLINKS_DIR, zip_id + '.zip')
+    with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for phys, _ in items:
+            zf.write(os.path.join(UPLOAD_FOLDER, phys), arcname=phys.replace('+', '_'))
+
+    size = os.path.getsize(zip_path)
+    app.logger.info('Создан архив по выборке: %d файл(ов), %s, /z/%s, от %s',
+                    len(items), format_size(size), zip_id, request.remote_addr)
+    return jsonify({'url': f"{BASE_URL}/z/{zip_id}", 'count': len(items), 'size': format_size(size)})
+
+@app.route('/z/<zip_id>')
+@limiter.limit("30 per minute")
+def download_zip(zip_id):
+    """Публичная ссылка на созданный архив (id неугадываемый, живёт сутки)."""
+    if not re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', zip_id):
+        abort(404)
+    path = os.path.join(ZIPLINKS_DIR, zip_id + '.zip')
+    if not os.path.isfile(path):
+        abort(404)
+    app.logger.info('Скачивание архива /z/%s (%s) от %s', zip_id,
+                    format_size(os.path.getsize(path)), request.remote_addr)
+    return send_file(path, as_attachment=True,
+                     download_name=f"albion-archive-{datetime.now().strftime('%Y%m%d-%H%M')}.zip")
 
 @app.route('/robots.txt')
 def robots():
@@ -2116,6 +2643,9 @@ if __name__ == '__main__':
     print("АЛЬБИОН: Файловый сервер с каталогами")
     print(f"Локально: http://127.0.0.1:5000")
     print("=" * 60)
-    serve(app, host='0.0.0.0', port=5000, threads=8,
+    serve(app,
+          host=os.environ.get('ALBION_HOST', '0.0.0.0'),   # в офисе за nginx: ALBION_HOST=127.0.0.1
+          port=int(os.environ.get('ALBION_PORT', '5000')),
+          threads=8,
           max_request_body_size=100 * 1024 * 1024 * 1024,  # 100 ГБ (None waitress не принимает)
           channel_timeout=300)
