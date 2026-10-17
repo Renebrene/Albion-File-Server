@@ -12,13 +12,14 @@
 
 ## Аутентификация и ограничения
 
-- `/f/...`, `/api/...`, `/upload...`, `/export_xlsx`, `/api/export_zip` требуют сессию, полученную через `/login`. Если `auth.json` отсутствует/повреждён, вход закрыт (HTTP 503), без встроенных паролей. Сессия постоянная с максимумом 12 ч (`ALBION_SESSION_HOURS`); при HTTPS обязательно `ALBION_COOKIE_SECURE=1`.
+- `/f/...`, `/api/...`, `/upload...`, `/export_xlsx`, `/api/export_zip` требуют сессию, полученную через `/login`. При отсутствии `auth.json` создаётся стартовая учётная запись `admin` / `альбион`; смените её в `/settings`. Повреждённый `auth.json` не перезаписывается — вход закрыт. Сессия постоянная с максимумом 12 ч (`ALBION_SESSION_HOURS`); при HTTPS обязательно `ALBION_COOKIE_SECURE=1`.
 - Скачивание файла, просмотр и публичная страница папки доступны без сессии.
-- Авторизованные `POST/PUT/PATCH/DELETE` защищены синхронизируемым CSRF-токеном: браузерная форма `/login` включает hidden token; для JSON API нужен заголовок `X-CSRF-Token` из `<meta name="csrf-token">` на админской странице. Неверный/отсутствующий токен даёт HTTP 403.
+- Авторизованные `POST/PUT/PATCH/DELETE` защищены синхронизируемым CSRF-токеном: браузерная форма `/login` включает hidden token; для JSON API нужен заголовок `X-CSRF-Token` из `<meta name="csrf-token">` на админской странице. Неверный/отсутствующий токен даёт HTTP 403. Изменение логина/пароля аннулирует все ранее выданные admin-сессии; требуется повторный вход.
+- Ответы приложения включают anti-framing (`X-Frame-Options: DENY`, CSP `frame-ancestors 'none'`) и `X-Content-Type-Options: nosniff`.
 - Автоматика передаёт ключ только заголовком `X-API-Key` (query-параметр намеренно не поддерживается, чтобы секрет не утекал в URL/access-логи). Скрипт создания/отзыва: `python manage_tokens.py add|list|revoke ...`.
 - По умолчанию анонимный бюджет — 10 GiB за час/IP; бюджет ключа — 100 GiB за сутки и разделяется по hash-id API-ключа. В памяти используется скользящее окно; с Redis — фиксированное окно часа/суток. Ответ при превышении: HTTP 429, заголовок `Retry-After` в секундах. Значения настраиваются `ALBION_DL_BUDGET_GB` и `ALBION_TOKEN_DL_BUDGET_GB`. Без `ALBION_REDIS_URL` счётчик хранится в памяти и сбрасывается при рестарте; с Redis состояние общее для процессов.
-- `GET /export_all` по умолчанию доступен только из локальной сети, с API-ключом или из админ-сессии; в `/settings` это можно переключить. Лимит — не чаще раза в час на IP или hash-id API-ключа; размер архива расходует download budget. При настроенном Redis квота общая для процессов.
-- Выделенный ZIP (`/api/export_zip`) требует админ-сессию; созданный `/z/<uuid>` публичен 24 часа.
+- `GET /export_all` по умолчанию доступен только из локальной сети за явно доверенным proxy, с API-ключом или действующей админ-сессией; в `/settings` это можно переключить. Приложение по умолчанию слушает только `127.0.0.1`; `ALBION_TRUST_PROXY=1` включает доверие одному proxy hop, а `ALBION_TRUSTED_PROXY_IPS` ограничивает адреса proxy peer. Лимит — не чаще раза в час на IP или hash-id API-ключа; размер архива расходует download budget. При настроенном Redis квота общая для процессов.
+- Выделенный ZIP (`/api/export_zip`) требует админ-сессию; созданный `/z/<uuid>` публичен 24 часа. Проверка свободного места и запись ZIP сериализованы в рамках одного процесса.
 - Один запрос загрузки ограничен `ALBION_MAX_UPLOAD_GB` (по умолчанию 50 ГиБ); общая квота учтённых файлов — `ALBION_STORAGE_QUOTA_GB`; для загрузок и ZIP всегда резервируется `ALBION_MIN_FREE_GB` свободного места. ZIP ограничен `ALBION_MAX_ZIP_GB` и `ALBION_MAX_ZIP_FILES`.
 - Ошибки квот: `413` для слишком большого запроса/архива, `507` при нехватке диска/квоты, `411` если для загрузки с активными квотами не передан `Content-Length`.
 
@@ -34,7 +35,7 @@
 | `GET /f/<folder_id>` | сессия | Содержимое папки в админке (идентификатор — UUID) |
 | `GET /settings` | сессия | Форма квот; только администратор |
 | `POST /settings` | сессия + CSRF | Сохранить `max_upload_gb`, `storage_quota_gb`, `min_free_gb`, `max_zip_gb`, `max_zip_files` в `settings.json` |
-| `GET /d/<slug-or-uuid>` | публичный | Публичный список файлов/подпапок указанной папки |
+| `GET /d/<slug-or-uuid>` | публичный | Публичный список только файлов непосредственно в указанной папке; без перехода к родителю/подпапкам |
 | `GET /<physical-path-or-file-slug-or-alias>` | публичный | Скачивание файла как вложения; `Content-Disposition` задаёт имя файла и увеличивается счётчик |
 | `HEAD /<physical-path-or-file-slug-or-alias>` | публичный | Заголовки скачивания без тела; счётчики/бюджет не расходуются |
 | `GET /v/<physical-path>` | публичный | Inline-просмотр (например, изображение); увеличивает `view_count` и учитывает бюджет |
@@ -95,4 +96,4 @@ curl -fL -H 'X-API-Key: alb_...' -o albion-files.zip 'https://files.example.ru/e
 - В Docker новый bind-mounted `./data` должен быть доступен контейнерному UID 10001. Перед запуском: `mkdir -p data && sudo chown -R 10001:10001 data`; затем `docker compose exec app python change_password.py`.
 - `/export_all` и выделенные ZIP используют дисковое место. ZIP по выделению хранится в `ziplinks/` до 24 часов; `/export_all` оставляет временный архив в `uploads/` до последующей очистки старше двух часов.
 - JSON-БД пишутся атомарно через временный файл и `os.replace`; повреждённая БД сохраняется как `.corrupt-*`.
-- Для домена офиса задайте `ALBION_BASE_URL=https://files.example.ru`; без этого ссылки в интерфейсе используют cloudpub origin по умолчанию. Внешний reverse proxy должен передавать `X-Forwarded-For`/`X-Forwarded-Proto`; пример nginx — `deploy/nginx.conf.example`.
+- Для домена офиса задайте `ALBION_BASE_URL=https://files.example.ru`; без этого ссылки в интерфейсе используют cloudpub origin по умолчанию. За reverse proxy задайте `ALBION_TRUST_PROXY=1`, ограничьте `ALBION_TRUSTED_PROXY_IPS` адресом proxy и перезаписывайте `X-Forwarded-For`/`X-Forwarded-Proto`; пример nginx — `deploy/nginx.conf.example`.

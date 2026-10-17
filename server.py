@@ -19,6 +19,7 @@ import threading
 import logging
 import hashlib
 import hmac
+import ipaddress
 import time
 import zipfile
 from collections import deque
@@ -51,6 +52,12 @@ except ValueError:
 EXPORT_ALL_INTERNAL_ONLY = os.environ.get('ALBION_EXPORT_ALL_INTERNAL_ONLY', '1').lower() in {'1', 'true', 'yes'}
 _REDIS_URL = os.environ.get('ALBION_REDIS_URL', '').strip()
 RATE_LIMIT_STORAGE_URI = os.environ.get('ALBION_RATE_LIMIT_STORAGE_URI', 'memory://').strip() or 'memory://'
+TRUST_PROXY = os.environ.get('ALBION_TRUST_PROXY', '0').lower() in {'1', 'true', 'yes'}
+APP_HOST = os.environ.get('ALBION_HOST', '127.0.0.1')
+TRUSTED_PROXY_IPS = tuple(
+    addr.strip() for addr in os.environ.get('ALBION_TRUSTED_PROXY_IPS', '127.0.0.1,::1').split(',')
+    if addr.strip()
+)
 
 # ===== ПРИКЛАДНЫЕ НАСТРОЙКИ (управляются только из админки) =====
 SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
@@ -109,6 +116,18 @@ def save_quota_settings(values):
     app.config['MAX_CONTENT_LENGTH'] = int(clean['max_upload_gb'] * 1024 ** 3) or None
 
 app = Flask(__name__, static_folder='static')
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    response.headers.setdefault('X-Frame-Options', 'DENY')
+    csp = response.headers.get('Content-Security-Policy')
+    if not csp:
+        response.headers['Content-Security-Policy'] = "frame-ancestors 'none'"
+    elif 'frame-ancestors' not in csp.lower():
+        response.headers['Content-Security-Policy'] = f"{csp}; frame-ancestors 'none'"
+    response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+    return response
 
 # ===== СЕКРЕТНЫЙ КЛЮЧ (сохраняется между перезапусками, сессии не слетают) =====
 SECRET_KEY_FILE = os.path.join(DATA_DIR, '.secret_key')
@@ -637,7 +656,7 @@ def upload_capacity_error(incoming_bytes, db=None):
             return 507, f'Недостаточно свободного места: требуется резерв {format_size(min_free)}'
     return None
 
-def zip_capacity_error(files):
+def zip_capacity_error(files, target_dir=None):
     """files: iterable of (source_path, arcname). Return (status, message) or None."""
     limits = load_quota_settings()
     max_zip = int(float(limits['max_zip_gb']) * 1024 ** 3)
@@ -651,7 +670,7 @@ def zip_capacity_error(files):
     if max_zip and total > max_zip:
         return 413, f'Размер архива превышает лимит {format_size(max_zip)}'
     if min_free:
-        target = ZIPLINKS_DIR if os.path.isdir(ZIPLINKS_DIR) else UPLOAD_FOLDER
+        target = target_dir or (ZIPLINKS_DIR if os.path.isdir(ZIPLINKS_DIR) else UPLOAD_FOLDER)
         free = shutil.disk_usage(target).free
         if free - total < min_free:
             return 507, f'Недостаточно свободного места для архива (резерв {format_size(min_free)})'
@@ -1774,7 +1793,7 @@ PUBLIC_FOLDER_TEMPLATE = """
             {% else %}
                 <div class="empty">
                     <div class="icon">📭</div>
-                    <div>Папка пуста</div>
+                    <div>Нет файлов для публикации</div>
                 </div>
             {% endif %}
         </div>
@@ -1857,6 +1876,21 @@ SETTINGS_TEMPLATE = """
                     <label><input type="checkbox" name="export_all_internal_only" value="1" style="width:auto;margin-right:6px;" {% if values.export_all_internal_only %}checked{% endif %}> Полный экспорт только из локальной сети/с API-ключом</label>
                     <div class="hint">Если выключено, GET /export_all доступен анонимно в пределах часовой квоты.</div>
                 </div>
+                <hr style="border:0;border-top:1px solid #e2e8f0;margin:22px 0;">
+                <h2>Учётные данные администратора</h2>
+                <div class="group">
+                    <label>Логин</label>
+                    <input type="text" name="username" autocomplete="username" value="{{ auth_username }}" required>
+                </div>
+                <div class="group">
+                    <label>Новый пароль</label>
+                    <input type="password" name="new_password" autocomplete="new-password" placeholder="Оставьте пустым, чтобы не менять">
+                    <div class="hint">Минимум 6 символов. После публикации сервера смените стартовый пароль.</div>
+                </div>
+                <div class="group">
+                    <label>Повторите новый пароль</label>
+                    <input type="password" name="new_password_confirm" autocomplete="new-password">
+                </div>
                 <div class="actions">
                     <button class="btn" type="submit">Сохранить</button>
                     <a class="btn btn-secondary" href="/f/">← К файлам</a>
@@ -1870,6 +1904,25 @@ SETTINGS_TEMPLATE = """
 
 # ===== АУТЕНТИФИКАЦИЯ =====
 AUTH_FILE = os.path.join(DATA_DIR, 'auth.json')
+DEFAULT_AUTH_USERNAME = 'admin'
+DEFAULT_AUTH_PASSWORD = 'альбион'
+
+def ensure_default_auth():
+    """Create the requested bootstrap admin only when auth.json is absent."""
+    if os.path.exists(AUTH_FILE):
+        return True
+    try:
+        _save_json(AUTH_FILE, {
+            'username': DEFAULT_AUTH_USERNAME,
+            'password_hash': generate_password_hash(DEFAULT_AUTH_PASSWORD),
+        })
+        app.logger.warning(
+            'Создан стартовый администратор admin/альбион. '
+            'Смените пароль в /settings перед публикацией сервера в интернет.')
+        return True
+    except OSError as e:
+        app.logger.critical('Не удалось создать auth.json: %s', e)
+        return False
 
 # ===== API-КЛЮЧИ ДЛЯ АВТОМАТИКИ (tokens.json: {sha256(ключ): {name, created}}) =====
 def load_tokens():
@@ -2017,10 +2070,10 @@ def check_download_budget(ip, size_bytes):
 # Массовый экспорт: последнее время на область (IP или ключ)
 _export_all_scopes = {}
 _EXPORT_ALL_LOCK = threading.Lock()
+ZIP_BUILD_LOCK = threading.Lock()
 
 def get_auth():
-    if not os.path.exists(AUTH_FILE):
-        app.logger.critical('Файл авторизации отсутствует: %s; вход закрыт до настройки пароля', AUTH_FILE)
+    if not ensure_default_auth():
         return None
     try:
         with open(AUTH_FILE, 'r', encoding='utf-8') as f:
@@ -2047,11 +2100,62 @@ def serialized_mutation(f):
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not session.get('logged_in') or get_auth() is None:
+        auth = get_auth()
+        if (not session.get('logged_in') or auth is None
+                or session.get('_auth_fingerprint') != auth_fingerprint(auth)):
             session.clear()
             return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
     return decorated_function
+
+
+def auth_fingerprint(auth):
+    """Return a non-secret session version that changes with stored credentials."""
+    material = json.dumps(
+        [auth.get('username', ''), auth.get('password_hash', '')],
+        ensure_ascii=False, separators=(',', ':'),
+    )
+    return hashlib.sha256(material.encode('utf-8')).hexdigest()
+
+
+def is_trusted_proxy_peer(peer_addr):
+    try:
+        peer = ipaddress.ip_address(peer_addr)
+        if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped:
+            peer = peer.ipv4_mapped
+    except (TypeError, ValueError):
+        return False
+    for value in TRUSTED_PROXY_IPS:
+        try:
+            if peer in ipaddress.ip_network(value, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def trusted_proxy_middleware(app_wsgi):
+    proxy_app = ProxyFix(app_wsgi, x_for=1, x_proto=1)
+
+    def wrapped(environ, start_response):
+        if is_trusted_proxy_peer(environ.get('REMOTE_ADDR', '')):
+            return proxy_app(environ, start_response)
+        # Drop untrusted forwarded headers; the app uses REMOTE_ADDR for access
+        # and rate limiting, so no header supplied by this peer may replace it.
+        environ.pop('HTTP_X_FORWARDED_FOR', None)
+        environ.pop('HTTP_X_FORWARDED_PROTO', None)
+        return app_wsgi(environ, start_response)
+
+    return wrapped
+
+
+def serialized_zip_build(f):
+    """Serialize ZIP capacity checks and writes within this app process."""
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        with ZIP_BUILD_LOCK:
+            return f(*args, **kwargs)
+    return wrapped
 
 def _login_csrf_input():
     token = session.setdefault('_csrf_token', secrets.token_urlsafe(32))
@@ -2072,6 +2176,7 @@ def login():
         if request.form.get('username') == auth['username'] and check_password_hash(auth['password_hash'], request.form.get('password', '')):
             session.clear()
             session['logged_in'] = True
+            session['_auth_fingerprint'] = auth_fingerprint(auth)
             session['_csrf_token'] = secrets.token_urlsafe(32)
             session.permanent = True
             app.logger.info('Вход: пользователь "%s" с %s', request.form.get('username'), request.remote_addr)
@@ -2095,9 +2200,11 @@ def login():
         <button type="submit">Войти</button></form></div></body></html>'''
         return page.replace('<form method="post">', '<form method="post">' + _login_csrf_input())
 
-    # Если уже залогинен, редирект
-    if session.get('logged_in'):
+    # Redirect only for a session associated with the current credentials.
+    if session.get('logged_in') and session.get('_auth_fingerprint') == auth_fingerprint(auth):
         return redirect('/f/')
+    if session.get('logged_in'):
+        session.clear()
         
     page = '''<!DOCTYPE html><html><head><title>Вход - АЛЬБИОН</title>
     <style>body{font-family:'Segoe UI',Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f9;margin:0}
@@ -2176,34 +2283,66 @@ def browse_folder(folder_id=None):
 @app.route('/settings', methods=['GET', 'POST'])
 @login_required
 def settings_page():
-    """Quota/config settings, available only after admin login."""
+    """Quota and credential settings, available only after admin login."""
     values = load_quota_settings()
+    current_auth = get_auth() or {}
+    auth_username = current_auth.get('username', DEFAULT_AUTH_USERNAME)
     error = None
     if request.method == 'POST':
-        try:
-            parsed = {}
-            for key in ('max_upload_gb', 'storage_quota_gb', 'min_free_gb', 'max_zip_gb'):
-                raw = request.form.get(key, '').strip().replace(',', '.')
-                value = float(raw)
-                max_allowed = 1024 if key == 'max_upload_gb' else 10 ** 9
-                if value < 0 or value != value or value > max_allowed:
-                    raise ValueError('Недопустимое значение')
-                parsed[key] = value
-            raw_files = request.form.get('max_zip_files', '').strip()
-            max_files = int(raw_files)
-            if max_files < 0 or max_files > 10 ** 9:
-                raise ValueError('Недопустимое число файлов')
-            parsed['max_zip_files'] = max_files
-            parsed['export_all_internal_only'] = request.form.get('export_all_internal_only') == '1'
-            save_quota_settings(parsed)
-            app.logger.info('Настройки квот изменены администратором: %s', parsed)
-            return redirect('/settings?saved=1')
-        except (TypeError, ValueError) as e:
-            error = f'Проверьте значения: {e}'
-            values = {**values, **{k: request.form.get(k, values[k]) for k in values}}
+        form_username = request.form.get('username', '').strip()
+        new_password = request.form.get('new_password', '')
+        confirm_password = request.form.get('new_password_confirm', '')
+        if not form_username:
+            error = 'Логин не может быть пустым'
+        elif new_password or confirm_password:
+            if len(new_password) < 6:
+                error = 'Новый пароль должен быть не короче 6 символов'
+            elif new_password != confirm_password:
+                error = 'Повтор нового пароля не совпадает'
+        if error is None:
+            try:
+                parsed = {}
+                for key in ('max_upload_gb', 'storage_quota_gb', 'min_free_gb', 'max_zip_gb'):
+                    raw = request.form.get(key, '').strip().replace(',', '.')
+                    value = float(raw)
+                    max_allowed = 1024 if key == 'max_upload_gb' else 10 ** 9
+                    if value < 0 or value != value or value > max_allowed:
+                        raise ValueError('Недопустимое значение')
+                    parsed[key] = value
+                raw_files = request.form.get('max_zip_files', '').strip()
+                max_files = int(raw_files)
+                if max_files < 0 or max_files > 10 ** 9:
+                    raise ValueError('Недопустимое число файлов')
+                parsed['max_zip_files'] = max_files
+                parsed['export_all_internal_only'] = request.form.get('export_all_internal_only') == '1'
+
+                # Persist quotas and credentials together only after all validation.
+                save_quota_settings(parsed)
+                new_auth = {
+                    'username': form_username,
+                    'password_hash': (generate_password_hash(new_password)
+                                      if new_password else current_auth['password_hash']),
+                }
+                with DB_LOCK:
+                    _save_json(AUTH_FILE, new_auth)
+                try:
+                    os.chmod(AUTH_FILE, 0o600)
+                except OSError:
+                    pass
+                if form_username != current_auth.get('username') or new_password:
+                    session.clear()
+                app.logger.info(
+                    'Настройки изменены администратором; логин=%s; пароль_изменён=%s',
+                    form_username, bool(new_password))
+                return redirect('/settings?saved=1')
+            except (TypeError, ValueError, OSError) as e:
+                error = f'Проверьте значения: {e}'
+        auth_username = form_username or auth_username
+        values = {**values, **{k: request.form.get(k, values[k]) for k in values}}
     return render_template_string(
         SETTINGS_TEMPLATE,
         values=values,
+        auth_username=auth_username,
         saved=request.args.get('saved') == '1',
         error=error,
         csrf_token=session.setdefault('_csrf_token', secrets.token_urlsafe(32)),
@@ -2227,16 +2366,10 @@ def public_folder(folder_ref):
 
     folder = folders[fid]
 
+    # Publish only this folder's direct files. Do not expose parent path or
+    # child-folder links: each subfolder must be shared separately.
     breadcrumbs_data = []
-    path = get_folder_path(fid, folders)
-    current = fid
-    for name in reversed(path):
-        breadcrumbs_data.append({'id': current, 'name': name})
-        current = folders[current].get('parent_id')
-    breadcrumbs_data.reverse()
-
-    subfolders_data = [{'id': fid2, 'name': f['name'], 'slug': f.get('slug', '')}
-                       for fid2, f in folders.items() if f.get('parent_id') == fid]
+    subfolders_data = []
 
     files_data = []
     db = load_db()
@@ -3090,6 +3223,7 @@ def direct_file_access(filepath):
 
 @app.route('/export_all', methods=['GET', 'HEAD'])
 @limiter.limit("2 per minute")
+@serialized_zip_build
 def export_all():
     """Массовое скачивание всего хранилища одним ZIP.
     Не чаще раза в час на IP (анонимно) или на API-ключ."""
@@ -3098,7 +3232,18 @@ def export_all():
     quota_settings = load_quota_settings()
     if quota_settings.get('export_all_internal_only', True):
         client_addr = request.remote_addr or ''
-        if not (g.get('api_key_id') or session.get('logged_in') or _PRIVATE_RE.match(client_addr)):
+        current_auth = get_auth() or {}
+        has_valid_admin_session = bool(
+            session.get('logged_in') and current_auth
+            and session.get('_auth_fingerprint') == auth_fingerprint(current_auth)
+        )
+        peer_addr = request.environ.get('werkzeug.proxy_fix.orig', {}).get('REMOTE_ADDR', client_addr)
+        peer_is_loopback = peer_addr in {'127.0.0.1', '::1', '::ffff:127.0.0.1'}
+        trusted_lan_client = bool(_PRIVATE_RE.match(client_addr)) and (
+            (not TRUST_PROXY and not peer_is_loopback)
+            or (TRUST_PROXY and is_trusted_proxy_peer(peer_addr))
+        )
+        if not (g.get('api_key_id') or has_valid_admin_session or trusted_lan_client):
             app.logger.warning('Полный экспорт запрещён для внешнего адреса %s', client_addr)
             return jsonify({'error': 'Полный экспорт доступен только из локальной сети или с API-ключом'}), 403
     scope = f"key:{g.api_key_id}" if g.get('api_key_id') else f"ip:{request.remote_addr}"
@@ -3122,7 +3267,7 @@ def export_all():
                 items.append((full, arcname))
         if not items:
             return jsonify({'error': 'Нет файлов для архивирования'}), 404
-        zip_error = zip_capacity_error(items)
+        zip_error = zip_capacity_error(items, target_dir=UPLOAD_FOLDER)
         if zip_error:
             status, message = zip_error
             return jsonify({'error': message}), status
@@ -3188,6 +3333,7 @@ def export_all():
 
 @app.route('/api/export_zip', methods=['POST'])
 @login_required
+@serialized_zip_build
 def export_zip():
     """ZIP по выделению: выбранные файлы + выбранные папки (рекурсивно).
     Возвращает публичную ссылку на архив (id — uuid, неугадываемый), живёт сутки."""
@@ -3236,7 +3382,7 @@ def export_zip():
         return jsonify({'error': 'Нет файлов для архивирования'}), 404
 
     os.makedirs(ZIPLINKS_DIR, exist_ok=True)
-    zip_error = zip_capacity_error(items)
+    zip_error = zip_capacity_error(items, target_dir=ZIPLINKS_DIR)
     if zip_error:
         status, message = zip_error
         app.logger.warning('ZIP по выделению отклонён: %s (файлов=%d)', message, len(items))
@@ -3253,9 +3399,16 @@ def export_zip():
 
     zip_id = str(uuid.uuid4())
     zip_path = os.path.join(ZIPLINKS_DIR, zip_id + '.zip')
-    with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
-        for safe_path, arcname in items:
-            zf.write(safe_path, arcname=arcname.replace('+', '_'))
+    try:
+        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for safe_path, arcname in items:
+                zf.write(safe_path, arcname=arcname.replace('+', '_'))
+    except Exception:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+        raise
 
     size = os.path.getsize(zip_path)
     app.logger.info('Создан архив по выборке: %d файл(ов), %s, /z/%s, от %s',
@@ -3293,14 +3446,17 @@ def favicon():
 def robots():
     return send_from_directory('static', 'robots.txt', mimetype='text/plain')
 
+if TRUST_PROXY:
+    # Trust exactly one proxy hop, and ignore forwarded headers from any other peer.
+    app.wsgi_app = trusted_proxy_middleware(app.wsgi_app)
+
 if __name__ == '__main__':
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
     print("=" * 60)
     print("АЛЬБИОН: Файловый сервер с каталогами")
     print(f"Локально: http://127.0.0.1:5000")
     print("=" * 60)
     serve(app,
-          host=os.environ.get('ALBION_HOST', '0.0.0.0'),   # в офисе за nginx: ALBION_HOST=127.0.0.1
+          host=APP_HOST,
           port=int(os.environ.get('ALBION_PORT', '5000')),
           threads=8,
           # Transport ceiling; the admin-configurable per-request limit is lower.

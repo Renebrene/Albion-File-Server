@@ -71,10 +71,23 @@ class ServerSmokeTests(unittest.TestCase):
             self.client.environ_base['HTTP_X_CSRF_TOKEN'] = match.group(1).decode()
         return response
 
+    def test_default_bind_is_loopback_and_proxy_trust_is_opt_in(self):
+        self.assertEqual(server.APP_HOST, '127.0.0.1')
+        self.assertFalse(server.TRUST_PROXY)
+
+    def test_security_headers_on_html_and_errors(self):
+        for path in ('/login', '/unknown-security-probe'):
+            response = self.anon.get(path)
+            self.assertEqual(response.headers.get('X-Frame-Options'), 'DENY')
+            self.assertIn("frame-ancestors 'none'", response.headers.get('Content-Security-Policy', ''))
+            self.assertEqual(response.headers.get('X-Content-Type-Options'), 'nosniff')
+            response.close()
+
     def test_static_branding_routes(self):
-        self.assertEqual(self.anon.get('/favicon.ico').status_code, 200)
-        self.assertEqual(self.anon.get('/static/logo.png').status_code, 200)
-        self.assertEqual(self.anon.get('/robots.txt').status_code, 200)
+        for path in ('/favicon.ico', '/static/logo.png', '/robots.txt'):
+            response = self.anon.get(path)
+            self.assertEqual(response.status_code, 200)
+            response.close()
 
     def test_auth_and_open_redirect(self):
         self.assertEqual(self.anon.get('/f/').status_code, 302)
@@ -101,13 +114,17 @@ class ServerSmokeTests(unittest.TestCase):
         response = self.client.post('/api/create_folder', json={'name':'With CSRF'})
         self.assertEqual(response.status_code, 200)
 
-    def test_missing_auth_fails_closed(self):
-        self.login()
+    def test_default_auth_bootstrap(self):
         os.remove(server.AUTH_FILE)
-        self.assertEqual(self.anon.get('/login').status_code, 503)
-        self.assertNotEqual(self.anon.post('/login', data={'username': 'admin', 'password': 'admin'}).status_code, 302)
-        # Existing signed session must not retain administrator access without auth.json.
-        self.assertEqual(self.client.get('/f/').status_code, 302)
+        page = self.anon.get('/login')
+        self.assertEqual(page.status_code, 200)
+        self.assertTrue(os.path.exists(server.AUTH_FILE))
+        token = re.search(rb'name="csrf_token" value="([^"]+)"', page.data).group(1).decode()
+        response = self.anon.post('/login', data={
+            'username': 'admin', 'password': 'альбион', 'csrf_token': token,
+        })
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.location.endswith('/f/'))
 
     def test_upload_and_plus_sanitization(self):
         self.login()
@@ -274,6 +291,7 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         token = re.search(rb'<meta name="csrf-token" content="([^"]+)"', page.data).group(1).decode()
         response = self.client.post('/settings', data={
+            'username': 'test',
             'max_upload_gb': '1.5',
             'storage_quota_gb': '200',
             'min_free_gb': '2',
@@ -290,11 +308,56 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertEqual(saved['max_zip_files'], 500)
         self.assertEqual(server.app.config['MAX_CONTENT_LENGTH'], int(1.5 * 1024 ** 3))
         invalid = self.client.post('/settings', data={
+            'username': 'test',
             'max_upload_gb': '-1', 'storage_quota_gb': '0', 'min_free_gb': '0',
             'max_zip_gb': '0', 'max_zip_files': '0', 'csrf_token': token,
         })
         self.assertEqual(invalid.status_code, 200)
         self.assertIn('Проверьте значения', invalid.get_data(as_text=True))
+
+    def test_settings_changes_admin_password(self):
+        stale_client = server.app.test_client()
+        page = stale_client.get('/login')
+        stale_token = re.search(rb'name="csrf_token" value="([^"]+)"', page.data).group(1).decode()
+        stale_client.post('/login', data={
+            'username': 'test', 'password': 'Test-Password-2026!', 'csrf_token': stale_token,
+        })
+        self.login()
+        page = self.client.get('/settings')
+        token = re.search(rb'<meta name="csrf-token" content="([^"]+)"', page.data).group(1).decode()
+        response = self.client.post('/settings', data={
+            'username': 'newadmin',
+            'new_password': 'NewPass123!',
+            'new_password_confirm': 'NewPass123!',
+            'max_upload_gb': '50', 'storage_quota_gb': '0', 'min_free_gb': '5',
+            'max_zip_gb': '50', 'max_zip_files': '20000',
+            'export_all_internal_only': '1', 'csrf_token': token,
+        })
+        self.assertEqual(response.status_code, 302)
+        auth = server.get_auth()
+        self.assertEqual(auth['username'], 'newadmin')
+        # Changing credentials invalidates the session that performed the change.
+        self.assertEqual(self.client.get('/f/').status_code, 302)
+        new_client = server.app.test_client()
+        page = new_client.get('/login')
+        token = re.search(rb'name="csrf_token" value="([^"]+)"', page.data).group(1).decode()
+        login = new_client.post('/login', data={
+            'username': 'newadmin', 'password': 'NewPass123!', 'csrf_token': token,
+        })
+        self.assertEqual(login.status_code, 302)
+        # A second session established before the change is rejected.
+        self.assertEqual(stale_client.get('/f/').status_code, 302)
+
+    def test_external_auth_file_change_invalidates_existing_session(self):
+        self.login()
+        old_auth = server.get_auth()
+        server._save_json(server.AUTH_FILE, {
+            'username': old_auth['username'],
+            'password_hash': generate_password_hash('Changed-Externally-2026!'),
+        })
+        response = self.client.get('/f/')
+        self.assertEqual(response.status_code, 302)
+        response.close()
 
     def test_upload_quota_and_free_space_helpers(self):
         old_quota = server.STORAGE_QUOTA_BYTES
@@ -322,6 +385,44 @@ class ServerSmokeTests(unittest.TestCase):
         finally:
             server.MAX_UPLOAD_BYTES = old_limit
             server.app.config['MAX_CONTENT_LENGTH'] = old_cfg
+
+    def test_zip_build_lock_serializes_capacity_check(self):
+        for route in ('/api/export_zip', '/export_all'):
+            endpoint = next(rule.endpoint for rule in server.app.url_map.iter_rules() if rule.rule == route)
+            self.assertTrue(hasattr(server.app.view_functions[endpoint], '__wrapped__'))
+        import threading
+        import time
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        second_attempting = threading.Event()
+        release = threading.Event()
+
+        @server.serialized_zip_build
+        def first_build():
+            first_entered.set()
+            release.wait(2)
+
+        @server.serialized_zip_build
+        def second_build():
+            second_entered.set()
+
+        def run_second():
+            first_entered.wait(2)
+            second_attempting.set()
+            second_build()
+
+        first = threading.Thread(target=first_build)
+        second = threading.Thread(target=run_second)
+        first.start()
+        second.start()
+        self.assertTrue(first_entered.wait(2))
+        self.assertTrue(second_attempting.wait(2))
+        time.sleep(0.05)
+        self.assertFalse(second_entered.is_set())
+        release.set()
+        first.join(2)
+        second.join(2)
+        self.assertTrue(second_entered.is_set())
 
     def test_zip_limits(self):
         import tempfile
@@ -355,9 +456,15 @@ class ServerSmokeTests(unittest.TestCase):
         self.login()
         result = self.client.post('/api/create_folder', json={'name':'Публичная'}).get_json()
         folder_id = result['folder_id']
+        child = self.client.post('/api/create_folder', json={
+            'name':'Секретная подпапка', 'parent_id': folder_id}).get_json()['folder_id']
         folders = server.load_folders()
         slug = folders[folder_id]['slug']
-        self.assertEqual(self.anon.get('/d/' + slug).status_code, 200)
+        child_slug = folders[child]['slug']
+        page = self.anon.get('/d/' + slug)
+        self.assertEqual(page.status_code, 200)
+        self.assertNotIn(child_slug, page.get_data(as_text=True))
+        self.assertNotIn('Секретная подпапка', page.get_data(as_text=True))
         self.assertEqual(self.anon.get('/d/' + folder_id).status_code, 200)
 
     def test_export_selected_zip_and_public_link(self):
@@ -436,12 +543,48 @@ class ServerSmokeTests(unittest.TestCase):
         # External anonymous client is denied by the default internal-only setting.
         external = self.anon.get('/export_all', environ_base={'REMOTE_ADDR': '203.0.113.5'})
         self.assertEqual(external.status_code, 403)
+        proxy_localhost = self.anon.get('/export_all')
+        self.assertEqual(proxy_localhost.status_code, 403)
+        proxy_localhost.close()
+        spoofed_lan = self.anon.get('/export_all',
+                                    headers={'X-Forwarded-For': '10.0.0.8'},
+                                    environ_base={'REMOTE_ADDR': '203.0.113.5'})
+        self.assertEqual(spoofed_lan.status_code, 403)
+        spoofed_lan.close()
         self.login()
         self.client.post('/upload', data={'count':'1','file_0':(io.BytesIO(b'zip'),'export.txt')}, content_type='multipart/form-data')
-        r = self.anon.get('/export_all')
+        r = self.anon.get('/export_all', environ_base={'REMOTE_ADDR': '192.168.1.20'})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.data[:2], b'PK')
-        self.assertEqual(self.anon.get('/export_all').status_code, 429)
+        r.close()
+        limited = self.anon.get('/export_all', environ_base={'REMOTE_ADDR': '192.168.1.20'})
+        self.assertEqual(limited.status_code, 429)
+        limited.close()
+
+    def test_export_all_rejects_spoofed_private_forwarded_ip(self):
+        original_wsgi = server.app.wsgi_app
+        original_trust = server.TRUST_PROXY
+        original_peers = server.TRUSTED_PROXY_IPS
+        try:
+            server.TRUST_PROXY = True
+            server.TRUSTED_PROXY_IPS = ('127.0.0.1',)
+            server.app.wsgi_app = server.trusted_proxy_middleware(original_wsgi)
+            client = server.app.test_client()
+            client.environ_base['REMOTE_ADDR'] = '203.0.113.5'
+            denied = client.get('/export_all', headers={'X-Forwarded-For': '10.0.0.7'})
+            self.assertEqual(denied.status_code, 403)
+            denied.close()
+
+            # A request genuinely received from the trusted local proxy may use the LAN allowance.
+            client.environ_base['REMOTE_ADDR'] = '127.0.0.1'
+            server._save_json(server.DB_FILE, {})
+            local = client.get('/export_all', headers={'X-Forwarded-For': '10.0.0.7'})
+            self.assertEqual(local.status_code, 404)  # authorized; no files in fixture
+            local.close()
+        finally:
+            server.app.wsgi_app = original_wsgi
+            server.TRUST_PROXY = original_trust
+            server.TRUSTED_PROXY_IPS = original_peers
 
 
 if __name__ == '__main__':

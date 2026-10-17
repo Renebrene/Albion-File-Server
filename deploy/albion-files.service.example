@@ -1,0 +1,31 @@
+[Unit]
+Description=Albion File Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=albion
+Group=albion
+WorkingDirectory=/opt/albion-files
+EnvironmentFile=-/etc/albion-files.env
+Environment=ALBION_DATA_DIR=/srv/albion/data
+Environment=ALBION_HOST=127.0.0.1
+Environment=ALBION_TRUST_PROXY=1
+Environment=ALBION_TRUSTED_PROXY_IPS=127.0.0.1,::1
+Environment=ALBION_PORT=5000
+Environment=ALBION_COOKIE_SECURE=1
+Environment=ALBION_SESSION_HOURS=12
+ExecStart=/opt/albion-files/venv/bin/python /opt/albion-files/server.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/albion/data
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

@@ -5,6 +5,10 @@ services:
     environment:
       ALBION_BASE_URL: ${ALBION_BASE_URL:?Set public HTTPS origin in .env}
       ALBION_COOKIE_SECURE: "1"
+      ALBION_HOST: 0.0.0.0
+      ALBION_TRUST_PROXY: "1"
+      # Docker bridge is normally 172.16.0.0/12; restrict to the actual proxy subnet if customized.
+      ALBION_TRUSTED_PROXY_IPS: 172.16.0.0/12,127.0.0.1,::1
       ALBION_SESSION_HOURS: "12"
       ALBION_MAX_UPLOAD_GB: ${ALBION_MAX_UPLOAD_GB:-50}
       ALBION_STORAGE_QUOTA_GB: ${ALBION_STORAGE_QUOTA_GB:-0}
@@ -12,16 +16,9 @@ services:
       ALBION_MAX_ZIP_GB: ${ALBION_MAX_ZIP_GB:-50}
       ALBION_MAX_ZIP_FILES: ${ALBION_MAX_ZIP_FILES:-20000}
       ALBION_EXPORT_ALL_INTERNAL_ONLY: ${ALBION_EXPORT_ALL_INTERNAL_ONLY:-1}
-      # Optional shared state:
+      # Optional shared state for multiple processes/replicas:
       # ALBION_REDIS_URL: redis://redis:6379/0
       # ALBION_RATE_LIMIT_STORAGE_URI: redis://redis:6379/1
-
-  # Optional shared state for multiple processes/replicas:
-  # redis:
-  #   image: redis:7-alpine
-  #   restart: unless-stopped
-  #   volumes:
-  #     - ./redis-data:/data
     volumes:
       - ./data:/app/data        # uploads, files_db.json, auth.json, tokens.json и пр.
     mem_limit: 1g
@@ -38,3 +35,10 @@ services:
     volumes:
       - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./certs:/etc/nginx/certs:ro
+
+  # Optional shared state for multiple processes/replicas:
+  # redis:
+  #   image: redis:7-alpine
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./redis-data:/data

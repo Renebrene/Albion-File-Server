@@ -1,5 +1,5 @@
-# Пример nginx для офисного деплоя АЛЬБИОН.
-# Скопируйте в deploy/nginx.conf, подставьте домен и пути к сертификатам.
+# Пример nginx для нативного деплоя АЛЬБИОН (systemd + Waitress на 127.0.0.1:5000).
+# Скопируйте в /etc/nginx/sites-available/albion.conf, подставьте домен и пути к сертификатам.
 # Лимиты запросов выполняет Flask-Limiter в приложении.
 # nginx дополнительно ограничивает параллельные соединения и скорость ответа.
 limit_conn_zone $binary_remote_addr zone=conn:10m;
@@ -21,32 +21,44 @@ server {
     ssl_certificate_key /etc/nginx/certs/privkey.pem;
     ssl_protocols       TLSv1.2 TLSv1.3;
 
-    # Лимит размера загрузки контролирует приложение (сейчас — снят)
-    client_max_body_size 0;
+    # Должен быть не меньше max upload в /settings (по умолчанию 50 GiB).
+    client_max_body_size 55g;
 
     add_header Strict-Transport-Security "max-age=31536000" always;
     add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Content-Security-Policy "frame-ancestors 'none'" always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
 
     # Публичные скачивания/страницы: ограничить параллельность и скорость.
-    # API-загрузка также идёт через этот location; настройте limit_rate под канал офиса.
+    # API-загрузка также идёт через этот location; настройте limit_rate под канал.
     location / {
         limit_conn conn 5;
         limit_rate 20m;                      # 20 МБ/с на соединение, настройте под канал
-        proxy_pass http://app:5000;
+        proxy_pass http://127.0.0.1:5000;
         proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
         client_body_temp_path /var/cache/nginx/client_temp;
     }
 
-    # Админка (после логина) — без файловых лимитов скорости
+    # Админка (после логина) — без файловых лимитов скорости.
     location /f/ {
-        proxy_pass http://app:5000;
+        proxy_pass http://127.0.0.1:5000;
         proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 300s;
+    }
+
+    # Настройки квот. Доступ проверяет приложение; при желании можно дополнительно
+    # ограничить этот location по VPN/IP allowlist.
+    location = /settings {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }

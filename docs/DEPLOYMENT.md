@@ -6,7 +6,7 @@
 
 1. Подготовить Linux-пользователя без shell-доступа и каталог данных, например `/srv/albion/data`; владелец — service user.
 2. Создать venv, установить `requirements.txt`, скопировать код.
-3. Задать environment в systemd unit:
+3. Взять за основу `deploy/albion-files.service.example` и задать environment в systemd unit:
 
 ```ini
 [Service]
@@ -15,6 +15,8 @@ Group=albion
 WorkingDirectory=/opt/albion-files
 Environment=ALBION_DATA_DIR=/srv/albion/data
 Environment=ALBION_HOST=127.0.0.1
+Environment=ALBION_TRUST_PROXY=1
+Environment=ALBION_TRUSTED_PROXY_IPS=127.0.0.1,::1
 Environment=ALBION_PORT=5000
 Environment=ALBION_BASE_URL=https://files.example.ru
 Environment=ALBION_COOKIE_SECURE=1
@@ -42,23 +44,23 @@ WantedBy=multi-user.target
 
 Проверить unit через `systemd-analyze verify`, затем `systemctl daemon-reload`, `enable --now albion-files`. Убедиться, что порт 5000 слушает только `127.0.0.1`.
 
-4. Настроить TLS сертификат и nginx на `files.example.ru`; пример — `deploy/nginx.conf.example`. Nginx должен проксировать к `http://127.0.0.1:5000` и задавать `Host`, `X-Forwarded-For`, `X-Forwarded-Proto`.
+4. Настроить TLS сертификат и nginx на `files.example.ru`; пример — `deploy/nginx.conf.example`. Nginx должен проксировать к `http://127.0.0.1:5000`, задавать `Host`, перезаписывать `X-Forwarded-For` через `$remote_addr` и передавать `X-Forwarded-Proto`.
 5. Firewall: снаружи разрешить только 443 (и 80 для TLS-проверки/redirect); порт 5000 закрыть. Для доступа только сотрудникам предпочтительнее VPN или IP allowlist на nginx.
-6. Создать пароль: `ALBION_DATA_DIR=/srv/albion/data /opt/albion-files/venv/bin/python change_password.py`.
+6. При первом запуске без `auth.json` автоматически создаётся `admin / альбион`. Сразу смените логин/пароль в `/settings` или командой `ALBION_DATA_DIR=/srv/albion/data /opt/albion-files/venv/bin/python change_password.py`.
 7. При необходимости создать ключ автоматики `manage_tokens.py add "Назначение ключа"`.
 
-`ProxyFix` в коде доверяет одному proxy hop. Не выставляйте порт приложения в сеть, где клиент может сам посылать поддельный `X-Forwarded-For`.
+По умолчанию `ALBION_TRUST_PROXY=0`: прямой клиентский `X-Forwarded-For` игнорируется. При nginx на том же хосте включите `ALBION_TRUST_PROXY=1`; middleware доверяет одному proxy hop только когда непосредственный peer входит в `ALBION_TRUSTED_PROXY_IPS` (по умолчанию loopback). Шаблон nginx перезаписывает `X-Forwarded-For` на `$remote_addr`. Не включайте ProxyFix, если backend доступен клиентам в обход доверенного прокси. Если nginx и приложение в разных контейнерах, настройте `ALBION_TRUSTED_PROXY_IPS` по фактической Docker-сети.
 
 ## Docker Compose
 
-Файлы: `Dockerfile`, `docker-compose.yml`, `.env.example`, `deploy/nginx.conf.example`.
+Файлы: `Dockerfile`, `docker-compose.yml`, `.env.example`, `deploy/nginx.docker.conf.example`.
 
 ```bash
 cp .env.example .env
 # В .env укажите реальный внешний HTTPS origin
 mkdir -p data certs deploy
 sudo chown -R 10001:10001 data
-cp deploy/nginx.conf.example deploy/nginx.conf
+cp deploy/nginx.docker.conf.example deploy/nginx.conf
 # Положите fullchain.pem и privkey.pem в certs/
 docker compose config
 docker compose up -d
@@ -66,7 +68,7 @@ docker compose up -d
 docker compose exec app python change_password.py
 ```
 
-Порт приложения не публикуется на host, к нему обращается только контейнер nginx. Перед production нужно проверить права `data/`, корректность TLS, DNS и DNS split-horizon для LAN.
+Порт приложения не публикуется на host, к нему обращается только контейнер nginx. Compose включает `ALBION_TRUST_PROXY=1`; адреса Docker proxy разрешены через `ALBION_TRUSTED_PROXY_IPS=172.16.0.0/12,127.0.0.1,::1`. Перед production нужно проверить фактическую подсеть Compose, права `data/`, TLS, DNS и split-horizon для LAN.
 
 ## Домен доступен из интернета и LAN
 
@@ -88,7 +90,7 @@ docker compose exec app python change_password.py
 - Следить за свободным местом в `ALBION_DATA_DIR`: upload ограничен настройкой `max_upload_gb`, а ZIP и временные файлы занимают диск. Включить disk alert и filesystem quota.
 - После входа администратор может изменить квоты на `/settings`; они сохраняются в `ALBION_DATA_DIR/settings.json` и применяются без перезапуска. Environment-переменные задают defaults только до первого сохранения.
 - Без Redis бюджеты и Flask-Limiter хранятся in-memory и сбрасываются при restart; для нескольких процессов/реплик задайте `ALBION_REDIS_URL`/`ALBION_RATE_LIMIT_STORAGE_URI`, но метаданные JSON-БД всё равно требуют SQLite/PostgreSQL для транзакционности.
-- `/export_all` публичен по требованиям и позволяет один полный архив в час на IP/key; если это слишком открыто — ограничить через VPN, nginx allowlist или потребовать API key/auth.
+- `/export_all` по умолчанию разрешён только LAN-клиенту через доверенный proxy, API-ключу или действующей админ-сессии и не чаще раза в час; переключатель находится в `/settings`.
 
 ## Проверка после деплоя
 
