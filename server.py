@@ -30,6 +30,84 @@ from flask_limiter.util import get_remote_address
 # Каталог данных (uploads + json-базы): '.' по умолчанию, в Docker — /app/data
 DATA_DIR = os.environ.get('ALBION_DATA_DIR', '.')
 
+# ===== КВОТЫ И СВОБОДНОЕ МЕСТО =====
+def _env_gb(name, default_gb):
+    """Read a gigabyte limit from env; 0/negative means disabled/unlimited."""
+    raw = os.environ.get(name, str(default_gb))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = float(default_gb)
+    return max(0, int(value * 1024 ** 3))
+
+MAX_UPLOAD_BYTES = _env_gb('ALBION_MAX_UPLOAD_GB', 50)       # one request
+STORAGE_QUOTA_BYTES = _env_gb('ALBION_STORAGE_QUOTA_GB', 0)  # 0 = no hard total quota
+MIN_FREE_BYTES = _env_gb('ALBION_MIN_FREE_GB', 5)            # never consume this reserve
+MAX_ZIP_BYTES = _env_gb('ALBION_MAX_ZIP_GB', 50)             # selected ZIP source size
+try:
+    MAX_ZIP_FILES = max(0, int(os.environ.get('ALBION_MAX_ZIP_FILES', '20000')))
+except ValueError:
+    MAX_ZIP_FILES = 20000
+EXPORT_ALL_INTERNAL_ONLY = os.environ.get('ALBION_EXPORT_ALL_INTERNAL_ONLY', '1').lower() in {'1', 'true', 'yes'}
+_REDIS_URL = os.environ.get('ALBION_REDIS_URL', '').strip()
+RATE_LIMIT_STORAGE_URI = os.environ.get('ALBION_RATE_LIMIT_STORAGE_URI', 'memory://').strip() or 'memory://'
+
+# ===== ПРИКЛАДНЫЕ НАСТРОЙКИ (управляются только из админки) =====
+SETTINGS_FILE = os.path.join(DATA_DIR, 'settings.json')
+QUOTA_KEYS = ('max_upload_gb', 'storage_quota_gb', 'min_free_gb', 'max_zip_gb', 'max_zip_files',
+              'export_all_internal_only')
+
+def _quota_defaults():
+    return {
+        'max_upload_gb': MAX_UPLOAD_BYTES / (1024 ** 3),
+        'storage_quota_gb': STORAGE_QUOTA_BYTES / (1024 ** 3),
+        'min_free_gb': MIN_FREE_BYTES / (1024 ** 3),
+        'max_zip_gb': MAX_ZIP_BYTES / (1024 ** 3),
+        'max_zip_files': MAX_ZIP_FILES,
+        'export_all_internal_only': EXPORT_ALL_INTERNAL_ONLY,
+    }
+
+def load_quota_settings():
+    """Return validated quota settings; settings.json overrides env defaults."""
+    values = _quota_defaults()
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for key in QUOTA_KEYS:
+                    if key not in raw:
+                        continue
+                    val = raw[key]
+                    if key == 'export_all_internal_only':
+                        values[key] = bool(val)
+                        continue
+                    if key == 'max_zip_files':
+                        val = int(val)
+                    else:
+                        val = float(val)
+                    if val < 0:
+                        raise ValueError(f'negative value for {key}')
+                    values[key] = val
+            try:
+                os.chmod(SETTINGS_FILE, 0o600)
+            except OSError:
+                pass
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            print(f'⚠️ settings.json проигнорирован: {e}')
+    return values
+
+def save_quota_settings(values):
+    clean = {}
+    for key in QUOTA_KEYS:
+        if key == 'export_all_internal_only':
+            clean[key] = bool(values[key])
+        else:
+            clean[key] = int(values[key]) if key == 'max_zip_files' else float(values[key])
+    with DB_LOCK:
+        _save_json(SETTINGS_FILE, clean)
+    app.config['MAX_CONTENT_LENGTH'] = int(clean['max_upload_gb'] * 1024 ** 3) or None
+
 app = Flask(__name__, static_folder='static')
 
 # ===== СЕКРЕТНЫЙ КЛЮЧ (сохраняется между перезапусками, сессии не слетают) =====
@@ -94,17 +172,23 @@ limiter = Limiter(
     key_func=_rate_limit_key,
     app=app,
     default_limits=["100 per hour", "20 per minute"],
-    storage_uri="memory://"
+    storage_uri=RATE_LIMIT_STORAGE_URI
 )
 
 # ===== ОБРАБОТЧИКИ ОШИБОК =====
 @app.errorhandler(413)
 def request_too_large(e):
     size = request.content_length or 0
-    app.logger.error('Слишком большой запрос на %s: %s от %s (частей формы: лимит %s)',
+    limit = app.config.get('MAX_CONTENT_LENGTH')
+    app.logger.error('Слишком большой запрос на %s: %s от %s (лимит запроса: %s, частей формы: %s)',
                      request.path, format_size(size), request.remote_addr,
+                     format_size(limit) if limit else 'без лимита',
                      app.config.get('MAX_FORM_PARTS'))
-    return jsonify({'error': f'Запрос слишком большой ({format_size(size)}). Проверьте размер и число файлов в папке'}), 413
+    if limit:
+        message = f'Размер загрузки превышает лимит {format_size(limit)}'
+    else:
+        message = f'Запрос слишком большой ({format_size(size)})'
+    return jsonify({'error': message}), 413
 
 @app.errorhandler(500)
 def internal_error(e):
@@ -125,8 +209,9 @@ ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar',
 IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-# Лимит размера загрузки снят (по запросу владельца) — контроль места в статус-баре и albion.log
-app.config['MAX_CONTENT_LENGTH'] = None
+# Один HTTP-запрос ограничен настройкой max_upload_gb (env-дефолт 50 ГиБ).
+# 0 отключает лимит Flask; Waitress всё равно ограничивает тело запроса.
+app.config['MAX_CONTENT_LENGTH'] = int(load_quota_settings()['max_upload_gb'] * 1024 ** 3) or None
 # Werkzeug по умолчанию допускает всего 1000 частей формы (~500 файлов за раз).
 # Каждый файл в загрузке папки = 2 части (file_N + path_N) — поднимаем лимит.
 app.config['MAX_FORM_PARTS'] = 50000
@@ -145,7 +230,7 @@ def is_valid_filename(filename):
 # ===== КОРОТКИЕ ССЫЛКИ (латинизированный слаг из имени файла) =====
 # Путь, занятый системой: короткая ссылка не может его замаскировать
 RESERVED_PATHS = {'login', 'logout', 'export_xlsx', 'export_all', 'upload', 'upload_folder',
-                  'robots.txt', 'favicon.ico', 'v', 'f', 'd', 'z', 'static', 'api'}
+                  'robots.txt', 'favicon.ico', 'v', 'f', 'd', 'z', 'settings', 'static', 'api'}
 
 # ===== БЮДЖЕТ СКАЧИВАНИЯ (защита от массового выкачивания из интернета) =====
 # Аноним: ГБ в скользящем окне часа; с API-ключом: ГБ в сутки (настраивается env)
@@ -523,6 +608,55 @@ def get_all_files():
         'total_downloads': total_downloads
     }
 
+def current_storage_bytes(db=None):
+    db = db if db is not None else load_db()
+    return sum(record.get('size', 0) for record in db.values())
+
+def upload_capacity_error(incoming_bytes, db=None):
+    """Return (HTTP status, message) if an upload cannot fit, else None.
+    incoming_bytes=None means chunked/unknown; quotas require Content-Length.
+    Values are re-read on every request so admin settings apply immediately."""
+    limits = load_quota_settings()
+    max_upload = int(float(limits['max_upload_gb']) * 1024 ** 3)
+    storage_quota = int(float(limits['storage_quota_gb']) * 1024 ** 3)
+    min_free = int(float(limits['min_free_gb']) * 1024 ** 3)
+    if incoming_bytes is None:
+        if storage_quota or min_free or max_upload:
+            return 411, 'Для загрузки требуется заголовок Content-Length (chunked uploads отключены)'
+        incoming_bytes = 0
+    incoming_bytes = max(0, int(incoming_bytes))
+    if max_upload and incoming_bytes > max_upload:
+        return 413, f'Размер загрузки превышает лимит {format_size(max_upload)}'
+    if storage_quota:
+        used = current_storage_bytes(db)
+        if used + incoming_bytes > storage_quota:
+            return 507, f'Квота хранилища исчерпана ({format_size(storage_quota)})'
+    if min_free:
+        free = shutil.disk_usage(UPLOAD_FOLDER).free
+        if free - incoming_bytes < min_free:
+            return 507, f'Недостаточно свободного места: требуется резерв {format_size(min_free)}'
+    return None
+
+def zip_capacity_error(files):
+    """files: iterable of (source_path, arcname). Return (status, message) or None."""
+    limits = load_quota_settings()
+    max_zip = int(float(limits['max_zip_gb']) * 1024 ** 3)
+    max_files = int(limits['max_zip_files'])
+    min_free = int(float(limits['min_free_gb']) * 1024 ** 3)
+    files = list(files)
+    count = len(files)
+    if max_files and count > max_files:
+        return 413, f'Слишком много файлов для архива: {count} (лимит {max_files})'
+    total = sum(os.path.getsize(path) for path, _ in files)
+    if max_zip and total > max_zip:
+        return 413, f'Размер архива превышает лимит {format_size(max_zip)}'
+    if min_free:
+        target = ZIPLINKS_DIR if os.path.isdir(ZIPLINKS_DIR) else UPLOAD_FOLDER
+        free = shutil.disk_usage(target).free
+        if free - total < min_free:
+            return 507, f'Недостаточно свободного места для архива (резерв {format_size(min_free)})'
+    return None
+
 def get_folder_stats_map(folders, db):
     """Рекурсивная статистика по каждой папке: (файлов, суммарный размер, подпапок).
     Один проход по БД + мемоизация — дёшево даже на тысячах папок."""
@@ -756,6 +890,7 @@ HTML_TEMPLATE = """
             <h1 class="header-title">АЛЬБИОН: Файлы</h1>
             <div class="header-subtitle">Файловый сервер для обмена документами</div>
         </div>
+        <a href="/settings" class="btn btn-sm" style="margin:0 0 0 auto; background:rgba(255,255,255,.18);" title="Настройки квот">⚙️ Настройки</a>
     </header>
 
     <div class="main">
@@ -1241,10 +1376,10 @@ HTML_TEMPLATE = """
             finally { btn.disabled = false; btn.textContent = '⬇ Скачать архив'; }
         }
 
-        function openBatchMoveModal() {
+        async function openBatchMoveModal() {
             if (selectedFiles.size === 0) return;
-            loadFolderSelect('batchMoveFolderId');
-            document.getElementById('batchMoveModal').classList.add('active');
+            const loaded = await loadFolderSelect('batchMoveFolderId');
+            if (loaded) document.getElementById('batchMoveModal').classList.add('active');
         }
 
         function closeBatchMoveModal() { document.getElementById('batchMoveModal').classList.remove('active'); }
@@ -1274,27 +1409,39 @@ HTML_TEMPLATE = """
             } catch (err) { showToast('❌ Ошибка', true); }
         }
 
-        function openEditModal(internalId, displayName, physicalFilename, customAlias, folderId) {
+        async function openEditModal(internalId, displayName, physicalFilename, customAlias, folderId) {
             document.getElementById('editInternalId').value = internalId;
             document.getElementById('editDisplayName').value = displayName;
             document.getElementById('editPhysicalFilename').value = physicalFilename;
             document.getElementById('editCustomAlias').value = customAlias;
-            document.getElementById('editFolderId').value = folderId || '';
             document.getElementById('filenameWarning').style.display = 'none';
             updateAliasPreview();
-            loadFolderSelect('editFolderId');
+            const loaded = await loadFolderSelect('editFolderId', folderId);
+            if (!loaded) return;
             document.getElementById('editModal').classList.add('active');
         }
         function closeEditModal() { document.getElementById('editModal').classList.remove('active'); }
         
-        async function loadFolderSelect(selectId) {
-            const response = await fetch('/api/get_all_folders');
-            const folders = await response.json();
-            const select = document.getElementById(selectId);
-            select.innerHTML = '<option value="">🏠 Корень</option>';
-            folders.forEach(f => {
-                select.innerHTML += `<option value="${f.id}">${'—'.repeat(f.depth)} 📁 ${f.name}</option>`;
-            });
+        async function loadFolderSelect(selectId, selectedValue = '') {
+            try {
+                const response = await fetch('/api/get_all_folders');
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const folders = await response.json();
+                const select = document.getElementById(selectId);
+                select.innerHTML = '<option value="">🏠 Корень</option>';
+                folders.forEach(f => {
+                    const option = document.createElement('option');
+                    option.value = f.id;
+                    option.textContent = `${'—'.repeat(f.depth)} 📁 ${f.name}`;
+                    select.appendChild(option);
+                });
+                select.value = selectedValue || '';
+                return true;
+            } catch (err) {
+                showToast('❌ Не удалось загрузить список папок', true);
+                console.error('Ошибка списка папок:', err);
+                return false;
+            }
         }
         
         function updateAliasPreview() {
@@ -1638,6 +1785,89 @@ PUBLIC_FOLDER_TEMPLATE = """
 """
 
 
+# ===== НАСТРОЙКИ (только администратор) =====
+SETTINGS_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="csrf-token" content="{{ csrf_token }}">
+    <title>АЛЬБИОН: Настройки</title>
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: #f4f4f9; margin: 0; color: #1e293b; }
+        .header { background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%); color: white; padding: 15px 30px; display: flex; align-items: center; gap: 15px; }
+        .header img { height: 42px; background: white; padding: 4px 7px; border-radius: 6px; }
+        .header h1 { margin: 0; font-size: 20px; }
+        .main { max-width: 760px; margin: 0 auto; padding: 22px 15px; }
+        .card { background: white; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.08); padding: 20px 24px; }
+        h2 { color: #1e3a8a; margin-top: 0; font-size: 18px; }
+        .group { margin: 16px 0; }
+        label { display: block; font-weight: 600; margin-bottom: 5px; font-size: 13px; }
+        input { width: 100%; max-width: 260px; padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 5px; font-size: 14px; }
+        .hint { color: #64748b; font-size: 12px; margin-top: 4px; }
+        .actions { display: flex; gap: 10px; margin-top: 22px; }
+        .btn { display: inline-block; padding: 8px 16px; border-radius: 5px; text-decoration: none; color: white; background: #2563eb; border: none; cursor: pointer; font-size: 13px; font-weight: 500; }
+        .btn:hover { background: #1e3a8a; }
+        .btn-secondary { background: #f1f5f9; color: #475569; }
+        .btn-secondary:hover { background: #e2e8f0; }
+        .toast { background: #dcfce7; color: #166534; padding: 10px 14px; border-radius: 6px; margin-bottom: 15px; font-size: 13px; }
+        .error { background: #fee2e2; color: #991b1b; padding: 10px 14px; border-radius: 6px; margin-bottom: 15px; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <img src="{{ url_for('static', filename='logo.png') }}" alt="АЛЬБИОН">
+        <h1>⚙️ Настройки квот</h1>
+    </header>
+    <div class="main">
+        <div class="card">
+            {% if saved %}<div class="toast">Настройки сохранены.</div>{% endif %}
+            {% if error %}<div class="error">{{ error }}</div>{% endif %}
+            <p style="color:#64748b;font-size:13px;margin-top:0;">Изменения применяются сразу. Значение 0 отключает соответствующее ограничение.</p>
+            <form method="post" action="/settings">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <div class="group">
+                    <label>Максимальный размер одной загрузки, ГиБ</label>
+                    <input type="number" name="max_upload_gb" min="0" step="0.1" value="{{ values.max_upload_gb }}">
+                    <div class="hint">Ограничивает один HTTP-запрос; 0 — без Flask-лимита.</div>
+                </div>
+                <div class="group">
+                    <label>Общая квота хранилища, ГиБ</label>
+                    <input type="number" name="storage_quota_gb" min="0" step="0.1" value="{{ values.storage_quota_gb }}">
+                    <div class="hint">Сумма учтённых файлов; 0 — без жёсткой общей квоты.</div>
+                </div>
+                <div class="group">
+                    <label>Неприкосновенный резерв диска, ГиБ</label>
+                    <input type="number" name="min_free_gb" min="0" step="0.1" value="{{ values.min_free_gb }}">
+                    <div class="hint">Загрузки и создание ZIP не могут занять этот объём.</div>
+                </div>
+                <div class="group">
+                    <label>Максимальный размер исходных файлов ZIP, ГиБ</label>
+                    <input type="number" name="max_zip_gb" min="0" step="0.1" value="{{ values.max_zip_gb }}">
+                    <div class="hint">Применяется к ZIP по выделению и /export_all; 0 — без ограничения.</div>
+                </div>
+                <div class="group">
+                    <label>Максимум файлов в одном ZIP</label>
+                    <input type="number" name="max_zip_files" min="0" step="1" value="{{ values.max_zip_files }}">
+                    <div class="hint">0 — без ограничения по числу файлов.</div>
+                </div>
+                <div class="group">
+                    <label><input type="checkbox" name="export_all_internal_only" value="1" style="width:auto;margin-right:6px;" {% if values.export_all_internal_only %}checked{% endif %}> Полный экспорт только из локальной сети/с API-ключом</label>
+                    <div class="hint">Если выключено, GET /export_all доступен анонимно в пределах часовой квоты.</div>
+                </div>
+                <div class="actions">
+                    <button class="btn" type="submit">Сохранить</button>
+                    <a class="btn btn-secondary" href="/f/">← К файлам</a>
+                </div>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
 # ===== АУТЕНТИФИКАЦИЯ =====
 AUTH_FILE = os.path.join(DATA_DIR, 'auth.json')
 
@@ -1674,15 +1904,82 @@ def _enforce_csrf():
     if request.method not in {'POST', 'PUT', 'PATCH', 'DELETE'} or not session.get('logged_in'):
         return None
     expected = session.get('_csrf_token')
-    provided = request.headers.get('X-CSRF-Token')
+    provided = request.headers.get('X-CSRF-Token') or request.form.get('csrf_token')
     if not expected or not provided or not hmac.compare_digest(expected, provided):
         app.logger.warning('CSRF token missing/invalid: %s %s from %s', request.method, request.path, request.remote_addr)
         return jsonify({'error': 'CSRF-токен отсутствует или неверен'}), 403
     return None
 
-# ===== БЮДЖЕТ СКАЧИВАНИЯ: скользящее окно на IP/API-ключ =====
+@app.before_request
+def _early_upload_capacity():
+    """Reject oversized/unsafe uploads before Werkzeug parses multipart data."""
+    if not session.get('logged_in') or request.path not in {'/upload', '/upload_folder'}:
+        return None
+    error = upload_capacity_error(request.content_length)
+    if error:
+        status, message = error
+        app.logger.warning('Ранняя проверка загрузки отклонена: %s (content_length=%s)',
+                           message, request.content_length)
+        return jsonify({'error': message}), status
+    return None
+
+# ===== БЮДЖЕТ СКАЧИВАНИЯ: Redis (общий) или memory fallback =====
 _download_windows = {}
 _DOWNLOAD_BUDGET_LOCK = threading.Lock()
+_redis_client = None
+_redis_checked = False
+
+def _get_redis_client():
+    """Optional shared state for multi-process deployments. Requires redis package/server."""
+    global _redis_client, _redis_checked
+    if _redis_checked:
+        return _redis_client
+    _redis_checked = True
+    if not _REDIS_URL:
+        return None
+    try:
+        import redis  # optional dependency
+        client = redis.Redis.from_url(
+            _REDIS_URL, decode_responses=True,
+            socket_connect_timeout=0.5, socket_timeout=0.5,
+        )
+        client.ping()
+        _redis_client = client
+        app.logger.info('Redis подключён для бюджетов и квот экспорта')
+    except Exception as e:
+        app.logger.warning('Redis недоступен (%s); бюджеты работают в памяти процесса', e)
+        _redis_client = None
+    return _redis_client
+
+_REDIS_BUDGET_SCRIPT = """
+local used = tonumber(redis.call('GET', KEYS[1]) or '0')
+local limit = tonumber(ARGV[1])
+local size = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+if used > 0 and used + size > limit then
+  return -1
+end
+redis.call('INCRBY', KEYS[1], size)
+if used == 0 then redis.call('EXPIRE', KEYS[1], ttl) end
+return 1
+"""
+
+def _redis_budget_check(scope, size_bytes, limit, window):
+    """Return (handled, retry_after_seconds_or_None); fallback to memory on Redis error."""
+    client = _get_redis_client()
+    if client is None:
+        return False, None
+    now = time.time()
+    bucket = int(now // window)
+    key = f"albion:budget:{scope}:{bucket}"
+    try:
+        result = client.eval(_REDIS_BUDGET_SCRIPT, 1, key, limit, size_bytes, window + 5)
+        if result == -1:
+            return True, max(1, int(window - (now % window)))
+        return True, None
+    except Exception as e:
+        app.logger.warning('Redis budget недоступен (%s); fallback в память', e)
+        return False, None
 
 def check_download_budget(ip, size_bytes):
     """None — скачивание разрешено (usage записан); иначе сколько секунд ждать.
@@ -1694,6 +1991,9 @@ def check_download_budget(ip, size_bytes):
     else:
         limit, window = ANON_DL_BUDGET_BYTES, ANON_DL_WINDOW
     scope = f"key:{g.api_key_id}" if g.get('api_key_id') else f"ip:{ip}"
+    handled, retry = _redis_budget_check(scope, size_bytes, limit, window)
+    if handled:
+        return retry
     with _DOWNLOAD_BUDGET_LOCK:
         dq = _download_windows.setdefault(scope, deque())
         while dq and now - dq[0][0] > window:
@@ -1873,6 +2173,42 @@ def browse_folder(folder_id=None):
         base_url=BASE_URL,
         csrf_token=session.setdefault('_csrf_token', secrets.token_urlsafe(32)))
 
+@app.route('/settings', methods=['GET', 'POST'])
+@login_required
+def settings_page():
+    """Quota/config settings, available only after admin login."""
+    values = load_quota_settings()
+    error = None
+    if request.method == 'POST':
+        try:
+            parsed = {}
+            for key in ('max_upload_gb', 'storage_quota_gb', 'min_free_gb', 'max_zip_gb'):
+                raw = request.form.get(key, '').strip().replace(',', '.')
+                value = float(raw)
+                max_allowed = 1024 if key == 'max_upload_gb' else 10 ** 9
+                if value < 0 or value != value or value > max_allowed:
+                    raise ValueError('Недопустимое значение')
+                parsed[key] = value
+            raw_files = request.form.get('max_zip_files', '').strip()
+            max_files = int(raw_files)
+            if max_files < 0 or max_files > 10 ** 9:
+                raise ValueError('Недопустимое число файлов')
+            parsed['max_zip_files'] = max_files
+            parsed['export_all_internal_only'] = request.form.get('export_all_internal_only') == '1'
+            save_quota_settings(parsed)
+            app.logger.info('Настройки квот изменены администратором: %s', parsed)
+            return redirect('/settings?saved=1')
+        except (TypeError, ValueError) as e:
+            error = f'Проверьте значения: {e}'
+            values = {**values, **{k: request.form.get(k, values[k]) for k in values}}
+    return render_template_string(
+        SETTINGS_TEMPLATE,
+        values=values,
+        saved=request.args.get('saved') == '1',
+        error=error,
+        csrf_token=session.setdefault('_csrf_token', secrets.token_urlsafe(32)),
+    )
+
 @app.route('/d/<folder_ref>')
 @limiter.limit("60 per minute")
 def public_folder(folder_ref):
@@ -1961,6 +2297,13 @@ def upload_file():
     with UPLOAD_LOCK:
         saved_count = 0
         db = load_db()
+
+        capacity_error = upload_capacity_error(request.content_length, db)
+        if capacity_error:
+            status, message = capacity_error
+            app.logger.warning('Загрузка отклонена: %s (content_length=%s, файлов=%d)',
+                               message, request.content_length, len(files))
+            return jsonify({'error': message}), status
 
         folder_physical_path = get_folder_physical_path(folder_id, folders)
         os.makedirs(folder_physical_path, exist_ok=True)
@@ -2059,6 +2402,13 @@ def upload_folder():
 
     with UPLOAD_LOCK:
         db = load_db()
+
+        capacity_error = upload_capacity_error(request.content_length, db)
+        if capacity_error:
+            status, message = capacity_error
+            app.logger.warning('Загрузка папки отклонена: %s (content_length=%s, файлов=%d)',
+                               message, request.content_length, len(file_data))
+            return jsonify({'error': message}), status
 
         for file, rel_path in file_data:
             if not rel_path:
@@ -2685,7 +3035,7 @@ def export_xlsx():
 @limiter.limit("30 per minute", deduct_when=lambda response: g.get('api_key') is None)
 def direct_file_access(filepath):
     if filepath.startswith('static/') or filepath.startswith('f/') or filepath.startswith('d/') or filepath.startswith('z/') or filepath in [
-        'export_xlsx', 'export_all', 'upload', 'upload_folder', 'favicon.ico'
+        'export_xlsx', 'export_all', 'upload', 'upload_folder', 'settings', 'favicon.ico'
     ] or filepath.startswith('api/'):
         abort(404)
 
@@ -2745,6 +3095,12 @@ def export_all():
     Не чаще раза в час на IP (анонимно) или на API-ключ."""
     if request.method == 'HEAD':
         return '', 405
+    quota_settings = load_quota_settings()
+    if quota_settings.get('export_all_internal_only', True):
+        client_addr = request.remote_addr or ''
+        if not (g.get('api_key_id') or session.get('logged_in') or _PRIVATE_RE.match(client_addr)):
+            app.logger.warning('Полный экспорт запрещён для внешнего адреса %s', client_addr)
+            return jsonify({'error': 'Полный экспорт доступен только из локальной сети или с API-ключом'}), 403
     scope = f"key:{g.api_key_id}" if g.get('api_key_id') else f"ip:{request.remote_addr}"
     with _EXPORT_ALL_LOCK:
         now = time.time()
@@ -2766,14 +3122,38 @@ def export_all():
                 items.append((full, arcname))
         if not items:
             return jsonify({'error': 'Нет файлов для архивирования'}), 404
+        zip_error = zip_capacity_error(items)
+        if zip_error:
+            status, message = zip_error
+            return jsonify({'error': message}), status
+
+        # Cross-process hourly quota; memory fallback remains single-process.
+        redis_export_key = None
+        redis_client = _get_redis_client()
+        if redis_client is not None:
+            try:
+                redis_export_key = f"albion:export_all:{scope}"
+                if not redis_client.set(redis_export_key, '1', nx=True, ex=EXPORT_ALL_INTERVAL):
+                    ttl = redis_client.ttl(redis_export_key)
+                    retry = int(ttl) if isinstance(ttl, int) and ttl > 0 else EXPORT_ALL_INTERVAL
+                    resp = jsonify({'error': f'Массовое скачивание доступно раз в час, повторите через {max(1, retry // 60)} мин'})
+                    resp.headers['Retry-After'] = str(retry)
+                    return resp, 429
+            except Exception as e:
+                app.logger.warning('Redis export quota недоступен (%s); fallback в память', e)
+                redis_export_key = None
+
         total_bytes = sum(os.path.getsize(path) for path, _ in items)
         retry_after = check_download_budget(request.remote_addr, total_bytes)
         if retry_after:
+            if redis_export_key and redis_client is not None:
+                try:
+                    redis_client.delete(redis_export_key)
+                except Exception:
+                    pass
             resp = jsonify({'error': f'Бюджет скачивания исчерпан; повторите через {max(1, retry_after // 60)} мин'})
             resp.headers['Retry-After'] = str(retry_after)
             return resp, 429
-        if shutil.disk_usage(UPLOAD_FOLDER).free < total_bytes + 64 * 1024 * 1024:
-            return jsonify({'error': 'Недостаточно свободного места для временного архива'}), 507
 
         for fn in os.listdir(UPLOAD_FOLDER):
             if fn.startswith('.export_all-') and fn.endswith('.zip'):
@@ -2794,6 +3174,11 @@ def export_all():
                 os.remove(tmp_path)
             except OSError:
                 pass
+            if redis_export_key and redis_client is not None:
+                try:
+                    redis_client.delete(redis_export_key)
+                except Exception:
+                    pass
             raise
 
     app.logger.info('Экспорт всего хранилища: %d файл(ов), %s, scope=%s',
@@ -2851,6 +3236,11 @@ def export_zip():
         return jsonify({'error': 'Нет файлов для архивирования'}), 404
 
     os.makedirs(ZIPLINKS_DIR, exist_ok=True)
+    zip_error = zip_capacity_error(items)
+    if zip_error:
+        status, message = zip_error
+        app.logger.warning('ZIP по выделению отклонён: %s (файлов=%d)', message, len(items))
+        return jsonify({'error': message}), status
     # Архивы-ссылки живут сутки, старые подчищаем
     now = time.time()
     for fn in os.listdir(ZIPLINKS_DIR):
@@ -2913,5 +3303,6 @@ if __name__ == '__main__':
           host=os.environ.get('ALBION_HOST', '0.0.0.0'),   # в офисе за nginx: ALBION_HOST=127.0.0.1
           port=int(os.environ.get('ALBION_PORT', '5000')),
           threads=8,
-          max_request_body_size=100 * 1024 * 1024 * 1024,  # 100 ГБ (None waitress не принимает)
+          # Transport ceiling; the admin-configurable per-request limit is lower.
+          max_request_body_size=1024 * 1024 * 1024 * 1024,
           channel_timeout=300)

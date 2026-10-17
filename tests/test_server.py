@@ -43,6 +43,10 @@ class ServerSmokeTests(unittest.TestCase):
                 shutil.rmtree(path)
         for entry in os.listdir(server.ZIPLINKS_DIR):
             os.remove(os.path.join(server.ZIPLINKS_DIR, entry))
+        if os.path.exists(server.SETTINGS_FILE):
+            os.remove(server.SETTINGS_FILE)
+        server.app.config['MAX_CONTENT_LENGTH'] = (
+            int(server.load_quota_settings()['max_upload_gb'] * 1024 ** 3) or None)
         with open(server.AUTH_FILE, 'w', encoding='utf-8') as f:
             json.dump({'username': 'test', 'password_hash': generate_password_hash('Test-Password-2026!')}, f)
         self.client = server.app.test_client()
@@ -193,6 +197,160 @@ class ServerSmokeTests(unittest.TestCase):
         response.close()
         self.assertEqual(server.load_db()[fid]['view_count'], 1)
 
+    def test_rename_alias_move_and_stable_slug(self):
+        self.login()
+        upload = self.client.post('/upload', data={'count':'1','file_0':(io.BytesIO(b'rename'),'before.txt')}, content_type='multipart/form-data')
+        self.assertEqual(upload.status_code, 200)
+        fid, rec = next(iter(server.load_db().items()))
+        original_slug = rec['slug']
+        folder = self.client.post('/api/create_folder', json={'name':'Target'}).get_json()['folder_id']
+        response = self.client.post('/api/update_file', json={
+            'internal_id':fid,'display_name':'After','physical_filename':'after.txt','custom_alias':'after-link','folder_id':None
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.anon.get('/after-link').status_code, 200)
+        response = self.client.post('/api/move_file', json={'file_id':fid,'target_folder_id':folder})
+        self.assertEqual(response.status_code, 200)
+        current = server.load_db()[fid]
+        self.assertEqual(current['folder_id'], folder)
+        self.assertTrue(current['link_rotated'])
+        self.assertEqual(current['slug'], original_slug)
+        self.assertEqual(self.anon.get('/' + original_slug).status_code, 200)
+
+    def test_batch_move_and_delete(self):
+        self.login()
+        for name in ('one.txt','two.txt'):
+            self.client.post('/upload', data={'count':'1','file_0':(io.BytesIO(name.encode()),name)}, content_type='multipart/form-data')
+        db=server.load_db()
+        ids=[fid for fid,rec in db.items()]
+        folder=self.client.post('/api/create_folder',json={'name':'Batch'}).get_json()['folder_id']
+        moved=self.client.post('/api/move_files_batch',json={'file_ids':ids,'target_folder_id':folder})
+        self.assertEqual(moved.status_code,200)
+        self.assertEqual(moved.get_json()['count'],2)
+        self.assertTrue(all(server.load_db()[fid]['folder_id']==folder for fid in ids))
+        deleted=self.client.post('/api/delete_files_batch',json={'file_ids':ids})
+        self.assertEqual(deleted.status_code,200)
+        self.assertEqual(deleted.get_json()['count'],2)
+        self.assertFalse(server.load_db())
+
+    def test_recursive_folder_delete(self):
+        self.login()
+        parent=self.client.post('/api/create_folder',json={'name':'Parent'}).get_json()['folder_id']
+        child=self.client.post('/api/create_folder',json={'name':'Child','parent_id':parent}).get_json()['folder_id']
+        self.client.post('/upload',data={'count':'1','folder_id':child,'file_0':(io.BytesIO(b'x'),'child.txt')},content_type='multipart/form-data')
+        response=self.client.post('/api/delete_folder',json={'folder_id':parent})
+        self.assertEqual(response.status_code,200)
+        self.assertFalse(server.load_db())
+        self.assertNotIn(parent,server.load_folders())
+        self.assertNotIn(child,server.load_folders())
+
+    def test_redis_budget_branch(self):
+        class FakeRedis:
+            def __init__(self):
+                self.used = 0
+            def eval(self, script, numkeys, key, limit, size, ttl):
+                if self.used > 0 and self.used + size > limit:
+                    return -1
+                self.used += size
+                return 1
+
+        fake = FakeRedis()
+        old_getter = server._get_redis_client
+        old_budget = server.ANON_DL_BUDGET_BYTES
+        server._get_redis_client = lambda: fake
+        server.ANON_DL_BUDGET_BYTES = 10
+        try:
+            with server.app.test_request_context('/'):
+                self.assertIsNone(server.check_download_budget('203.0.113.1', 5))
+                self.assertIsNotNone(server.check_download_budget('203.0.113.1', 6))
+        finally:
+            server._get_redis_client = old_getter
+            server.ANON_DL_BUDGET_BYTES = old_budget
+
+    def test_admin_settings_update_quotas(self):
+        self.assertEqual(self.anon.get('/settings').status_code, 302)
+        self.login()
+        page = self.client.get('/settings')
+        self.assertEqual(page.status_code, 200)
+        token = re.search(rb'<meta name="csrf-token" content="([^"]+)"', page.data).group(1).decode()
+        response = self.client.post('/settings', data={
+            'max_upload_gb': '1.5',
+            'storage_quota_gb': '200',
+            'min_free_gb': '2',
+            'max_zip_gb': '25',
+            'max_zip_files': '500',
+            'export_all_internal_only': '1',
+            'csrf_token': token,
+        }, follow_redirects=False)
+        self.assertEqual(response.status_code, 302)
+        saved = server.load_quota_settings()
+        self.assertTrue(saved['export_all_internal_only'])
+        self.assertEqual(saved['max_upload_gb'], 1.5)
+        self.assertEqual(saved['storage_quota_gb'], 200.0)
+        self.assertEqual(saved['max_zip_files'], 500)
+        self.assertEqual(server.app.config['MAX_CONTENT_LENGTH'], int(1.5 * 1024 ** 3))
+        invalid = self.client.post('/settings', data={
+            'max_upload_gb': '-1', 'storage_quota_gb': '0', 'min_free_gb': '0',
+            'max_zip_gb': '0', 'max_zip_files': '0', 'csrf_token': token,
+        })
+        self.assertEqual(invalid.status_code, 200)
+        self.assertIn('Проверьте значения', invalid.get_data(as_text=True))
+
+    def test_upload_quota_and_free_space_helpers(self):
+        old_quota = server.STORAGE_QUOTA_BYTES
+        old_free = server.MIN_FREE_BYTES
+        try:
+            server.STORAGE_QUOTA_BYTES = 1000
+            server.MIN_FREE_BYTES = 0
+            status, _ = server.upload_capacity_error(200, {'a': {'size': 900}})
+            self.assertEqual(status, 507)
+            self.assertIsNone(server.upload_capacity_error(50, {'a': {'size': 900}}))
+        finally:
+            server.STORAGE_QUOTA_BYTES = old_quota
+            server.MIN_FREE_BYTES = old_free
+
+    def test_upload_request_limit_returns_413(self):
+        self.login()
+        old_limit, old_cfg = server.MAX_UPLOAD_BYTES, server.app.config.get('MAX_CONTENT_LENGTH')
+        try:
+            server.MAX_UPLOAD_BYTES = 100
+            server.app.config['MAX_CONTENT_LENGTH'] = 100
+            response = self.client.post('/upload', data={
+                'count':'1', 'file_0':(io.BytesIO(b'x' * 200), 'too-big.txt')
+            }, content_type='multipart/form-data')
+            self.assertEqual(response.status_code, 413)
+        finally:
+            server.MAX_UPLOAD_BYTES = old_limit
+            server.app.config['MAX_CONTENT_LENGTH'] = old_cfg
+
+    def test_zip_limits(self):
+        import tempfile
+        old_bytes, old_files = server.MAX_ZIP_BYTES, server.MAX_ZIP_FILES
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        tmp.write(b'x' * 20)
+        tmp.close()
+        try:
+            server.MAX_ZIP_BYTES = 10
+            server.MAX_ZIP_FILES = 10
+            self.assertEqual(server.zip_capacity_error([(tmp.name, 'x')])[0], 413)
+            server.MAX_ZIP_BYTES = 1000
+            server.MAX_ZIP_FILES = 0
+            self.assertEqual(server.zip_capacity_error([(tmp.name, 'x'), (tmp.name, 'y')]), None)
+            server.MAX_ZIP_FILES = 1
+            self.assertEqual(server.zip_capacity_error([(tmp.name, 'x'), (tmp.name, 'y')])[0], 413)
+        finally:
+            server.MAX_ZIP_BYTES, server.MAX_ZIP_FILES = old_bytes, old_files
+            os.remove(tmp.name)
+
+    def test_export_xlsx_response(self):
+        self.login()
+        self.client.post('/upload',data={'count':'1','file_0':(io.BytesIO(b'x'),'sheet.txt')},content_type='multipart/form-data')
+        response=self.client.get('/export_xlsx')
+        self.assertEqual(response.status_code,200)
+        self.assertIn('spreadsheetml',response.mimetype)
+        self.assertTrue(response.data.startswith(b'PK'))
+        response.close()
+
     def test_public_folder_slug_and_uuid(self):
         self.login()
         result = self.client.post('/api/create_folder', json={'name':'Публичная'}).get_json()
@@ -275,6 +433,9 @@ class ServerSmokeTests(unittest.TestCase):
             server.ANON_DL_BUDGET_BYTES = 10 * 1024**3
 
     def test_export_all_hourly_limit_and_zip(self):
+        # External anonymous client is denied by the default internal-only setting.
+        external = self.anon.get('/export_all', environ_base={'REMOTE_ADDR': '203.0.113.5'})
+        self.assertEqual(external.status_code, 403)
         self.login()
         self.client.post('/upload', data={'count':'1','file_0':(io.BytesIO(b'zip'),'export.txt')}, content_type='multipart/form-data')
         r = self.anon.get('/export_all')

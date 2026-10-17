@@ -4,10 +4,14 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Deployment secrets and private data
+.env
+
 # Данные приложения (НЕ коммитим)
 files_db.json
 folders_db.json
 stats.json
+settings.json
 auth.json
 tokens.json
 .secret_key
