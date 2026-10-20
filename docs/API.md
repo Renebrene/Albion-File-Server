@@ -90,6 +90,129 @@ curl -fL -H 'X-API-Key: alb_...' -o albion-files.zip 'https://files.example.ru/e
 
 Не передавайте ключ через query string: URL попадает в access-логи и историю клиента.
 
+## Интеграция (машинные токены)
+
+Токены выпускаются владельцем хранилища и предназначены для доверенных сервисов
+(Photobase, демо-сайт и т. п.). Аутентификация — только заголовок `X-API-Key`;
+браузерная сессия и CSRF для этих endpoint'ов не нужны и не принимаются.
+Секрет хранится в `tokens.json` только как SHA-256 и выводится один раз при создании.
+
+### Права и привязка к папке
+
+| Поле `tokens.json` | Смысл |
+|---|---|
+| `scopes` | `download`, `upload`, `delete` или `*` (все права). Нет поля — трактуется как `["download"]` (совместимость со старыми ключами) |
+| `folder_id` | UUID папки; обязателен для `upload`/`*`. Токен может писать только в неё |
+| `expires_at` | Необязательная ISO-дата; после неё токен отклоняется (`403`) |
+
+Создание и просмотр:
+
+```bash
+python manage_tokens.py add "Photobase" --scopes upload,download --folder <uuid>
+python manage_tokens.py add "Демо-сайт" --scopes upload,delete --folder <uuid>
+python manage_tokens.py add "Скрипт отчётов"          # только download
+python manage_tokens.py list                          # права и папка
+python manage_tokens.py revoke "Photobase"
+```
+
+`add` без `--scopes` сохраняет прежнее поведение — ключ только на скачивание.
+Для `upload` (в том числе в составе `*`) обязателен `--folder`.
+
+### `GET /api/v1/integration/verify`
+
+Проверяет токен, его права и привязку. Ничего не меняет. Требуется право `upload`
+(токен только на скачивание получает `403`).
+
+```bash
+curl -H 'X-API-Key: alb_...' https://files.example.ru/api/v1/integration/verify
+```
+
+Успех `200`:
+
+```json
+{
+  "ok": true,
+  "name": "Photobase",
+  "scopes": ["upload", "download"],
+  "folder_id": "3f0c...",
+  "base_url": "https://files.example.ru",
+  "limits": {"max_upload_gb": 50}
+}
+```
+
+### `POST /api/v1/integration/upload`
+
+`multipart/form-data`, один файл в поле `file`.
+
+| Поле | Обяз. | Смысл |
+|---|---|---|
+| `file` | да | один файл; расширение — из белого списка Albion |
+| `folder_id` | нет | нужен, если у токена нет привязки; иначе должен совпадать с токеном |
+| `display_name` | нет | имя в интерфейсе; по умолчанию имя файла |
+| `ttl_days` | нет | только для расчёта `expires_at` (1…3650) |
+
+```bash
+curl -H 'X-API-Key: alb_...' \
+     -F 'file=@photo.jpg' \
+     -F 'display_name=Фото объекта' \
+     -F 'ttl_days=90' \
+     https://files.example.ru/api/v1/integration/upload
+```
+
+Успех `200`:
+
+```json
+{
+  "file_id": "uuid",
+  "url": "https://files.example.ru/korotkaya-ssylka",
+  "short_url": "https://files.example.ru/korotkaya-ssylka",
+  "object_key": "uploads/<folder>/photo.jpg",
+  "name": "photo.jpg",
+  "folder_id": "3f0c...",
+  "expires_at": "2027-01-18T12:00:00+00:00"
+}
+```
+
+Имя файла очищается (`+` → `_`), небезопасные имена (`..`, `/`, `\`, `\0`,
+абсолютные пути) отклоняются. Совпадение имени с существующим файлом даёт
+суффикс `_1`, `_2`, … — как у веб-загрузки. Запись создаётся в `files_db.json`
+с теми же полями, что `/upload`; физическая запись атомарная (временный файл
+рядом с целевым + `os.replace`).
+
+`expires_at` — **метка для клиента**, а не политика удаления: Albion не удаляет
+файлы по TTL. По умолчанию TTL — `ALBION_INTEGRATION_TTL_DAYS` (90 дней),
+значение ограничивается диапазоном 1…3650. Лимит частоты — 60 загрузок в минуту
+на токен (fallback — IP), ответ при превышении `429`.
+
+Коды ошибок:
+
+| Код | Когда |
+|---|---|
+| `400` | нет файла, пустое/недопустимое имя, недопустимое расширение, некорректный `ttl_days`/форма |
+| `401` | токена нет или он неверен (в том числе после отзыва) |
+| `403` | нет права `upload`, токен не привязан к папке, чужая папка, токен просрочен |
+| `404` | папки нет |
+| `413` | превышен размер запроса/файла |
+| `429` | превышен лимит запросов токена |
+| `507` | нет свободного места/квоты |
+
+Квоты и резерв `ALBION_MIN_FREE_GB` — те же, что у веб-загрузки. Токен не даёт
+доступа к админским JSON-API и не создаёт браузерную сессию.
+
+### `DELETE /api/v1/integration/files/<file_id>`
+
+Удаляет файл и его запись из `files_db.json`. Требуется право `delete`; токен,
+привязанный к папке, может удалять только файлы этой папки (`403` для чужой).
+
+```bash
+curl -X DELETE -H 'X-API-Key: alb_...' \
+     https://files.example.ru/api/v1/integration/files/<file_id>
+```
+
+Успех `200`: `{"deleted": true, "file_id": "..."}`. Ошибки: `401` — токен
+неверен/отозван, `403` — нет права `delete` или файл в чужой папке, `404` —
+файл не найден, `400` — небезопасный путь в записи.
+
 ## Состояние хранения и эксплуатация
 
 - Данные находятся в `ALBION_DATA_DIR` (по умолчанию `.`): `uploads/`, JSON-БД, `auth.json`, `tokens.json`, `.secret_key`, логи. Секретные JSON-файлы и ключ сессии создаются с правами 0600.

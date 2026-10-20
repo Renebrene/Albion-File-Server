@@ -6,7 +6,7 @@ import uuid
 import re
 import shutil
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, send_from_directory, render_template_string, send_file, jsonify, abort, redirect, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 from openpyxl import Workbook
@@ -208,6 +208,14 @@ def request_too_large(e):
     else:
         message = f'Запрос слишком большой ({format_size(size)})'
     return jsonify({'error': message}), 413
+
+@app.errorhandler(429)
+def too_many_requests(e):
+    response = jsonify({'error': 'Слишком много запросов — повторите позже'})
+    retry_after = getattr(e, 'retry_after', None)
+    if retry_after:
+        response.headers['Retry-After'] = str(retry_after)
+    return response, 429
 
 @app.errorhandler(500)
 def internal_error(e):
@@ -1934,22 +1942,72 @@ def load_tokens():
             pass
     return tokens
 
+def _token_scopes(meta):
+    """Права токена; старые записи без scopes работают только на скачивание."""
+    scopes = meta.get('scopes')
+    if not isinstance(scopes, list) or not scopes:
+        return ['download']
+    return scopes
+
+def _token_is_expired(value):
+    """True для корректной прошедшей даты; None — дата некорректна."""
+    if not value:
+        return False
+    try:
+        expires = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    now = datetime.now(expires.tzinfo) if expires.tzinfo else datetime.now()
+    return expires < now
+
 def check_api_key(provided):
     """Метаданные ключа + его hash-id, либо None."""
     if not provided:
         return None
     key_hash = hashlib.sha256(provided.encode('utf-8')).hexdigest()
     meta = load_tokens().get(key_hash)
-    if not meta:
+    if not meta or not isinstance(meta, dict):
         return None
-    return {'id': key_hash, 'name': meta.get('name', 'без имени')}
+    scopes = _token_scopes(meta)
+    expired = _token_is_expired(meta.get('expires_at'))
+    if expired is None:
+        return None
+    return {'id': key_hash, 'name': meta.get('name', 'без имени'),
+            'scopes': scopes, 'folder_id': meta.get('folder_id'),
+            'expired': bool(expired)}
+
+def require_api_scope(scope):
+    """Проверка X-API-Key и права для машинных роутов.
+
+    Возвращает (meta, None) либо (None, (jsonify(...), status)).
+    Просроченный токен — 403, отсутствующий/неверный — 401.
+    """
+    meta = check_api_key(request.headers.get('X-API-Key'))
+    if not meta:
+        return None, (jsonify({'error': 'Требуется корректный заголовок X-API-Key'}), 401)
+    if meta.get('expired'):
+        return None, (jsonify({'error': 'Токен просрочен'}), 403)
+    scopes = meta.get('scopes') or ['download']
+    if '*' not in scopes and scope not in scopes:
+        return None, (jsonify({'error': f'Токену не разрешено: {scope}'}), 403)
+    return meta, None
+
+def _integration_rate_limit_key():
+    """Лимит частоты на конкретный токен; fallback — IP клиента."""
+    key_id = g.get('api_key_id')
+    if key_id:
+        return f'token:{key_id}'
+    return get_remote_address() or 'unknown'
 
 @app.before_request
 def _resolve_api_key():
     """API-ключ принимается только заголовком, чтобы секрет не попадал в URL/логи."""
     key = check_api_key(request.headers.get('X-API-Key'))
-    g.api_key = key['name'] if key else None
-    g.api_key_id = key['id'] if key else None
+    g.api_key_meta = key
+    # Просроченный токен не даёт бюджет скачивания и не считается авторизацией.
+    active = key if key and not key.get('expired') else None
+    g.api_key = active['name'] if active else None
+    g.api_key_id = active['id'] if active else None
 
 @app.before_request
 def _enforce_csrf():
@@ -2400,6 +2458,221 @@ def public_folder(folder_ref):
         breadcrumbs=breadcrumbs_data,
         subfolders=subfolders_data,
         files=files_data)
+
+# ===== ИНТЕГРАЦИЯ: МАШИННЫЕ ТОКЕНЫ (без сессии и CSRF) =====
+INTEGRATION_TTL_MAX_DAYS = 3650
+INTEGRATION_UPLOAD_RATE = '60 per minute'
+
+def _integration_ttl_days():
+    """TTL по умолчанию из ALBION_INTEGRATION_TTL_DAYS, всегда в диапазоне 1..3650."""
+    raw = os.environ.get('ALBION_INTEGRATION_TTL_DAYS', '90')
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 90
+    return max(1, min(INTEGRATION_TTL_MAX_DAYS, value))
+
+@app.route('/api/v1/integration/verify', methods=['GET'])
+def integration_verify():
+    """Проверка токена и его прав. Ничего не меняет."""
+    # Для интеграции нужен именно upload: download-only токен не подходит.
+    meta, error = require_api_scope('upload')
+    if error:
+        return error
+    max_upload_gb = load_quota_settings()['max_upload_gb']
+    if float(max_upload_gb).is_integer():
+        max_upload_gb = int(max_upload_gb)
+    return jsonify({
+        'ok': True,
+        'name': meta.get('name'),
+        'scopes': meta.get('scopes') or ['download'],
+        'folder_id': meta.get('folder_id'),
+        'base_url': BASE_URL,
+        'limits': {'max_upload_gb': max_upload_gb},
+    })
+
+@app.route('/api/v1/integration/upload', methods=['POST'])
+@limiter.limit(INTEGRATION_UPLOAD_RATE, key_func=_integration_rate_limit_key)
+def integration_upload():
+    """Приём одного файла от доверенного сервиса по X-API-Key."""
+    meta, error = require_api_scope('upload')
+    if error:
+        return error
+
+    # Привязка к папке: токен с folder_id пишет только туда.
+    token_folder = meta.get('folder_id')
+    requested_folder = (request.form.get('folder_id') or '').strip() or None
+    if token_folder:
+        if requested_folder and requested_folder != token_folder:
+            return jsonify({'error': 'Токен привязан к другой папке'}), 403
+        folder_id = token_folder
+    else:
+        if not requested_folder:
+            return jsonify({'error': 'Токен не привязан к папке; укажите folder_id'}), 403
+        folder_id = requested_folder
+
+    folders = load_folders()
+    if folder_id not in folders:
+        return jsonify({'error': 'Папка не найдена'}), 404
+
+    upload = request.files.get('file')
+    if upload is None or not upload.filename:
+        return jsonify({'error': 'Нет файла (ожидается поле file)'}), 400
+
+    original_name = upload.filename.replace('+', '_')
+    if (not original_name or original_name in {'.', '..'}
+            or '\0' in original_name or os.path.isabs(original_name)
+            or '/' in original_name or '\\' in original_name
+            or os.path.basename(original_name) != original_name):
+        return jsonify({'error': 'Недопустимое имя файла'}), 400
+    if not is_valid_filename(original_name):
+        return jsonify({'error': 'Недопустимое имя файла'}), 400
+    if not allowed_file(original_name):
+        return jsonify({'error': 'Недопустимое расширение файла'}), 400
+
+    display_name = (request.form.get('display_name') or '').strip() or original_name
+    if '\0' in display_name:
+        return jsonify({'error': 'Недопустимое display_name'}), 400
+    display_name = display_name[:255]
+
+    raw_ttl = request.form.get('ttl_days')
+    if raw_ttl in (None, ''):
+        ttl_days = _integration_ttl_days()
+    else:
+        try:
+            ttl_days = int(raw_ttl)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'ttl_days должен быть целым числом'}), 400
+        ttl_days = max(1, min(INTEGRATION_TTL_MAX_DAYS, ttl_days))
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat()
+
+    with UPLOAD_LOCK:
+        db = load_db()
+        capacity_error = upload_capacity_error(request.content_length, db)
+        if capacity_error:
+            status, message = capacity_error
+            app.logger.warning('Интеграционная загрузка отклонена: %s (токен=%s, content_length=%s)',
+                               message, meta.get('name'), request.content_length)
+            return jsonify({'error': message}), status
+
+        folder_physical_path = get_folder_physical_path(folder_id, folders)
+        os.makedirs(folder_physical_path, exist_ok=True)
+
+        existing_names = set()
+        for record in db.values():
+            if record.get('folder_id') == folder_id:
+                existing_names.add(record['current_filename'])
+        for fname in os.listdir(folder_physical_path):
+            if os.path.isfile(os.path.join(folder_physical_path, fname)):
+                existing_names.add(fname)
+
+        internal_id = str(uuid.uuid4())
+        ext = get_file_ext(original_name)
+        if is_valid_filename(original_name):
+            current_filename = original_name
+            if current_filename in existing_names:
+                name_part = original_name.rsplit('.', 1)[0] if '.' in original_name else original_name
+                counter = 1
+                while True:
+                    current_filename = f"{name_part}_{counter}.{ext}" if ext else f"{name_part}_{counter}"
+                    if current_filename not in existing_names:
+                        break
+                    counter += 1
+        else:
+            current_filename = f"{internal_id}.{ext}" if ext else internal_id
+
+        physical_path = os.path.relpath(
+            os.path.join(folder_physical_path, current_filename), UPLOAD_FOLDER)
+        save_path = safe_upload_path(physical_path)
+        if save_path is None:
+            app.logger.error('Интеграционная загрузка: небезопасный путь %r', physical_path)
+            return jsonify({'error': 'Недопустимый путь сохранения'}), 400
+
+        # Атомарная запись: tmp рядом с целевым файлом + os.replace.
+        tmp_path = os.path.join(os.path.dirname(save_path), f'.{internal_id}.part')
+        try:
+            upload.save(tmp_path)
+            os.replace(tmp_path, save_path)
+        except OSError as e:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            app.logger.error('Интеграционная загрузка: не удалось сохранить %s: %s', physical_path, e)
+            return jsonify({'error': 'Не удалось сохранить файл'}), 500
+
+        size = os.path.getsize(save_path)
+        db[internal_id] = {
+            'access_id': internal_id,
+            'current_filename': current_filename,
+            'physical_path': physical_path,
+            'original_filename': original_name,
+            'display_name': display_name,
+            'folder_id': folder_id,
+            'custom_alias': '',
+            'slug': make_short_slug(original_name, db, exclude_id=internal_id, folders=folders),
+            'link_rotated': False,
+            'download_count': 0,
+            'size': size,
+            'mtime': datetime.fromtimestamp(os.path.getmtime(save_path)).strftime('%d.%m.%Y %H:%M'),
+            'ext': ext.upper() if ext else '—',
+            'is_image': ext in IMAGE_EXTENSIONS,
+        }
+        save_db(db)
+        update_last_upload()
+
+    slug = db[internal_id]['slug']
+    public_url = f"{BASE_URL}/{slug}"
+    app.logger.info('Интеграционная загрузка: токен=%s, файл=%s (%s), папка=%s',
+                    meta.get('name'), physical_path, format_size(size), folder_id)
+    return jsonify({
+        'file_id': internal_id,
+        'url': public_url,
+        'short_url': public_url,
+        'object_key': 'uploads/' + physical_path.replace(os.sep, '/'),
+        'name': current_filename,
+        'folder_id': folder_id,
+        'expires_at': expires_at,
+    })
+
+@app.route('/api/v1/integration/files/<file_id>', methods=['DELETE'])
+@limiter.limit(INTEGRATION_UPLOAD_RATE, key_func=_integration_rate_limit_key)
+@serialized_mutation
+def integration_delete_file(file_id):
+    """Удаление файла, загруженного интеграцией (право delete)."""
+    meta, error = require_api_scope('delete')
+    if error:
+        return error
+
+    db = load_db()
+    record = db.get(file_id)
+    if not record:
+        return jsonify({'error': 'Файл не найден'}), 404
+
+    token_folder = meta.get('folder_id')
+    if token_folder and record.get('folder_id') != token_folder:
+        return jsonify({'error': 'Файл находится в другой папке'}), 403
+
+    physical_path = record.get('physical_path') or record.get('current_filename')
+    filepath = safe_upload_path(physical_path)
+    if filepath is None:
+        app.logger.error('Интеграционное удаление: небезопасный путь %r', physical_path)
+        return jsonify({'error': 'Небезопасный путь файла'}), 400
+
+    if os.path.exists(filepath):
+        try:
+            os.remove(filepath)
+        except OSError as exc:
+            app.logger.error('Интеграционное удаление: не удалось удалить %s: %s',
+                             physical_path, exc)
+            return jsonify({'error': 'Не удалось удалить файл'}), 500
+
+    db.pop(file_id, None)
+    save_db(db)
+    app.logger.info('Интеграционное удаление: токен=%s, файл=%s',
+                    meta.get('name'), physical_path)
+    return jsonify({'deleted': True, 'file_id': file_id})
 
 @app.route('/upload', methods=['POST'])
 @login_required

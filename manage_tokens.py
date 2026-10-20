@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Управление API-ключами для автоматического скачивания.
+"""Управление API-ключами для автоматического скачивания и интеграций.
 
 Использование:
     python3 manage_tokens.py add "Отчёты 1С"     # создать ключ (показывается ОДИН раз)
-    python3 manage_tokens.py list                # список ключей
+    python3 manage_tokens.py add "Photobase" --scopes upload,download --folder <uuid>
+    python3 manage_tokens.py list                # список ключей, прав и папок
     python3 manage_tokens.py revoke "Отчёты 1С"  # отозвать по имени или префиксу хеша
+
+Права: download, upload, delete или * (все). Без --scopes создаётся ключ
+только на скачивание (прежнее поведение). Для права upload обязательна
+привязка --folder. Папка — UUID из folders_db.json.
 
 Ключи хранятся только в виде sha256-хешей в tokens.json.
 """
@@ -16,6 +21,8 @@ import sys
 from datetime import datetime
 
 TOKENS_FILE = os.path.join(os.environ.get('ALBION_DATA_DIR', '.'), 'tokens.json')
+
+ALLOWED_SCOPES = {'download', 'upload', 'delete', '*'}
 
 
 def load_tokens():
@@ -37,6 +44,68 @@ def save_tokens(tokens):
     os.replace(tmp, TOKENS_FILE)
 
 
+def token_scopes(meta):
+    """Старые записи без scopes работают только на скачивание."""
+    scopes = meta.get('scopes')
+    if not isinstance(scopes, list) or not scopes:
+        return ['download']
+    return scopes
+
+
+def parse_add_args(args):
+    """Разбирает: <имя> [--scopes a,b] [--folder uuid]."""
+    if not args:
+        print('Укажите имя: manage_tokens.py add "Имя интеграции"')
+        sys.exit(1)
+    name = args[0].strip()
+    if not name:
+        print('Имя не может быть пустым.')
+        sys.exit(1)
+
+    scopes_arg = None
+    folder = None
+    i = 1
+    while i < len(args):
+        option = args[i]
+        if option in ('--scopes', '--folder'):
+            if i + 1 >= len(args):
+                print(f'Для {option} требуется значение.')
+                sys.exit(1)
+            value = args[i + 1].strip()
+            if option == '--scopes':
+                scopes_arg = value
+            else:
+                folder = value or None
+            i += 2
+        else:
+            print(f'Неизвестный аргумент: {option}')
+            sys.exit(1)
+
+    if scopes_arg is None:
+        scopes = ['download']
+    else:
+        scopes = []
+        for scope in scopes_arg.split(','):
+            scope = scope.strip().lower()
+            if not scope:
+                continue
+            if scope not in ALLOWED_SCOPES:
+                print(f'❌ Недопустимое право "{scope}". Разрешены: '
+                      f'{", ".join(sorted(ALLOWED_SCOPES))}')
+                sys.exit(1)
+            if scope not in scopes:
+                scopes.append(scope)
+        if not scopes:
+            print('❌ Список прав пуст. Укажите download, upload, delete или *.')
+            sys.exit(1)
+
+    if ('upload' in scopes or '*' in scopes) and not folder:
+        print('❌ Для права upload (включая *) обязателен --folder <uuid>.')
+        sys.exit(1)
+
+    return name, scopes, folder
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -46,10 +115,7 @@ def main():
     tokens = load_tokens()
 
     if cmd == 'add':
-        if len(sys.argv) < 3:
-            print('Укажите имя: manage_tokens.py add "Имя интеграции"')
-            sys.exit(1)
-        name = sys.argv[2].strip()
+        name, scopes, folder = parse_add_args(sys.argv[2:])
         if any(meta.get('name') == name for meta in tokens.values()):
             print(f'❌ Ключ с именем "{name}" уже существует. Сначала отзовите его.')
             sys.exit(1)
@@ -58,19 +124,26 @@ def main():
         tokens[key_hash] = {
             'name': name,
             'created': datetime.now().strftime('%d.%m.%Y %H:%M'),
+            'scopes': scopes,
+            'folder_id': folder,
         }
         save_tokens(tokens)
         print('✅ Ключ создан. Показывается ОДИН раз — сохраните его:')
         print(f'   {key}')
-        print('   Использование: curl -H "X-API-Key: <ключ>" -O https://ваш-домен/<слаг-файла>')
+        print(f'   Права: {", ".join(scopes)}; папка: {folder or "—"}')
+        print('   Использование: curl -H "X-API-Key: <ключ>" '
+              'https://ваш-домен/api/v1/integration/verify')
 
     elif cmd == 'list':
         if not tokens:
             print('Ключей нет. Создайте: manage_tokens.py add "Имя"')
             return
-        print(f'{"Имя":<25} {"Создан":<17} Хеш (префикс)')
+        print(f'{"Имя":<25} {"Создан":<17} {"Права":<20} {"Папка":<38} Хеш (префикс)')
         for key_hash, meta in sorted(tokens.items(), key=lambda x: x[1].get('name', '')):
-            print(f'{meta.get("name", "?"):<25} {meta.get("created", "?"):<17} {key_hash[:12]}…')
+            scopes = ','.join(token_scopes(meta))
+            folder = meta.get('folder_id') or '—'
+            print(f'{meta.get("name", "?"):<25} {meta.get("created", "?"):<17} '
+                  f'{scopes:<20} {folder:<38} {key_hash[:12]}…')
 
     elif cmd == 'revoke':
         if len(sys.argv) < 3:
