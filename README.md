@@ -78,6 +78,7 @@ Rate-limit Flask-Limiter по умолчанию хранится в памят�
 - Все административные POST/PUT/PATCH/DELETE требуют сессию и `X-CSRF-Token`.
 - API-ключ для автоматического скачивания передаётся только заголовком `X-API-Key`.
 - Основная документация: [`docs/API.md`](docs/API.md).
+- Техническое описание назначения, функций, архитектуры и требований: [`docs/TECHNICAL_DESCRIPTION.md`](docs/TECHNICAL_DESCRIPTION.md).
 - Архитектура, хранение, ограничения и угрозы: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Production-развёртывание и эксплуатация: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md), краткий чек-лист: [`deploy/README.md`](deploy/README.md).
 
