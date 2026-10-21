@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py .
+COPY server.py token_store.py .
 COPY static/ ./static/
 COPY change_password.py manage_tokens.py ./
 

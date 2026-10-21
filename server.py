@@ -11,6 +11,7 @@ from flask import Flask, request, send_from_directory, render_template_string, s
 from werkzeug.middleware.proxy_fix import ProxyFix
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
+from PIL import Image, ImageOps
 from waitress import serve
 from flask import session, redirect, url_for, request
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -27,6 +28,7 @@ from logging.handlers import RotatingFileHandler
 from flask import Flask, request, send_from_directory, render_template_string, send_file, jsonify, abort, redirect, url_for, g
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+import token_store
 
 # Каталог данных (uploads + json-базы): '.' по умолчанию, в Docker — /app/data
 DATA_DIR = os.environ.get('ALBION_DATA_DIR', '.')
@@ -230,6 +232,9 @@ DB_FILE = os.path.join(DATA_DIR, 'files_db.json')
 FOLDERS_DB_FILE = os.path.join(DATA_DIR, 'folders_db.json')
 TOKENS_FILE = os.path.join(DATA_DIR, 'tokens.json')
 ZIPLINKS_DIR = os.path.join(DATA_DIR, 'ziplinks')
+THUMBNAIL_DIR = os.path.join(DATA_DIR, 'thumbnails')
+THUMBNAIL_SIZES = {'mini': 160, 'medium': 480}
+THUMBNAIL_LOCK = threading.Lock()
 
 ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar',
                       'docx', 'xlsx', 'mp4', 'mkv', 'doc', 'xls', 'pptx', '7z'}
@@ -245,6 +250,7 @@ app.config['MAX_FORM_PARTS'] = 50000
 
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
+os.makedirs(THUMBNAIL_DIR, exist_ok=True)
 
 # ===== ПРОВЕРКА ИМЕНИ =====
 # Имя файла: белый список (расширен реальным миром: запятые, '!', '+', '&', '#', '@', ';', '=', '№')
@@ -409,6 +415,53 @@ def safe_upload_path(relative_path, allow_root=False):
     except (ValueError, OSError):
         return None
     return target
+
+
+def ensure_thumbnail(record, size):
+    """Build and cache a WebP thumbnail keyed by record id and size."""
+    if size not in THUMBNAIL_SIZES or not record.get('is_image'):
+        return None
+    source = safe_upload_path(record.get('physical_path', record.get('current_filename', '')))
+    if not source or not os.path.isfile(source):
+        return None
+    max_edge = THUMBNAIL_SIZES[size]
+    safe_id = re.sub(r'[^A-Za-z0-9_-]', '_', str(record.get('access_id', 'file')))
+    cache_path = os.path.join(THUMBNAIL_DIR, f'{safe_id}-{size}.webp')
+    try:
+        source_mtime = os.path.getmtime(source)
+        if os.path.isfile(cache_path) and os.path.getmtime(cache_path) >= source_mtime:
+            return cache_path
+    except OSError:
+        return None
+
+    with THUMBNAIL_LOCK:
+        try:
+            source_mtime = os.path.getmtime(source)
+            if os.path.isfile(cache_path) and os.path.getmtime(cache_path) >= source_mtime:
+                return cache_path
+            with Image.open(source) as image:
+                image.seek(0)
+                image = ImageOps.exif_transpose(image)
+                image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+                has_alpha = image.mode in {'RGBA', 'LA'} or (
+                    image.mode == 'P' and 'transparency' in image.info
+                )
+                image = image.convert('RGBA' if has_alpha else 'RGB')
+                tmp_path = os.path.join(THUMBNAIL_DIR, f'.{uuid.uuid4()}.tmp')
+                try:
+                    image.save(tmp_path, 'WEBP', quality=82, method=6)
+                    os.replace(tmp_path, cache_path)
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+            return cache_path
+        except Exception as exc:
+            app.logger.warning('Не удалось создать превью %s (%s): %s', record.get('access_id'), size, exc)
+            return None
+
 
 def get_json_object():
     """Read a JSON object; arrays, scalars, null and malformed bodies are rejected."""
@@ -618,6 +671,10 @@ def get_files_in_folder(folder_id):
                     # Ссылки с нормальной кириллицей (без URL-кодирования)
                     'download_url': f"{BASE_URL}/{url_path(physical_path)}",
                     'view_url': f"{BASE_URL}/v/{url_path(physical_path)}",
+                    # Thumbnail requests must not inflate view_count.
+                    'thumb_url': f"/thumb/mini/{internal_id}",
+                    'thumb_medium_url': f"/thumb/medium/{internal_id}",
+                    'slug': record.get('slug', ''),
                     # Короткая латинизированная ссылка (переживает переименование)
                     'short_url': f"{BASE_URL}/{record['slug']}" if record.get('slug') else f"{BASE_URL}/{url_path(physical_path)}",
                 })
@@ -722,6 +779,7 @@ HTML_TEMPLATE = """
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="csrf-token" content="{{ csrf_token }}">
     <title>АЛЬБИОН: Файлы</title>
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
@@ -785,7 +843,12 @@ HTML_TEMPLATE = """
         .batch-actions.active { display: flex; }
         .batch-actions .count { font-weight: 600; color: #1e3a8a; }
 
-        .view-switcher { display: flex; gap: 5px; margin-bottom: 12px; padding: 4px; background: #f1f5f9; border-radius: 6px; width: fit-content; flex-shrink: 0; }
+        .file-filters { display: flex; align-items: center; gap: 7px; margin-bottom: 12px; flex-wrap: wrap; }
+        .file-filters input[type="search"], .file-filters select { padding: 6px 9px; border: 1px solid #cbd5e1; border-radius: 5px; font-size: 13px; background: white; }
+        .file-filters input[type="search"] { min-width: 230px; flex: 1 1 230px; }
+        .file-filters .filter-result { color: #64748b; font-size: 12px; margin-left: auto; }
+
+        .view-switcher { display: flex; gap: 5px; margin-bottom: 12px; padding: 4px; background: #f1f5f9; border-radius: 6px; width: fit-content; flex-shrink: 0; flex-wrap: wrap; }
         .view-btn { background: transparent; color: #475569; padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; margin: 0; transition: all 0.15s; }
         .view-btn:hover { background: #e2e8f0; }
         .view-btn.active { background: white; color: #1e3a8a; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
@@ -823,7 +886,7 @@ HTML_TEMPLATE = """
         .tile.dragging { opacity: 0.5; }
         .tile-checkbox { position: absolute; top: 5px; left: 5px; z-index: 3; }
         .tile-actions { position: absolute; top: 5px; right: 5px; display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s; z-index: 2; }
-        .tile:hover .tile-actions { opacity: 1; }
+        .tile:hover .tile-actions, .tile:focus-within .tile-actions { opacity: 1; }
         .tile-actions button { background: rgba(255,255,255,0.95); border: none; border-radius: 4px; width: 28px; height: 28px; cursor: pointer; font-size: 14px; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
         .tile-actions button:hover { background: white; }
         .tile-actions button.del-btn:hover { color: #dc3545; }
@@ -860,7 +923,7 @@ HTML_TEMPLATE = """
         .list-size { color: #64748b; white-space: nowrap; font-size: 12px; }
         .list-date { color: #94a3b8; white-space: nowrap; font-size: 12px; }
         .list-actions { display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s; }
-        .list-item:hover .list-actions { opacity: 1; }
+        .list-item:hover .list-actions, .list-item:focus-within .list-actions { opacity: 1; }
 
         .status-bar { background: #1e293b; color: #cbd5e1; padding: 0 25px; height: 38px; display: flex; align-items: center; gap: 20px; font-size: 12px; flex-shrink: 0; border-top: 1px solid #0f172a; overflow-x: auto; }
         .status-item { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
@@ -881,6 +944,14 @@ HTML_TEMPLATE = """
         .files-content::-webkit-scrollbar-track { background: #f1f5f9; }
         .files-content::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
         .files-content::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        .lazy-loader { display: flex; align-items: center; justify-content: center; gap: 10px; padding-top: 12px; color: #64748b; font-size: 12px; }
+        .lazy-loader[hidden] { display: none; }
+        .lazy-status { color: #64748b; font-size: 12px; }
+        .pagination { display: flex; align-items: center; justify-content: center; gap: 5px; padding-top: 12px; flex-wrap: wrap; }
+        .page-link, .lazy-more { color: #2563eb; border: 1px solid #dbeafe; border-radius: 4px; padding: 4px 9px; text-decoration: none; font-size: 12px; background: #fff; cursor: pointer; }
+        .page-link:hover, .lazy-more:hover { background: #eff6ff; }
+        .page-link.active { background: #2563eb; border-color: #2563eb; color: white; font-weight: 600; }
+        .page-ellipsis { color: #94a3b8; padding: 0 2px; }
 
         .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: none; align-items: center; justify-content: center; z-index: 2000; }
         .modal-overlay.active { display: flex; }
@@ -900,12 +971,22 @@ HTML_TEMPLATE = """
         .confirm-filename { font-weight: 700; color: #dc3545; }
 
         input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; }
+        button:focus-visible, .btn:focus-visible, a:focus-visible,
+        input:focus-visible, select:focus-visible {
+            outline: 2px solid #f59e0b;
+            outline-offset: 2px;
+        }
 
         @media (max-width: 700px) {
             .top-row { flex-direction: column; }
-            .header { padding: 12px 15px; }
+            .header { padding: 12px 15px; flex-wrap: wrap; }
             .header-title { font-size: 18px; }
             .main { padding: 10px; }
+            .file-filters input[type="search"] { min-width: 100%; flex-basis: 100%; }
+            .file-filters .filter-result { margin-left: 0; }
+            .files-content { overflow-x: auto; }
+            .files-table { min-width: 760px; }
+            .batch-actions { flex-wrap: wrap; }
             .status-bar { font-size: 11px; gap: 10px; padding: 6px 15px; height: auto; min-height: 38px; flex-wrap: wrap; }
         }
     </style>
@@ -917,7 +998,9 @@ HTML_TEMPLATE = """
             <h1 class="header-title">АЛЬБИОН: Файлы</h1>
             <div class="header-subtitle">Файловый сервер для обмена документами</div>
         </div>
-        <a href="/settings" class="btn btn-sm" style="margin:0 0 0 auto; background:rgba(255,255,255,.18);" title="Настройки квот">⚙️ Настройки</a>
+        <a href="/settings/tokens" class="btn btn-sm" style="margin:0 0 0 auto; background:rgba(255,255,255,.18);" title="API-токены">🔑 Токены</a>
+        <a href="/settings" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Настройки квот">⚙️ Настройки</a>
+        <a href="/logout" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Завершить сессию">Выйти</a>
     </header>
 
     <div class="main">
@@ -951,7 +1034,7 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="card card-files">
-            <h2>📂 {{ 'Корень' if not current_folder else current_folder.name }} <span style="color:#64748b; font-weight:400; font-size:13px;">({{ files|length }} файлов, {{ subfolders|length }} папок)</span>
+            <h2>📂 {{ 'Корень' if not current_folder else current_folder.name }} <span style="color:#64748b; font-weight:400; font-size:13px;">({{ total_files }} файлов, {{ subfolders|length }} папок)</span>
                 {% if current_folder %}
                 <button class="btn btn-sm" style="margin:0 0 0 8px; vertical-align:middle;" onclick='copyToClipboard("{{ base_url }}/d/{{ current_folder_slug or current_folder_id }}")' title="Скопировать публичную ссылку на эту папку">🔗 Ссылка на папку</button>
                 {% endif %}
@@ -969,6 +1052,30 @@ HTML_TEMPLATE = """
                 {% endfor %}
             </div>
 
+            <form class="file-filters" method="get" action="{{ request.path }}">
+                <input type="search" name="q" value="{{ q }}" placeholder="Поиск по имени, ссылке или алиасу" aria-label="Поиск файлов">
+                <select name="ext" aria-label="Тип файла">
+                    <option value="">Все типы</option>
+                    {% for option in ext_options %}
+                    <option value="{{ option }}" {% if ext == option %}selected{% endif %}>{{ option|upper }}</option>
+                    {% endfor %}
+                </select>
+                <select name="sort" aria-label="Сортировка">
+                    {% for value, label in sort_options %}
+                    <option value="{{ value }}" {% if sort == value %}selected{% endif %}>{{ label }}</option>
+                    {% endfor %}
+                </select>
+                <select name="per_page" aria-label="Файлов на странице">
+                    {% for option in per_page_options %}
+                    <option value="{{ option }}" {% if per_page == option %}selected{% endif %}>{{ option }} на странице</option>
+                    {% endfor %}
+                </select>
+                <input type="hidden" name="view" value="{{ view }}">
+                <button class="btn btn-sm" type="submit">Применить</button>
+                <a class="btn btn-sm btn-secondary" href="{{ reset_url }}">Сбросить</a>
+                <span class="filter-result">Найдено: <strong>{{ total_files }}</strong></span>
+            </form>
+
             <div class="batch-actions" id="batchActions">
                 <span class="count">Выбрано: <span id="selectedCount">0</span></span>
                 <button class="btn btn-sm btn-success" onclick="executeBatchZip()">⬇ Скачать архив</button>
@@ -978,18 +1085,20 @@ HTML_TEMPLATE = """
             </div>
 
             <div class="view-switcher">
-                <button class="view-btn" data-view="table">🗂 Таблица</button>
-                <button class="view-btn" data-view="grid">🖼 Плитка</button>
-                <button class="view-btn" data-view="list">📋 Список</button>
+                <button class="view-btn {% if view == 'table' %}active{% endif %}" data-view="table" aria-pressed="{{ 'true' if view == 'table' else 'false' }}">🗂 Таблица</button>
+                <button class="view-btn {% if view == 'grid' %}active{% endif %}" data-view="grid" aria-pressed="{{ 'true' if view == 'grid' else 'false' }}">🖼 Плитка</button>
+                <button class="view-btn {% if view == 'list' %}active{% endif %}" data-view="list" aria-pressed="{{ 'true' if view == 'list' else 'false' }}">📋 Список</button>
+                <button type="button" class="view-btn" id="selectAllBtn" onclick="selectAllItems()" title="Выбрать все на текущей странице" aria-label="Выбрать все на странице">☑️ Выбрать все</button>
             </div>
 
             <div class="files-content">
                 {% if subfolders or files %}
+                    {% if view == 'table' %}
                     <div id="view-table" class="view-container">
                         <table class="files-table">
                             <thead>
                                 <tr>
-                                    <th class="checkbox-cell"><input type="checkbox" id="selectAll" onchange="toggleSelectAll()"></th>
+                                    <th class="checkbox-cell"><input type="checkbox" id="selectAll" aria-label="Выбрать все на странице" onchange="toggleSelectAll()"></th>
                                     <th class="icon-cell"></th>
                                     <th>Имя</th>
                                     <th class="size-col">Размер</th>
@@ -1002,7 +1111,7 @@ HTML_TEMPLATE = """
                             <tbody>
                                 {% for folder in subfolders %}
                                 <tr class="folder-row" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
-                                    <td class="checkbox-cell"><input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" onchange="updateSelection()"></td>
+                                    <td class="checkbox-cell"><input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)"></td>
                                     <td class="icon-cell"><span class="folder-icon">📁</span></td>
                                     <td><a href="/f/{{ folder.id }}" style="font-weight: 600;">{{ folder.name }}</a></td>
                                     <td class="size-col">{% if folder.file_count %}{{ folder.size }}{% else %}—{% endif %}</td>
@@ -1017,10 +1126,10 @@ HTML_TEMPLATE = """
                                 {% endfor %}
                                 {% for f in files %}
                                 <tr class="file-row" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
-                                    <td class="checkbox-cell"><input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" onchange="updateSelection()"></td>
+                                    <td class="checkbox-cell"><input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)"></td>
                                     <td class="icon-cell">
                                         {% if f.is_image %}
-                                            <img src="{{ f.view_url }}" class="thumb-sm" alt="">
+                                            <img src="{{ f.thumb_url }}" class="thumb-sm" loading="lazy" decoding="async" alt="">
                                         {% else %}
                                             <span class="emoji-icon">{{ f.icon }}</span>
                                         {% endif %}
@@ -1054,12 +1163,12 @@ HTML_TEMPLATE = """
                             </tbody>
                         </table>
                     </div>
-
-                    <div id="view-grid" class="view-container" style="display:none">
+                    {% elif view == 'grid' %}
+                    <div id="view-grid" class="view-container">
                         <div class="files-grid">
                             {% for folder in subfolders %}
                             <div class="tile" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
-                                <div class="tile-checkbox"><input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" onchange="updateSelection()"></div>
+                                <div class="tile-checkbox"><input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)"></div>
                                 <a href="/f/{{ folder.id }}" class="tile-folder">
                                     <div class="tile-folder-icon">📁</div>
                                     <div class="tile-folder-name">{{ folder.name }}</div>
@@ -1072,7 +1181,7 @@ HTML_TEMPLATE = """
                             {% endfor %}
                             {% for f in files %}
                             <div class="tile" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
-                                <div class="tile-checkbox"><input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" onchange="updateSelection()"></div>
+                                <div class="tile-checkbox"><input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)"></div>
                                 <div class="tile-actions">
                                     {% if current_folder %}
                                     <button onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше">⬆️</button>
@@ -1083,7 +1192,7 @@ HTML_TEMPLATE = """
                                 </div>
                                 {% if f.is_image %}
                                     <a href="{{ f.view_url }}" target="_blank" class="tile-preview-wrap">
-                                        <img src="{{ f.view_url }}" class="tile-preview" alt="">
+                                        <img src="{{ f.thumb_medium_url }}" class="tile-preview" loading="lazy" decoding="async" alt="">
                                     </a>
                                 {% else %}
                                     <a href="{{ f.download_url }}" class="tile-icon-wrap">
@@ -1099,12 +1208,12 @@ HTML_TEMPLATE = """
                             {% endfor %}
                         </div>
                     </div>
-
-                    <div id="view-list" class="view-container" style="display:none">
+                    {% else %}
+                    <div id="view-list" class="view-container">
                         <div class="files-list">
                             {% for folder in subfolders %}
                             <div class="list-item folder-item" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
-                                <input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" onchange="updateSelection()">
+                                <input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)">
                                 <span class="emoji-icon-sm">📁</span>
                                 <div class="list-name-wrap">
                                     <a href="/f/{{ folder.id }}" class="list-name" style="font-weight: 600;">{{ folder.name }}</a>
@@ -1118,9 +1227,9 @@ HTML_TEMPLATE = """
                             {% endfor %}
                             {% for f in files %}
                             <div class="list-item" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
-                                <input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" onchange="updateSelection()">
+                                <input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)">
                                 {% if f.is_image %}
-                                    <img src="{{ f.view_url }}" class="thumb-xs" alt="">
+                                    <img src="{{ f.thumb_url }}" class="thumb-xs" loading="lazy" decoding="async" alt="">
                                 {% else %}
                                     <span class="emoji-icon-sm">{{ f.icon }}</span>
                                 {% endif %}
@@ -1143,12 +1252,18 @@ HTML_TEMPLATE = """
                             {% endfor %}
                         </div>
                     </div>
+                    {% endif %}
                 {% else %}
                     <div class="empty-state">
-                        <div class="icon">📭</div>
-                        <div>Папка пуста</div>
+                        <div class="icon">{% if has_filters %}🔎{% else %}📭{% endif %}</div>
+                        <div>{% if has_filters %}По фильтрам ничего не найдено. <a href="{{ reset_url }}">Сбросить фильтры</a>{% else %}Папка пуста{% endif %}</div>
                     </div>
                 {% endif %}
+                <div id="lazyLoader" class="lazy-loader" data-next-url="{{ next_url or '' }}"
+                     data-view="{{ view }}" {% if not next_url %}hidden{% endif %}>
+                    <button type="button" class="btn btn-sm btn-secondary" id="loadMoreBtn" onclick="loadNextPage()">Показать ещё</button>
+                    <span id="lazyStatus" class="lazy-status"></span>
+                </div>
             </div>
         </div>
     </div>
@@ -1156,7 +1271,7 @@ HTML_TEMPLATE = """
     <footer class="status-bar">
         <div class="status-item">
             <span class="label">📁 Файлов:</span>
-            <span class="value">{{ files|length }}</span>
+            <span class="value">{{ total_files }}</span>
         </div>
         <span class="separator">│</span>
         <div class="status-item">
@@ -1178,9 +1293,9 @@ HTML_TEMPLATE = """
         </div>
     </footer>
 
-    <div class="modal-overlay" id="editModal">
+    <div class="modal-overlay" id="editModal" role="dialog" aria-modal="true" aria-labelledby="editModalTitle" aria-hidden="true">
         <div class="modal">
-            <h3>✏️ Редактирование файла</h3>
+            <h3 id="editModalTitle">✏️ Редактирование файла</h3>
             <input type="hidden" id="editInternalId">
             <div class="form-group">
                 <label>Отображаемое имя</label>
@@ -1208,9 +1323,9 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <div class="modal-overlay" id="createFolderModal">
+    <div class="modal-overlay" id="createFolderModal" role="dialog" aria-modal="true" aria-labelledby="createFolderModalTitle" aria-hidden="true">
         <div class="modal">
-            <h3>➕ Новая папка</h3>
+            <h3 id="createFolderModalTitle">➕ Новая папка</h3>
             <div class="form-group">
                 <label>Имя папки</label>
                 <input type="text" id="newFolderName" placeholder="Например: Отчёты">
@@ -1222,9 +1337,9 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <div class="modal-overlay" id="batchMoveModal">
+    <div class="modal-overlay" id="batchMoveModal" role="dialog" aria-modal="true" aria-labelledby="batchMoveModalTitle" aria-hidden="true">
         <div class="modal">
-            <h3>📁 Переместить файлы</h3>
+            <h3 id="batchMoveModalTitle">📁 Переместить файлы</h3>
             <div class="form-group">
                 <label>Выберите папку</label>
                 <select id="batchMoveFolderId"></select>
@@ -1236,9 +1351,9 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <div class="modal-overlay" id="deleteModal">
+    <div class="modal-overlay" id="deleteModal" role="dialog" aria-modal="true" aria-labelledby="deleteModalTitle" aria-hidden="true">
         <div class="modal">
-            <h3>🗑️ Удаление файла</h3>
+            <h3 id="deleteModalTitle">🗑️ Удаление файла</h3>
             <input type="hidden" id="deleteFileId">
             <p class="confirm-text">Удалить файл <span class="confirm-filename" id="deleteFileName"></span>?</p>
             <p class="confirm-text" style="color: #dc3545; font-size: 13px;">⚠️ Файл будет удалён безвозвратно</p>
@@ -1249,9 +1364,9 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <div class="modal-overlay" id="deleteFolderModal">
+    <div class="modal-overlay" id="deleteFolderModal" role="dialog" aria-modal="true" aria-labelledby="deleteFolderModalTitle" aria-hidden="true">
         <div class="modal">
-            <h3>🗑️ Удаление папки</h3>
+            <h3 id="deleteFolderModalTitle">🗑️ Удаление папки</h3>
             <input type="hidden" id="deleteFolderId">
             <p class="confirm-text">Удалить папку <span class="confirm-filename" id="deleteFolderName"></span>?</p>
             <p class="confirm-text" style="color: #dc3545; font-size: 13px;">⚠️ Будут удалены все файлы и подпапки внутри!</p>
@@ -1262,11 +1377,12 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <div class="toast" id="toast"></div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
     <script>
         const currentFolderId = '{{ current_folder_id or "" }}';
         const parentFolderId = '{{ (current_folder.parent_id or "") if current_folder else "" }}';
+        const currentView = '{{ view }}';
         const csrfToken = '{{ csrf_token }}';
         const nativeFetch = window.fetch.bind(window);
         window.fetch = (input, init = {}) => {
@@ -1281,19 +1397,82 @@ HTML_TEMPLATE = """
         let draggedFileId = null;
         let selectedFiles = new Set();
         let selectedFolders = new Set();
+        const busyActions = new Set();
+        function lockAction(key) {
+            if (busyActions.has(key)) return false;
+            busyActions.add(key);
+            return true;
+        }
+        function unlockAction(key) { busyActions.delete(key); }
+
+        let activeModal = null;
+        let modalReturnFocus = null;
+        function modalFocusable(modal) {
+            return Array.from(modal.querySelectorAll(
+                'button:not([disabled]), [href], input:not([type="hidden"]):not([disabled]), ' +
+                'select:not([disabled]), textarea:not([disabled])'
+            )).filter(el => el.offsetParent !== null);
+        }
+        function openModal(id) {
+            const modal = document.getElementById(id);
+            if (!modal) return;
+            if (activeModal && activeModal !== modal) {
+                activeModal.classList.remove('active');
+                activeModal.setAttribute('aria-hidden', 'true');
+            }
+            modalReturnFocus = document.activeElement;
+            activeModal = modal;
+            modal.classList.add('active');
+            modal.setAttribute('aria-hidden', 'false');
+            const target = modalFocusable(modal)[0];
+            setTimeout(() => target?.focus(), 0);
+        }
+        function closeModal(id) {
+            const modal = document.getElementById(id);
+            if (!modal) return;
+            modal.classList.remove('active');
+            modal.setAttribute('aria-hidden', 'true');
+            if (activeModal === modal) {
+                activeModal = null;
+                if (modalReturnFocus && document.contains(modalReturnFocus)) {
+                    modalReturnFocus.focus();
+                }
+                modalReturnFocus = null;
+            }
+        }
+        document.addEventListener('keydown', (event) => {
+            if (!activeModal) return;
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                closeModal(activeModal.id);
+                return;
+            }
+            if (event.key !== 'Tab') return;
+            const items = modalFocusable(activeModal);
+            if (!items.length) return;
+            const first = items[0];
+            const last = items[items.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            } else if (!activeModal.contains(document.activeElement)) {
+                event.preventDefault();
+                first.focus();
+            }
+        });
         
-        const viewBtns = document.querySelectorAll('.view-btn');
-        const viewContainers = { table: document.getElementById('view-table'), grid: document.getElementById('view-grid'), list: document.getElementById('view-list') };
+        const viewBtns = document.querySelectorAll('.view-btn[data-view]');
         function setView(view) {
-            if (!viewContainers[view]) view = 'table';
-            Object.entries(viewContainers).forEach(([key, el]) => { if (el) el.style.display = (key === view) ? '' : 'none'; });
-            viewBtns.forEach(b => b.classList.toggle('active', b.dataset.view === view));
-            try { localStorage.setItem('albionFilesView', view); } catch(e) {}
+            if (!['table', 'grid', 'list'].includes(view)) return;
+            const url = new URL(window.location.href);
+            if (url.searchParams.get('view') === view) return;
+            url.searchParams.set('view', view);
+            window.location.assign(url.toString());
         }
         viewBtns.forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
-        let savedView = 'table';
-        try { savedView = localStorage.getItem('albionFilesView') || 'table'; } catch(e) {}
-        setView(savedView);
 
         function handleDragStart(event, fileId) {
             draggedFileId = fileId;
@@ -1323,62 +1502,117 @@ HTML_TEMPLATE = """
             event.currentTarget.classList.remove('drag-over');
             const fileId = event.dataTransfer.getData('text/plain');
             if (!fileId) return;
+            const actionKey = `drop:${fileId}`;
+            if (!lockAction(actionKey)) return;
             try {
                 const response = await fetch('/api/move_file', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ file_id: fileId, target_folder_id: targetFolderId })
                 });
-                const result = await response.json();
-                if (response.ok) { showToast('✅ Файл перемещён'); setTimeout(() => location.reload(), 800); }
+                const result = await parseResponseJson(response);
+                if (response.ok) { showToast('✅ Файл перемещён'); reloadPreservingScroll(800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка сети', true); }
+            finally { unlockAction(actionKey); }
         }
 
-        function updateSelection() {
-            selectedFiles.clear();
-            document.querySelectorAll('.file-checkbox:checked').forEach(cb => selectedFiles.add(cb.dataset.fileId));
-            selectedFolders.clear();
-            document.querySelectorAll('.folder-checkbox:checked').forEach(cb => selectedFolders.add(cb.dataset.folderId));
+        function syncSelectionCheckboxes() {
+            document.querySelectorAll('.file-checkbox').forEach(cb => {
+                cb.checked = selectedFiles.has(cb.dataset.fileId);
+            });
+            document.querySelectorAll('.folder-checkbox').forEach(cb => {
+                cb.checked = selectedFolders.has(cb.dataset.folderId);
+            });
+        }
+
+        function updateSelection(changed) {
+            if (changed) {
+                const isFile = changed.classList.contains('file-checkbox');
+                const id = isFile ? changed.dataset.fileId : changed.dataset.folderId;
+                const selection = isFile ? selectedFiles : selectedFolders;
+                if (changed.checked) selection.add(id); else selection.delete(id);
+            }
+
+            // Sets are the source of truth; all three views must agree.
+            syncSelectionCheckboxes();
             document.querySelectorAll('.file-row, .folder-row, .tile, .list-item').forEach(el => {
                 const fileId = el.dataset.fileId;
                 const folderId = el.dataset.folderId;
                 const on = (fileId && selectedFiles.has(fileId)) || (folderId && selectedFolders.has(folderId));
                 el.classList.toggle('selected', !!on);
             });
+
+            const total = selectedFiles.size + selectedFolders.size;
             const batchActions = document.getElementById('batchActions');
             const selectedCount = document.getElementById('selectedCount');
-            const total = selectedFiles.size + selectedFolders.size;
-            if (total > 0) { batchActions.classList.add('active'); selectedCount.textContent = total; }
-            else { batchActions.classList.remove('active'); }
+            if (total > 0) {
+                batchActions.classList.add('active');
+                selectedCount.textContent = total;
+            } else {
+                batchActions.classList.remove('active');
+                selectedCount.textContent = '0';
+            }
             document.querySelectorAll('.file-selection-action').forEach(btn => {
                 btn.hidden = selectedFiles.size === 0;
             });
+
+            const allCheckboxes = Array.from(document.querySelectorAll('.file-checkbox, .folder-checkbox'));
+            const uniqueTotal = new Set(allCheckboxes.map(cb => (
+                cb.classList.contains('file-checkbox') ? 'f:' : 'd:'
+            ) + (cb.dataset.fileId || cb.dataset.folderId))).size;
+            const selectAll = document.getElementById('selectAll');
+            if (selectAll) {
+                selectAll.checked = total > 0 && total === uniqueTotal;
+                selectAll.indeterminate = total > 0 && total < uniqueTotal;
+            }
+            const selectAllBtn = document.getElementById('selectAllBtn');
+            if (selectAllBtn) selectAllBtn.textContent = total > 0 && total === uniqueTotal ? '☑️ Всё выбрано' : '☑️ Выбрать все';
+        }
+
+        function setAllSelection(selected) {
+            document.querySelectorAll('.file-checkbox').forEach(cb => { cb.checked = selected; });
+            document.querySelectorAll('.folder-checkbox').forEach(cb => { cb.checked = selected; });
+            selectedFiles.clear();
+            selectedFolders.clear();
+            if (selected) {
+                document.querySelectorAll('.file-checkbox').forEach(cb => selectedFiles.add(cb.dataset.fileId));
+                document.querySelectorAll('.folder-checkbox').forEach(cb => selectedFolders.add(cb.dataset.folderId));
+            }
+            updateSelection();
         }
 
         function toggleSelectAll() {
             const selectAll = document.getElementById('selectAll');
-            document.querySelectorAll('.file-checkbox, .folder-checkbox').forEach(cb => { cb.checked = selectAll.checked; });
-            updateSelection();
+            setAllSelection(!!selectAll.checked);
+        }
+
+        function selectAllItems() {
+            const allCheckboxes = document.querySelectorAll('.file-checkbox, .folder-checkbox');
+            const selectedTotal = selectedFiles.size + selectedFolders.size;
+            const uniqueTotal = new Set(Array.from(allCheckboxes).map(cb => (
+                cb.classList.contains('file-checkbox') ? 'f:' : 'd:'
+            ) + (cb.dataset.fileId || cb.dataset.folderId))).size;
+            setAllSelection(selectedTotal !== uniqueTotal);
         }
 
         function clearSelection() {
-            document.querySelectorAll('.file-checkbox, .folder-checkbox').forEach(cb => { cb.checked = false; });
-            document.getElementById('selectAll').checked = false;
-            updateSelection();
+            setAllSelection(false);
         }
 
         async function batchDelete() {
             if (selectedFiles.size === 0) return;
-            if (!confirm(`Удалить ${selectedFiles.size} файл(ов)?`)) return;
+            if (!lockAction('batch-delete')) return;
+            if (!confirm(`Удалить ${selectedFiles.size} файл(ов)?`)) { unlockAction('batch-delete'); return; }
             try {
                 const response = await fetch('/api/delete_files_batch', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ file_ids: Array.from(selectedFiles) })
                 });
-                const result = await response.json();
-                if (response.ok) { showToast(`✅ Удалено: ${result.count}`); setTimeout(() => location.reload(), 800); }
+                const result = await parseResponseJson(response);
+                if (response.ok) { showToast(`✅ Удалено: ${result.count}`); reloadPreservingScroll(800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
+            finally { unlockAction('batch-delete'); }
         }
 
         async function executeBatchZip() {
@@ -1390,7 +1624,7 @@ HTML_TEMPLATE = """
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ file_ids: Array.from(selectedFiles), folder_ids: Array.from(selectedFolders) })
                 });
-                const result = await response.json();
+                const result = await parseResponseJson(response);
                 if (response.ok) {
                     copyToClipboard(result.url);
                     showToast(`✅ Архив: ${result.count} файл(ов), ${result.size}. Ссылка скопирована`);
@@ -1406,54 +1640,75 @@ HTML_TEMPLATE = """
         async function openBatchMoveModal() {
             if (selectedFiles.size === 0) return;
             const loaded = await loadFolderSelect('batchMoveFolderId');
-            if (loaded) document.getElementById('batchMoveModal').classList.add('active');
+            if (loaded) openModal('batchMoveModal');
         }
 
-        function closeBatchMoveModal() { document.getElementById('batchMoveModal').classList.remove('active'); }
+        function closeBatchMoveModal() { closeModal('batchMoveModal'); }
 
         async function executeBatchMove() {
+            if (!lockAction('batch-move')) return;
+            const btn = document.querySelector('#batchMoveModal .modal-actions .btn:last-child');
             const targetFolderId = document.getElementById('batchMoveFolderId').value || null;
+            btn.disabled = true; btn.textContent = 'Перемещение...';
             try {
                 const response = await fetch('/api/move_files_batch', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ file_ids: Array.from(selectedFiles), target_folder_id: targetFolderId })
                 });
-                const result = await response.json();
-                if (response.ok) { showToast(`✅ Перемещено: ${result.count}`); closeBatchMoveModal(); setTimeout(() => location.reload(), 800); }
+                const result = await parseResponseJson(response);
+                if (response.ok) { showToast(`✅ Перемещено: ${result.count}`); closeBatchMoveModal(); reloadPreservingScroll(800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
+            finally { btn.disabled = false; btn.textContent = 'Переместить'; unlockAction('batch-move'); }
         }
 
         async function moveFileUp(fileId) {
+            const actionKey = `move:${fileId}`;
+            if (!lockAction(actionKey)) return;
             try {
                 const response = await fetch('/api/move_file', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ file_id: fileId, target_folder_id: parentFolderId || null })
                 });
-                const result = await response.json();
-                if (response.ok) { showToast('✅ Перемещён выше'); setTimeout(() => location.reload(), 800); }
+                const result = await parseResponseJson(response);
+                if (response.ok) { showToast('✅ Перемещён выше'); reloadPreservingScroll(800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
+            finally { unlockAction(actionKey); }
         }
+
+        let editOriginalPhysicalFilename = '';
+        let folderSelectRequestId = 0;
 
         async function openEditModal(internalId, displayName, physicalFilename, customAlias, folderId) {
             document.getElementById('editInternalId').value = internalId;
             document.getElementById('editDisplayName').value = displayName;
             document.getElementById('editPhysicalFilename').value = physicalFilename;
             document.getElementById('editCustomAlias').value = customAlias;
-            document.getElementById('filenameWarning').style.display = 'none';
+            editOriginalPhysicalFilename = physicalFilename;
+            updateFilenameWarning();
             updateAliasPreview();
             const loaded = await loadFolderSelect('editFolderId', folderId);
             if (!loaded) return;
-            document.getElementById('editModal').classList.add('active');
+            openModal('editModal');
         }
-        function closeEditModal() { document.getElementById('editModal').classList.remove('active'); }
-        
+        function closeEditModal() { closeModal('editModal'); }
+
+        function updateFilenameWarning() {
+            const warning = document.getElementById('filenameWarning');
+            const current = document.getElementById('editPhysicalFilename').value.trim();
+            warning.style.display = current !== editOriginalPhysicalFilename ? 'block' : 'none';
+        }
+        document.getElementById('editPhysicalFilename').addEventListener('input', updateFilenameWarning);
+
         async function loadFolderSelect(selectId, selectedValue = '') {
+            const requestId = ++folderSelectRequestId;
             try {
                 const response = await fetch('/api/get_all_folders');
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
                 const folders = await response.json();
+                // A slower response from an older modal must not overwrite a newer one.
+                if (requestId !== folderSelectRequestId) return false;
                 const select = document.getElementById(selectId);
                 select.innerHTML = '<option value="">🏠 Корень</option>';
                 folders.forEach(f => {
@@ -1465,8 +1720,10 @@ HTML_TEMPLATE = """
                 select.value = selectedValue || '';
                 return true;
             } catch (err) {
-                showToast('❌ Не удалось загрузить список папок', true);
-                console.error('Ошибка списка папок:', err);
+                if (requestId === folderSelectRequestId) {
+                    showToast('❌ Не удалось загрузить список папок', true);
+                    console.error('Ошибка списка папок:', err);
+                }
                 return false;
             }
         }
@@ -1494,15 +1751,20 @@ HTML_TEMPLATE = """
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(data)
                 });
-                const result = await response.json();
-                if (response.ok) { showToast('✅ Сохранено'); closeEditModal(); setTimeout(() => location.reload(), 800); }
+                const result = await parseResponseJson(response);
+                if (response.ok) { showToast('✅ Сохранено'); closeEditModal(); reloadPreservingScroll(800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
             finally { btn.disabled = false; btn.textContent = 'Сохранить'; }
         }
 
-        function openCreateFolderModal() { document.getElementById('createFolderModal').classList.add('active'); }
-        function closeCreateFolderModal() { document.getElementById('createFolderModal').classList.remove('active'); }
+        function openCreateFolderModal() {
+            const input = document.getElementById('newFolderName');
+            input.value = '';
+            openModal('createFolderModal');
+            setTimeout(() => input.focus(), 0);
+        }
+        function closeCreateFolderModal() { closeModal('createFolderModal'); }
         async function createFolder() {
             const name = document.getElementById('newFolderName').value.trim();
             if (!name) { showToast('❌ Введите имя папки', true); return; }
@@ -1513,8 +1775,8 @@ HTML_TEMPLATE = """
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ name, parent_id: currentFolderId || null })
                 });
-                const result = await response.json();
-                if (response.ok) { showToast('✅ Папка создана'); closeCreateFolderModal(); setTimeout(() => location.reload(), 800); }
+                const result = await parseResponseJson(response);
+                if (response.ok) { showToast('✅ Папка создана'); closeCreateFolderModal(); reloadPreservingScroll(800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
             finally { btn.disabled = false; }
@@ -1523,9 +1785,9 @@ HTML_TEMPLATE = """
         function confirmDelete(internalId, fileName) {
             document.getElementById('deleteFileId').value = internalId;
             document.getElementById('deleteFileName').textContent = fileName;
-            document.getElementById('deleteModal').classList.add('active');
+            openModal('deleteModal');
         }
-        function closeDeleteModal() { document.getElementById('deleteModal').classList.remove('active'); }
+        function closeDeleteModal() { closeModal('deleteModal'); }
         async function executeDelete() {
             const internalId = document.getElementById('deleteFileId').value;
             const btn = document.querySelector('#deleteModal .btn-danger');
@@ -1535,8 +1797,8 @@ HTML_TEMPLATE = """
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ internal_id: internalId })
                 });
-                if (response.ok) { showToast('✅ Удалено'); closeDeleteModal(); setTimeout(() => location.reload(), 800); }
-                else { const data = await response.json(); showToast('❌ ' + (data.error || 'Ошибка'), true); }
+                if (response.ok) { showToast('✅ Удалено'); closeDeleteModal(); reloadPreservingScroll(800); }
+                else { const data = await parseResponseJson(response); showToast('❌ ' + (data.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
             finally { btn.disabled = false; }
         }
@@ -1544,9 +1806,9 @@ HTML_TEMPLATE = """
         function confirmDeleteFolder(folderId, folderName) {
             document.getElementById('deleteFolderId').value = folderId;
             document.getElementById('deleteFolderName').textContent = folderName;
-            document.getElementById('deleteFolderModal').classList.add('active');
+            openModal('deleteFolderModal');
         }
-        function closeDeleteFolderModal() { document.getElementById('deleteFolderModal').classList.remove('active'); }
+        function closeDeleteFolderModal() { closeModal('deleteFolderModal'); }
         async function executeDeleteFolder() {
             const folderId = document.getElementById('deleteFolderId').value;
             const btn = document.querySelector('#deleteFolderModal .btn-danger');
@@ -1556,8 +1818,8 @@ HTML_TEMPLATE = """
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ folder_id: folderId })
                 });
-                if (response.ok) { showToast('✅ Папка удалена'); closeDeleteFolderModal(); setTimeout(() => location.reload(), 800); }
-                else { const data = await response.json(); showToast('❌ ' + (data.error || 'Ошибка'), true); }
+                if (response.ok) { showToast('✅ Папка удалена'); closeDeleteFolderModal(); reloadPreservingScroll(800); }
+                else { const data = await parseResponseJson(response); showToast('❌ ' + (data.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
             finally { btn.disabled = false; }
         }
@@ -1570,39 +1832,51 @@ HTML_TEMPLATE = """
         const progressContainer = document.getElementById('progressContainer');
         const progressFill = document.getElementById('progressFill');
         const toast = document.getElementById('toast');
-        let selectedUploadFiles = [];
-        let isFolderUpload = false;
+        // Each queued item carries its own mode/path. This keeps ordinary files
+        // and folder uploads from being reinterpreted by a single global flag.
+        let selectedUploadFiles = [];  // {file, path, mode, key}
 
         dropZone.addEventListener('click', () => fileInput.click());
-        fileInput.addEventListener('change', (e) => { isFolderUpload = false; addFiles(e.target.files); });
-        folderInput.addEventListener('change', (e) => { isFolderUpload = true; addFiles(e.target.files); });
-        
+        fileInput.addEventListener('change', (e) => {
+            addFiles(e.target.files, 'files');
+            e.target.value = '';
+        });
+        folderInput.addEventListener('change', (e) => {
+            addFiles(e.target.files, 'folder');
+            e.target.value = '';
+        });
+
         ['dragenter', 'dragover'].forEach(evt => dropZone.addEventListener(evt, (e) => { e.preventDefault(); dropZone.classList.add('dragover'); }));
         ['dragleave', 'drop'].forEach(evt => dropZone.addEventListener(evt, (e) => { e.preventDefault(); dropZone.classList.remove('dragover'); }));
-        dropZone.addEventListener('drop', (e) => { isFolderUpload = false; addFiles(e.dataTransfer.files); });
+        dropZone.addEventListener('drop', (e) => { addFiles(e.dataTransfer.files, 'files'); });
+        // A missed drop must not navigate the browser to the dropped local file.
+        ['dragover', 'drop'].forEach(evt => document.addEventListener(evt, (e) => {
+            if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')) e.preventDefault();
+        }));
 
-        function addFiles(files) {
+        function addFiles(files, mode) {
             for (const file of files) {
-                const key = isFolderUpload ? (file.webkitRelativePath || file.name) : file.name;
-                const duplicate = selectedUploadFiles.some(f => {
-                    const existingKey = isFolderUpload ? (f.webkitRelativePath || f.name) : f.name;
-                    return existingKey === key && f.size === file.size;
-                });
-                if (!duplicate) selectedUploadFiles.push(file);
+                const path = mode === 'folder' ? (file.webkitRelativePath || file.name) : file.name;
+                const key = `${mode}:${path}:${file.size}:${file.lastModified || 0}`;
+                const duplicate = selectedUploadFiles.some(item => item.key === key);
+                if (!duplicate) selectedUploadFiles.push({ file, path, mode, key });
             }
             renderFileList();
         }
         function renderFileList() {
             fileList.innerHTML = '';
-            selectedUploadFiles.forEach((file, idx) => {
-                const item = document.createElement('div');
-                item.className = 'file-item';
-                const relPath = isFolderUpload ? (file.webkitRelativePath || file.name) : file.name;
-                item.innerHTML = `<span class="name">${escapeHtml(relPath)}</span><span class="size">${formatSize(file.size)}</span><button class="remove" data-idx="${idx}">✕</button>`;
-                fileList.appendChild(item);
+            selectedUploadFiles.forEach((item, idx) => {
+                const row = document.createElement('div');
+                row.className = 'file-item';
+                const prefix = item.mode === 'folder' ? '📁 ' : '';
+                row.innerHTML = `<span class="name">${prefix}${escapeHtml(item.path || item.file.name)}</span><span class="size">${formatSize(item.file.size)}</span><button class="remove" data-idx="${idx}">✕</button>`;
+                fileList.appendChild(row);
             });
             fileList.querySelectorAll('.remove').forEach(btn => {
-                btn.addEventListener('click', (e) => { selectedUploadFiles.splice(parseInt(e.target.dataset.idx), 1); renderFileList(); });
+                btn.addEventListener('click', (e) => {
+                    selectedUploadFiles.splice(parseInt(e.target.dataset.idx), 1);
+                    renderFileList();
+                });
             });
             uploadBtn.disabled = selectedUploadFiles.length === 0;
         }
@@ -1613,48 +1887,166 @@ HTML_TEMPLATE = """
             return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' ГБ';
         }
         function escapeHtml(str) { const div = document.createElement('div'); div.textContent = str; return div.innerHTML; }
+        let toastTimer = null;
         function showToast(msg, isError = false) {
+            clearTimeout(toastTimer);
             toast.textContent = msg;
             toast.className = 'toast show' + (isError ? ' error' : '');
-            setTimeout(() => toast.classList.remove('show'), 3500);
+            toastTimer = setTimeout(() => toast.classList.remove('show'), 3500);
         }
+        async function parseResponseJson(response) {
+            const text = await response.text();
+            try {
+                return JSON.parse(text);
+            } catch (err) {
+                return { error: `HTTP ${response.status}: ${text.slice(0, 200) || 'пустой ответ'}` };
+            }
+        }
+
+        function reloadPreservingScroll(delay = 800) {
+            const pane = document.querySelector('.files-content');
+            try { sessionStorage.setItem('albionFilesScroll', String(pane ? pane.scrollTop : 0)); } catch (e) {}
+            setTimeout(() => location.reload(), delay);
+        }
+        function reloadAtTop(delay = 800) {
+            try { sessionStorage.removeItem('albionFilesScroll'); } catch (e) {}
+            setTimeout(() => location.reload(), delay);
+        }
+        try {
+            const savedScroll = sessionStorage.getItem('albionFilesScroll');
+            if (savedScroll !== null) {
+                const pane = document.querySelector('.files-content');
+                if (pane) pane.scrollTop = Number(savedScroll) || 0;
+                sessionStorage.removeItem('albionFilesScroll');
+            }
+        } catch (e) {}
+
         function copyToClipboard(text) {
-            navigator.clipboard.writeText(text).then(() => showToast('✅ Ссылка скопирована')).catch(() => showToast('❌ Не удалось', true));
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text)
+                    .then(() => showToast('✅ Ссылка скопирована'))
+                    .catch(() => showToast('❌ Не удалось скопировать', true));
+                return;
+            }
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            try {
+                document.execCommand('copy');
+                showToast('✅ Ссылка скопирована');
+            } catch (err) {
+                showToast('❌ Скопируйте вручную: ' + text, true);
+            } finally {
+                textarea.remove();
+            }
         }
+
+        // ===== Ленивая подгрузка файлов вместо пагинации =====
+        const lazyLoader = document.getElementById('lazyLoader');
+        const loadMoreBtn = document.getElementById('loadMoreBtn');
+        const lazyStatus = document.getElementById('lazyStatus');
+        let lazyNextUrl = lazyLoader ? (lazyLoader.dataset.nextUrl || '') : '';
+        let lazyLoading = false;
+        let lazyObserver = null;
+
+        function lazyTarget() {
+            if (currentView === 'table') return document.querySelector('#view-table tbody');
+            if (currentView === 'grid') return document.querySelector('#view-grid .files-grid');
+            return document.querySelector('#view-list .files-list');
+        }
+        function lazyFileSelector() {
+            if (currentView === 'table') return '#view-table .file-row';
+            if (currentView === 'grid') return '#view-grid .tile[data-file-id]';
+            return '#view-list .list-item[data-file-id]';
+        }
+        async function loadNextPage() {
+            if (!lazyNextUrl || lazyLoading) return;
+            lazyLoading = true;
+            loadMoreBtn.disabled = true;
+            lazyStatus.textContent = 'Загрузка…';
+            try {
+                const response = await fetch(lazyNextUrl, { headers: { 'X-Requested-With': 'lazy' } });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const html = await response.text();
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                const target = lazyTarget();
+                if (!target) throw new Error('Не найдено активное представление');
+                doc.querySelectorAll(lazyFileSelector()).forEach(node => {
+                    target.appendChild(document.importNode(node, true));
+                });
+                const nextLoader = doc.getElementById('lazyLoader');
+                lazyNextUrl = nextLoader ? (nextLoader.dataset.nextUrl || '') : '';
+                lazyLoader.dataset.nextUrl = lazyNextUrl;
+                updateSelection();
+                if (!lazyNextUrl) {
+                    lazyLoader.hidden = true;
+                    lazyStatus.textContent = 'Все файлы загружены';
+                    if (lazyObserver) lazyObserver.disconnect();
+                } else {
+                    lazyStatus.textContent = '';
+                }
+            } catch (err) {
+                console.error('Ошибка ленивой загрузки:', err);
+                lazyStatus.textContent = 'Не удалось загрузить ещё файлы';
+                showToast('❌ Не удалось загрузить следующую страницу', true);
+            } finally {
+                lazyLoading = false;
+                loadMoreBtn.disabled = false;
+            }
+        }
+        function setupLazyLoading() {
+            if (!lazyNextUrl) return;
+            if ('IntersectionObserver' in window) {
+                lazyObserver = new IntersectionObserver(entries => {
+                    if (entries.some(entry => entry.isIntersecting)) loadNextPage();
+                }, { root: document.querySelector('.files-content'), rootMargin: '300px' });
+                lazyObserver.observe(lazyLoader);
+            } else {
+                lazyStatus.textContent = 'Прокрутите вниз или нажмите кнопку';
+            }
+        }
+        setupLazyLoading();
 
         // ===== Параллельная загрузка: батчи файлов в несколько потоков =====
         const PARALLEL_UPLOADS = 4;   // одновременных запросов
         const FILES_PER_BATCH = 25;   // файлов в одном запросе
 
         uploadBtn.addEventListener('click', async () => {
-            if (selectedUploadFiles.length === 0) return;
+            if (selectedUploadFiles.length === 0 || !lockAction('upload')) return;
             uploadBtn.disabled = true;
             progressContainer.style.display = 'block';
             progressFill.style.width = '0%'; progressFill.textContent = '0%';
 
-            // Группируем по целевой папке: файлы одной папки не должны попасть
-            // в разные параллельные запросы (иначе гонка имён)
+            try {
+            // Group by mode and target folder. A single batch never mixes
+            // plain files with folder uploads or different folder paths.
             const groups = new Map();
-            for (const f of selectedUploadFiles) {
-                const key = isFolderUpload
-                    ? (f.webkitRelativePath || f.name).split('/').slice(0, -1).join('/')
+            for (const item of selectedUploadFiles) {
+                const folderPath = item.mode === 'folder'
+                    ? item.path.split('/').slice(0, -1).join('/')
                     : '__plain__';
+                const key = `${item.mode}:${folderPath}`;
                 if (!groups.has(key)) groups.set(key, []);
-                groups.get(key).push(f);
+                groups.get(key).push(item);
             }
             const batches = [];
-            for (const files of groups.values()) {
-                for (let i = 0; i < files.length; i += FILES_PER_BATCH)
-                    batches.push(files.slice(i, i + FILES_PER_BATCH));
+            for (const items of groups.values()) {
+                for (let i = 0; i < items.length; i += FILES_PER_BATCH) {
+                    batches.push({ mode: items[0].mode, items: items.slice(i, i + FILES_PER_BATCH) });
+                }
             }
 
-            const totalBytes = selectedUploadFiles.reduce((s, f) => s + f.size, 0);
+            const totalBytes = selectedUploadFiles.reduce((sum, item) => sum + item.file.size, 0);
             const loadedByBatch = new Map();
+            const completedKeys = new Set();
             let savedTotal = 0, failedTotal = 0, lastError = '';
 
             const updateProgress = () => {
                 let loaded = 0;
-                loadedByBatch.forEach(v => loaded += v);
+                loadedByBatch.forEach(value => { loaded += value; });
                 const pct = totalBytes ? Math.min(100, Math.round(loaded / totalBytes * 100)) : 100;
                 progressFill.style.width = pct + '%'; progressFill.textContent = pct + '%';
             };
@@ -1662,32 +2054,50 @@ HTML_TEMPLATE = """
             const uploadBatch = (batch) => new Promise((resolve) => {
                 const fd = new FormData();
                 fd.append('folder_id', currentFolderId);
-                batch.forEach((f, i) => {
-                    fd.append(`file_${i}`, f);
-                    if (isFolderUpload) fd.append(`path_${i}`, f.webkitRelativePath || f.name);
+                batch.items.forEach((item, i) => {
+                    fd.append(`file_${i}`, item.file);
+                    if (batch.mode === 'folder') fd.append(`path_${i}`, item.path);
                 });
-                fd.append('count', String(batch.length));
+                fd.append('count', String(batch.items.length));
 
                 const xhr = new XMLHttpRequest();
-                xhr.open('POST', isFolderUpload ? '/upload_folder' : '/upload');
+                xhr.open('POST', batch.mode === 'folder' ? '/upload_folder' : '/upload');
                 xhr.setRequestHeader('X-CSRF-Token', csrfToken);
                 xhr.upload.onprogress = (e) => {
                     if (e.lengthComputable) { loadedByBatch.set(batch, e.loaded); updateProgress(); }
                 };
                 xhr.onload = () => {
+                    const expected = batch.items.length;
                     if (xhr.status === 200) {
-                        try { savedTotal += JSON.parse(xhr.responseText).count || 0; }
-                        catch (e) { savedTotal += batch.length; }
+                        let saved = 0;
+                        try {
+                            const payload = JSON.parse(xhr.responseText);
+                            saved = Number(payload.count);
+                        } catch (err) {
+                            saved = 0;
+                        }
+                        if (!Number.isFinite(saved) || saved < 0 || saved > expected) {
+                            failedTotal += expected;
+                            lastError = 'Некорректный ответ сервера';
+                        } else {
+                            savedTotal += saved;
+                            if (saved === expected) {
+                                batch.items.forEach(item => completedKeys.add(item.key));
+                            } else {
+                                failedTotal += expected - saved;
+                                lastError = `Сервер принял ${saved} из ${expected} файлов`;
+                            }
+                        }
                     } else {
-                        failedTotal += batch.length;
+                        failedTotal += expected;
                         let msg = `Ошибка ${xhr.status}`;
-                        try { const d = JSON.parse(xhr.responseText); if (d.error) msg = d.error; } catch (e) {}
+                        try { const payload = JSON.parse(xhr.responseText); if (payload.error) msg = payload.error; } catch (err) {}
                         lastError = msg;
                         console.error('Ошибка батча:', xhr.status, xhr.responseText);
                     }
                     resolve();
                 };
-                xhr.onerror = () => { failedTotal += batch.length; lastError = 'Ошибка сети'; resolve(); };
+                xhr.onerror = () => { failedTotal += batch.items.length; lastError = 'Ошибка сети'; resolve(); };
                 xhr.send(fd);
             });
 
@@ -1699,21 +2109,31 @@ HTML_TEMPLATE = """
                 }
             };
             await Promise.all(Array.from({ length: Math.min(PARALLEL_UPLOADS, batches.length) }, worker));
-
             if (failedTotal === 0) {
-                progressFill.style.width = '100%'; progressFill.textContent = '100%';
-                showToast(`✅ Загружено: ${savedTotal}`);
-                selectedUploadFiles = []; renderFileList(); fileInput.value = ''; folderInput.value = '';
-                setTimeout(() => location.reload(), 800);
-            } else {
-                showToast(`❌ Загружено: ${savedTotal}, не удалось: ${failedTotal}. ${lastError}`, true);
-                progressContainer.style.display = 'none'; uploadBtn.disabled = false;
-                setTimeout(() => location.reload(), 2000);
+                    progressFill.style.width = '100%'; progressFill.textContent = '100%';
+                    showToast(`✅ Загружено: ${savedTotal}`);
+                    selectedUploadFiles = [];
+                    renderFileList();
+                    reloadAtTop(800);
+                } else {
+                    selectedUploadFiles = selectedUploadFiles.filter(item => !completedKeys.has(item.key));
+                    renderFileList();
+                    progressContainer.style.display = 'none';
+                    uploadBtn.disabled = selectedUploadFiles.length === 0;
+                    showToast(`❌ Загружено: ${savedTotal}, не удалось: ${failedTotal}. ${lastError}. Очередь оставлена для повтора.`, true);
+                }
+            } catch (err) {
+                console.error('Ошибка загрузки:', err);
+                progressContainer.style.display = 'none';
+                showToast('❌ Не удалось выполнить загрузку: ' + err.message, true);
+            } finally {
+                if (uploadBtn.disabled) uploadBtn.disabled = selectedUploadFiles.length === 0;
+                unlockAction('upload');
             }
         });
 
         document.querySelectorAll('.modal-overlay').forEach(m => {
-            m.addEventListener('click', (e) => { if (e.target === m) m.classList.remove('active'); });
+            m.addEventListener('click', (e) => { if (e.target === m) closeModal(m.id); });
         });
     </script>
 </body>
@@ -1726,6 +2146,7 @@ PUBLIC_FOLDER_TEMPLATE = """
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>АЛЬБИОН: {{ folder.name }}</title>
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
     <meta name="robots" content="noindex">
@@ -1755,7 +2176,19 @@ PUBLIC_FOLDER_TEMPLATE = """
         .folder-item:hover { background: #fef3c7; }
         .empty { text-align: center; padding: 50px 20px; color: #94a3b8; }
         .empty .icon { font-size: 44px; margin-bottom: 8px; }
+        .pagination { display: flex; align-items: center; justify-content: center; gap: 5px; padding-top: 14px; flex-wrap: wrap; }
+        .page-link, .lazy-more { color: #2563eb; border: 1px solid #dbeafe; border-radius: 4px; padding: 4px 9px; text-decoration: none; font-size: 12px; background: #fff; cursor: pointer; }
+        .page-link:hover, .lazy-more:hover { background: #eff6ff; }
+        .page-link.active { background: #2563eb; border-color: #2563eb; color: white; font-weight: 600; }
+        .page-ellipsis { color: #94a3b8; padding: 0 2px; }
         .footer { text-align: center; color: #94a3b8; font-size: 11px; padding: 12px; }
+        @media (max-width: 650px) {
+            .header { padding: 12px 15px; }
+            .item { flex-wrap: wrap; }
+            .item .name { flex-basis: calc(100% - 50px); }
+            .item .meta { margin-left: 40px; }
+            .item .actions { margin-left: 40px; }
+        }
     </style>
 </head>
 <body>
@@ -1771,6 +2204,7 @@ PUBLIC_FOLDER_TEMPLATE = """
     <div class="main">
         <div class="card">
             {% if subfolders or files %}
+                <div id="publicItems">
                 {% for sf in subfolders %}
                 <div class="item folder-item">
                     <span class="icon">📁</span>
@@ -1783,7 +2217,7 @@ PUBLIC_FOLDER_TEMPLATE = """
                 {% for f in files %}
                 <div class="item">
                     {% if f.is_image %}
-                        <img class="thumb" src="{{ f.view_url }}" alt="">
+                        <img class="thumb" src="{{ f.thumb_url }}" loading="lazy" decoding="async" alt="">
                     {% else %}
                         <span class="icon">{{ f.icon }}</span>
                     {% endif %}
@@ -1798,6 +2232,7 @@ PUBLIC_FOLDER_TEMPLATE = """
                     </span>
                 </div>
                 {% endfor %}
+                </div>
             {% else %}
                 <div class="empty">
                     <div class="icon">📭</div>
@@ -1805,8 +2240,57 @@ PUBLIC_FOLDER_TEMPLATE = """
                 </div>
             {% endif %}
         </div>
+        <div id="publicLazyLoader" class="lazy-loader" data-next-url="{{ next_url or '' }}" {% if not next_url %}hidden{% endif %}>
+            <button type="button" class="lazy-more" id="publicLoadMore" onclick="publicLoadNextPage()">Показать ещё</button>
+            <span id="publicLazyStatus"></span>
+        </div>
+        <div class="footer">Файлов: {{ total_files }}</div>
     </div>
-    <div class="footer">АЛЬБИОН: Файловый сервер</div>
+    <script>
+        const publicLoader = document.getElementById('publicLazyLoader');
+        const publicStatus = document.getElementById('publicLazyStatus');
+        const publicButton = document.getElementById('publicLoadMore');
+        let publicNextUrl = publicLoader ? (publicLoader.dataset.nextUrl || '') : '';
+        let publicLoading = false;
+        async function publicLoadNextPage() {
+            if (!publicNextUrl || publicLoading) return;
+            publicLoading = true;
+            publicButton.disabled = true;
+            publicStatus.textContent = 'Загрузка…';
+            try {
+                const response = await fetch(publicNextUrl);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+                const target = document.getElementById('publicItems');
+                doc.querySelectorAll('#publicItems .item').forEach(node => {
+                    target.appendChild(document.importNode(node, true));
+                });
+                const nextLoader = doc.getElementById('publicLazyLoader');
+                publicNextUrl = nextLoader ? (nextLoader.dataset.nextUrl || '') : '';
+                publicLoader.dataset.nextUrl = publicNextUrl;
+                if (!publicNextUrl) {
+                    publicLoader.hidden = true;
+                    publicStatus.textContent = '';
+                } else {
+                    publicStatus.textContent = '';
+                }
+            } catch (err) {
+                console.error('Ошибка публичной lazy-загрузки:', err);
+                publicStatus.textContent = 'Не удалось загрузить ещё файлы';
+            } finally {
+                publicLoading = false;
+                publicButton.disabled = false;
+            }
+        }
+        if (publicNextUrl && 'IntersectionObserver' in window) {
+            const observer = new IntersectionObserver(entries => {
+                if (entries.some(entry => entry.isIntersecting)) publicLoadNextPage();
+            }, { rootMargin: '400px' });
+            observer.observe(publicLoader);
+        } else if (publicNextUrl) {
+            publicStatus.textContent = 'Прокрутите вниз или нажмите кнопку';
+        }
+    </script>
 </body>
 </html>
 """
@@ -1818,6 +2302,7 @@ SETTINGS_TEMPLATE = """
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="csrf-token" content="{{ csrf_token }}">
     <title>АЛЬБИОН: Настройки</title>
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
@@ -1901,11 +2386,171 @@ SETTINGS_TEMPLATE = """
                 </div>
                 <div class="actions">
                     <button class="btn" type="submit">Сохранить</button>
+                    <a class="btn btn-secondary" href="/settings/tokens">🔑 API-токены</a>
                     <a class="btn btn-secondary" href="/f/">← К файлам</a>
+                    <a class="btn btn-secondary" href="/logout">Выйти</a>
                 </div>
             </form>
         </div>
     </div>
+</body>
+</html>
+"""
+
+
+TOKENS_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>АЛЬБИОН: API-токены</title>
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: #f4f4f9; margin: 0; color: #1e293b; }
+        .header { background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%); color: white; padding: 15px 30px; display: flex; align-items: center; gap: 15px; flex-wrap: wrap; }
+        .header img { height: 42px; background: white; padding: 4px 7px; border-radius: 6px; }
+        .header h1 { margin: 0; font-size: 20px; }
+        .header a { color: white; margin-left: auto; }
+        .main { max-width: 1100px; margin: 0 auto; padding: 22px 15px; display: grid; gap: 18px; }
+        .card { background: white; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.08); padding: 20px 24px; overflow-x: auto; }
+        h2 { color: #1e3a8a; margin-top: 0; font-size: 18px; }
+        .group { margin: 14px 0; }
+        label { display: block; font-weight: 600; margin-bottom: 5px; font-size: 13px; }
+        input[type=text], input[type=number], select { width: 100%; max-width: 360px; padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 5px; font-size: 14px; }
+        .scopes { display: flex; gap: 15px; flex-wrap: wrap; font-weight: 400; }
+        .scopes label { display: flex; align-items: center; gap: 5px; font-weight: 400; }
+        .hint { color: #64748b; font-size: 12px; margin-top: 4px; }
+        .actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+        .btn { display: inline-block; padding: 8px 16px; border-radius: 5px; text-decoration: none; color: white; background: #2563eb; border: none; cursor: pointer; font-size: 13px; font-weight: 500; }
+        .btn:hover { background: #1e3a8a; }
+        .btn-secondary { background: #f1f5f9; color: #475569; }
+        .btn-secondary:hover { background: #e2e8f0; }
+        .btn-danger { background: #dc3545; }
+        .btn-danger:hover { background: #b02a37; }
+        .toast { background: #dcfce7; color: #166534; padding: 10px 14px; border-radius: 6px; margin-bottom: 15px; font-size: 13px; }
+        .error { background: #fee2e2; color: #991b1b; padding: 10px 14px; border-radius: 6px; margin-bottom: 15px; font-size: 13px; }
+        .secret { background: #f0fdf4; border: 1px solid #86efac; border-radius: 7px; padding: 14px; margin: 12px 0; }
+        .secret code { display: block; margin-top: 8px; padding: 10px; background: #fff; border: 1px solid #cbd5e1; border-radius: 4px; word-break: break-all; font-size: 13px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+        th { color: #1e3a8a; font-size: 12px; text-transform: uppercase; }
+        .badge { display: inline-block; padding: 2px 7px; border-radius: 9px; font-size: 11px; font-weight: 600; background: #eff6ff; color: #1d4ed8; white-space: nowrap; }
+        .badge.expired, .badge.invalid { background: #fee2e2; color: #991b1b; }
+        .badge.legacy { background: #fef3c7; color: #92400e; }
+        .empty { color: #94a3b8; padding: 12px 0; }
+        .revoke-form { display: inline; }
+        .revoke-form button { padding: 4px 9px; font-size: 12px; }
+        code { word-break: break-all; }
+        @media (max-width: 700px) {
+            .header { padding: 12px 15px; }
+            .header a { margin-left: 0; }
+            .main { padding: 12px 8px; }
+            .card { padding: 14px; }
+            table { min-width: 850px; }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <img src="{{ url_for('static', filename='logo.png') }}" alt="АЛЬБИОН">
+        <h1>🔑 API-токены</h1>
+        <a class="btn btn-secondary" href="/settings">← Настройки</a>
+        <a class="btn btn-secondary" href="/logout">Выйти</a>
+    </header>
+    <div class="main">
+        {% if new_token %}
+        <div class="card secret">
+            <h2>Токен создан</h2>
+            <p>Сохраните секрет сейчас — после обновления страницы он больше не будет показан.</p>
+            <code id="newToken">{{ new_token }}</code>
+            <div class="hint">Имя: {{ new_token_name }}. Передавайте его только в заголовке <code>X-API-Key</code>.</div>
+        </div>
+        {% endif %}
+        <div class="card">
+            <h2>Создать токен для приложения</h2>
+            {% if error %}<div class="error">{{ error }}</div>{% endif %}
+            {% if revoked %}<div class="toast">Токен отозван.</div>{% endif %}
+            <p class="hint">Токены нужны для доверенных интеграций. Для загрузки и удаления обязательна привязка к папке. Срок по умолчанию — 90 дней.</p>
+            <form method="post" action="/settings/tokens/create" autocomplete="off">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <div class="group">
+                    <label for="tokenName">Имя токена</label>
+                    <input id="tokenName" type="text" name="name" maxlength="64" required value="{{ form.name }}">
+                </div>
+                <div class="group">
+                    <label>Права</label>
+                    <div class="scopes">
+                        <label><input type="checkbox" name="scopes" value="download" {% if 'download' in form.scopes %}checked{% endif %}> Скачивание / экспорт</label>
+                        <label><input type="checkbox" name="scopes" value="upload" {% if 'upload' in form.scopes %}checked{% endif %}> Загрузка</label>
+                        <label><input type="checkbox" name="scopes" value="delete" {% if 'delete' in form.scopes %}checked{% endif %}> Удаление</label>
+                    </div>
+                    <div class="hint">Для загрузки/удаления выберите папку ниже.</div>
+                </div>
+                <div class="group">
+                    <label for="tokenFolder">Папка (обязательна для загрузки/удаления)</label>
+                    <select id="tokenFolder" name="folder_id">
+                        <option value="">— без привязки, только download —</option>
+                        {% for folder in folder_options %}
+                        <option value="{{ folder.id }}" {% if form.folder_id == folder.id %}selected{% endif %}>{{ folder.label }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="group">
+                    <label for="tokenExpires">Срок действия, дней</label>
+                    <input id="tokenExpires" type="number" name="expires_days" min="1" max="3650" step="1" value="{{ form.expires_days }}">
+                    <label style="font-weight:400;margin-top:8px"><input type="checkbox" name="no_expiry" value="1" {% if form.no_expiry %}checked{% endif %}> Бессрочный токен</label>
+                </div>
+                <div class="actions">
+                    <button class="btn" type="submit">Создать токен</button>
+                    <a class="btn btn-secondary" href="/f/">← К файлам</a>
+                </div>
+            </form>
+        </div>
+        <div class="card">
+            <h2>Выданные токены</h2>
+            {% if tokens %}
+            <table>
+                <thead><tr><th>Имя</th><th>Права</th><th>Папка</th><th>Создан</th><th>Срок</th><th>Состояние</th><th>Hash</th><th></th></tr></thead>
+                <tbody>
+                {% for token in tokens %}
+                <tr>
+                    <td><strong>{{ token.name }}</strong></td>
+                    <td>{{ token.scopes_label }}</td>
+                    <td>{{ token.folder_label }}</td>
+                    <td>{{ token.created }}</td>
+                    <td>{{ token.expires_label }}</td>
+                    <td><span class="badge {{ token.status_class }}">{{ token.status_label }}</span></td>
+                    <td><code>{{ token.hash_prefix }}…</code></td>
+                    <td>
+                        <form class="revoke-form" method="post" action="/settings/tokens/revoke" onsubmit="return confirm('Отозвать этот токен?');">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <input type="hidden" name="token_id" value="{{ token.token_id }}">
+                            <button class="btn btn-danger" type="submit">Отозвать</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty">Пока нет выданных токенов.</div>
+            {% endif %}
+        </div>
+    </div>
+    <script>
+        {% if new_token %}
+        document.getElementById('newToken').addEventListener('click', () => {
+            const text = document.getElementById('newToken').textContent;
+            const selection = window.getSelection();
+            const range = document.createRange();
+            range.selectNodeContents(document.getElementById('newToken'));
+            selection.removeAllRanges(); selection.addRange(range);
+            navigator.clipboard?.writeText(text).catch(() => {});
+        });
+        {% endif %}
+    </script>
 </body>
 </html>
 """
@@ -1944,28 +2589,21 @@ def load_tokens():
 
 def _token_scopes(meta):
     """Права токена; старые записи без scopes работают только на скачивание."""
-    scopes = meta.get('scopes')
-    if not isinstance(scopes, list) or not scopes:
-        return ['download']
-    return scopes
+    return token_store.scopes_of(meta)
 
 def _token_is_expired(value):
-    """True для корректной прошедшей даты; None — дата некорректна."""
-    if not value:
-        return False
-    try:
-        expires = datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
-        return None
-    now = datetime.now(expires.tzinfo) if expires.tzinfo else datetime.now()
-    return expires < now
+    return token_store.token_expired(value)
 
 def check_api_key(provided):
     """Метаданные ключа + его hash-id, либо None."""
     if not provided:
         return None
     key_hash = hashlib.sha256(provided.encode('utf-8')).hexdigest()
-    meta = load_tokens().get(key_hash)
+    try:
+        meta = load_tokens().get(key_hash)
+    except token_store.TokenStoreError:
+        app.logger.exception('Не удалось прочитать tokens.json')
+        return None
     if not meta or not isinstance(meta, dict):
         return None
     scopes = _token_scopes(meta)
@@ -1974,7 +2612,7 @@ def check_api_key(provided):
         return None
     return {'id': key_hash, 'name': meta.get('name', 'без имени'),
             'scopes': scopes, 'folder_id': meta.get('folder_id'),
-            'expired': bool(expired)}
+            'expires_at': meta.get('expires_at'), 'expired': bool(expired)}
 
 def require_api_scope(scope):
     """Проверка X-API-Key и права для машинных роутов.
@@ -1990,6 +2628,8 @@ def require_api_scope(scope):
     scopes = meta.get('scopes') or ['download']
     if '*' not in scopes and scope not in scopes:
         return None, (jsonify({'error': f'Токену не разрешено: {scope}'}), 403)
+    if scope in token_store.FOLDER_REQUIRED_SCOPES and not meta.get('folder_id'):
+        return None, (jsonify({'error': 'Токен не привязан к папке'}), 403)
     return meta, None
 
 def _integration_rate_limit_key():
@@ -2223,7 +2863,7 @@ def _login_csrf_input():
 def login():
     auth = get_auth()
     if auth is None:
-        return '''<!DOCTYPE html><html lang="ru"><meta charset="utf-8"><title>Требуется настройка</title>
+        return '''<!DOCTYPE html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Требуется настройка</title>
         <h1>Вход отключён: не настроены учётные данные</h1>
         <p>Администратор должен создать auth.json через change_password.py и перезапустить сервис.</p></html>''', 503
     if request.method == 'POST':
@@ -2245,7 +2885,7 @@ def login():
             return redirect(next_page)
         app.logger.warning('Неудачная попытка входа: логин "%s" с %s',
                            request.form.get('username'), request.remote_addr)
-        page = '''<!DOCTYPE html><html><head><title>Вход - АЛЬБИОН</title>
+        page = '''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Вход - АЛЬБИОН</title>
         <style>body{font-family:'Segoe UI',Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f9;margin:0}
         .box{background:white;padding:40px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.1);width:320px;text-align:center}
         h2{color:#1e3a8a;margin-top:0}input{width:100%;padding:12px;margin:10px 0;border:1px solid #cbd5e1;border-radius:6px;font-size:14px;box-sizing:border-box}
@@ -2264,7 +2904,7 @@ def login():
     if session.get('logged_in'):
         session.clear()
         
-    page = '''<!DOCTYPE html><html><head><title>Вход - АЛЬБИОН</title>
+    page = '''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Вход - АЛЬБИОН</title>
     <style>body{font-family:'Segoe UI',Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f4f4f9;margin:0}
     .box{background:white;padding:40px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.1);width:320px;text-align:center}
     h2{color:#1e3a8a;margin-top:0}input{width:100%;padding:12px;margin:10px 0;border:1px solid #cbd5e1;border-radius:6px;font-size:14px;box-sizing:border-box}
@@ -2285,18 +2925,35 @@ def logout():
 def index():
     return redirect('/f/')
 
+BROWSE_SORTS = (
+    ('mtime_desc', 'Сначала новые'),
+    ('name_asc', 'Имя А–Я'),
+    ('size_desc', 'Размер: больше'),
+    ('downloads_desc', 'Скачивания'),
+)
+BROWSE_PER_PAGE = (25, 50, 100)
+
+
+def _browse_url(folder_id, **params):
+    path = f'/f/{folder_id}' if folder_id else '/f/'
+    clean = {key: value for key, value in params.items() if value not in (None, '')}
+    query = urllib.parse.urlencode(clean)
+    return f'{path}?{query}' if query else path
+
+
+
 @app.route('/f/')
 @app.route('/f/<folder_id>')
 @login_required
 def browse_folder(folder_id=None):
     folders = load_folders()
-    
+
     if folder_id and folder_id not in folders:
         abort(404)
-    
+
     current_folder = folders.get(folder_id) if folder_id else None
     breadcrumbs_data = []
-    
+
     if folder_id:
         path = get_folder_path(folder_id, folders)
         current = folder_id
@@ -2304,7 +2961,28 @@ def browse_folder(folder_id=None):
             breadcrumbs_data.append({'id': current, 'name': name})
             current = folders[current].get('parent_id')
         breadcrumbs_data.reverse()
-    
+
+    q = request.args.get('q', '').strip()[:200]
+    ext = request.args.get('ext', '').strip().lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        ext = ''
+    sort = request.args.get('sort', 'mtime_desc')
+    if sort not in {key for key, _ in BROWSE_SORTS}:
+        sort = 'mtime_desc'
+    try:
+        per_page = int(request.args.get('per_page', '50'))
+    except (TypeError, ValueError):
+        per_page = 50
+    if per_page not in BROWSE_PER_PAGE:
+        per_page = 50
+    try:
+        page = int(request.args.get('page', '1'))
+    except (TypeError, ValueError):
+        page = 1
+    view = request.args.get('view', 'table')
+    if view not in {'table', 'grid', 'list'}:
+        view = 'table'
+
     stats_map = get_folder_stats_map(folders, load_db())
     subfolders_data = []
     for fid, f in folders.items():
@@ -2319,12 +2997,58 @@ def browse_folder(folder_id=None):
                 'subdir_count': f_subdirs,
                 'size': format_size(f_size),
             })
-    
-    files = get_files_in_folder(folder_id)
+
+    if q:
+        needle = q.casefold()
+        subfolders_data = [
+            folder for folder in subfolders_data
+            if needle in folder['name'].casefold()
+        ]
+
+    all_files = get_files_in_folder(folder_id)
+    filtered_files = []
+    for file_record in all_files:
+        if ext and file_record['ext'].lower() != ext:
+            continue
+        if q:
+            haystack = ' '.join((
+                file_record.get('name', ''),
+                file_record.get('current_filename', ''),
+                file_record.get('physical_path', ''),
+                file_record.get('slug', ''),
+                file_record.get('custom_alias', ''),
+            )).casefold()
+            if q.casefold() not in haystack:
+                continue
+        filtered_files.append(file_record)
+
+    if sort == 'name_asc':
+        filtered_files.sort(key=lambda item: item['name'].casefold())
+    elif sort == 'size_desc':
+        filtered_files.sort(key=lambda item: item['size_raw'], reverse=True)
+    elif sort == 'downloads_desc':
+        filtered_files.sort(key=lambda item: item.get('download_count', 0), reverse=True)
+    total_files = len(filtered_files)
+    total_pages = max(1, (total_files + per_page - 1) // per_page)
+    page = min(max(1, page), total_pages)
+    start = (page - 1) * per_page
+    files = filtered_files[start:start + per_page]
+
+    base_params = {
+        'q': q or None,
+        'ext': ext or None,
+        'sort': sort,
+        'per_page': per_page,
+        'view': view,
+    }
+    reset_url = _browse_url(folder_id, view=view)
+    next_url = _browse_url(folder_id, page=page + 1, **base_params) if page < total_pages else None
+    ext_options = sorted({item['ext'].lower() for item in all_files if item.get('ext') not in (None, '—')})
+
     stats_info = get_all_files()
     stats = load_stats()
     disk = get_disk_info()
-    
+
     return render_template_string(HTML_TEMPLATE,
         current_folder=current_folder,
         current_folder_id=folder_id,
@@ -2332,6 +3056,20 @@ def browse_folder(folder_id=None):
         breadcrumbs=breadcrumbs_data,
         subfolders=subfolders_data,
         files=files,
+        total_files=total_files,
+        total_pages=total_pages,
+        page=page,
+        per_page=per_page,
+        next_url=next_url,
+        view=view,
+        q=q,
+        ext=ext,
+        sort=sort,
+        sort_options=BROWSE_SORTS,
+        per_page_options=BROWSE_PER_PAGE,
+        ext_options=ext_options,
+        reset_url=reset_url,
+        has_filters=bool(q or ext),
         stats_info=stats_info,
         stats=stats,
         disk=disk,
@@ -2406,6 +3144,167 @@ def settings_page():
         csrf_token=session.setdefault('_csrf_token', secrets.token_urlsafe(32)),
     )
 
+
+TOKEN_HASH_RE = re.compile(r'^[0-9a-f]{64}$')
+
+
+def _token_folder_path(folder_id, folders):
+    if not folder_id:
+        return '—'
+    if folder_id not in folders:
+        return f'{folder_id} (папка удалена)'
+    return ' / '.join(get_folder_path(folder_id, folders))
+
+
+def _token_expiry_label(value):
+    if not value:
+        return 'бессрочный'
+    try:
+        expires = datetime.fromisoformat(str(value))
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return expires.astimezone(timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
+    except (TypeError, ValueError):
+        return f'{value} (некорректно)'
+
+
+def _render_tokens_page(error=None, form=None, new_token=None,
+                        new_token_name=None, status=200):
+    folders = load_folders()
+    raw_tokens = load_tokens()
+    form = form or {
+        'name': '',
+        'scopes': ['download'],
+        'folder_id': '',
+        'expires_days': token_store.DEFAULT_TTL_DAYS,
+        'no_expiry': False,
+    }
+    folder_options = []
+    for folder_id in folders:
+        folder_options.append({
+            'id': folder_id,
+            'label': ' / '.join(get_folder_path(folder_id, folders)),
+        })
+    folder_options.sort(key=lambda item: item['label'].casefold())
+
+    token_rows = []
+    for token_id, meta in raw_tokens.items():
+        if not isinstance(meta, dict):
+            continue
+        scopes = token_store.scopes_of(meta)
+        folder_id = meta.get('folder_id')
+        expired = token_store.token_expired(meta.get('expires_at'))
+        binding_invalid = (
+            any(scope in token_store.FOLDER_REQUIRED_SCOPES for scope in scopes)
+            and not folder_id
+        )
+        if binding_invalid:
+            status_class, status_label = 'invalid', 'нет папки'
+        elif expired is None:
+            status_class, status_label = 'invalid', 'некорректный срок'
+        elif expired:
+            status_class, status_label = 'expired', 'истёк'
+        elif not meta.get('expires_at'):
+            status_class, status_label = 'legacy', 'бессрочный'
+        else:
+            status_class, status_label = '', 'активен'
+        token_rows.append({
+            'token_id': token_id,
+            'hash_prefix': token_id[:12],
+            'name': meta.get('name') or 'без имени',
+            'scopes_label': ', '.join('все (*)' if s == '*' else s for s in scopes),
+            'folder_label': _token_folder_path(folder_id, folders),
+            'created': meta.get('created') or meta.get('created_at') or '—',
+            'expires_label': _token_expiry_label(meta.get('expires_at')),
+            'status_class': status_class,
+            'status_label': status_label,
+        })
+    token_rows.sort(key=lambda item: item['name'].casefold())
+
+    body = render_template_string(
+        TOKENS_TEMPLATE,
+        tokens=token_rows,
+        folder_options=folder_options,
+        form=form,
+        error=error,
+        revoked=request.args.get('revoked') == '1',
+        new_token=new_token,
+        new_token_name=new_token_name,
+        csrf_token=session.setdefault('_csrf_token', secrets.token_urlsafe(32)),
+    )
+    return body, status, {'Cache-Control': 'no-store', 'Pragma': 'no-cache'}
+
+
+@app.route('/settings/tokens')
+@login_required
+def tokens_page():
+    return _render_tokens_page()
+
+
+@app.route('/settings/tokens/create', methods=['POST'])
+@login_required
+def token_create():
+    form = {
+        'name': request.form.get('name', '').strip(),
+        'scopes': request.form.getlist('scopes'),
+        'folder_id': request.form.get('folder_id', '').strip(),
+        'expires_days': request.form.get('expires_days', '').strip(),
+        'no_expiry': request.form.get('no_expiry') == '1',
+    }
+    folders = load_folders()
+    raw_token, token_id = token_store.generate_token()
+    created = {}
+
+    def add_token(tokens):
+        name, scopes, folder_id, expires_at = token_store.validate_issuance(
+            form['name'], form['scopes'], form['folder_id'], folders,
+            form['expires_days'], no_expiry=form['no_expiry'],
+            existing_names=[
+                meta.get('name', '') for meta in tokens.values()
+                if isinstance(meta, dict)
+            ],
+        )
+        record = token_store.build_record(name, scopes, folder_id, expires_at)
+        tokens[token_id] = record
+        created['record'] = record
+
+    try:
+        token_store.mutate_tokens(TOKENS_FILE, add_token)
+    except (ValueError, token_store.TokenStoreError) as exc:
+        app.logger.warning('Не удалось создать API-токен: %s', exc)
+        return _render_tokens_page(error=str(exc), form=form, status=400)
+
+    record = created['record']
+    app.logger.info('Создан API-токен: имя=%s, права=%s, папка=%s, срок=%s',
+                    record['name'], ','.join(record['scopes']),
+                    record['folder_id'] or '—', record['expires_at'] or 'бессрочный')
+    return _render_tokens_page(new_token=raw_token, new_token_name=record['name'])
+
+
+@app.route('/settings/tokens/revoke', methods=['POST'])
+@login_required
+def token_revoke():
+    token_id = request.form.get('token_id', '').strip()
+    if not TOKEN_HASH_RE.fullmatch(token_id):
+        return _render_tokens_page(error='Некорректный идентификатор токена.', status=400)
+    removed = {}
+
+    def remove_token(tokens):
+        meta = tokens.pop(token_id, None)
+        if meta is None:
+            raise ValueError('Токен не найден или уже отозван.')
+        removed['meta'] = meta
+
+    try:
+        token_store.mutate_tokens(TOKENS_FILE, remove_token)
+    except (ValueError, token_store.TokenStoreError) as exc:
+        return _render_tokens_page(error=str(exc), status=400)
+
+    app.logger.info('Отозван API-токен: имя=%s, hash=%s…',
+                    removed['meta'].get('name', 'без имени'), token_id[:12])
+    return redirect('/settings/tokens?revoked=1')
+
+
 @app.route('/d/<folder_ref>')
 @limiter.limit("60 per minute")
 def public_folder(folder_ref):
@@ -2431,7 +3330,7 @@ def public_folder(folder_ref):
 
     files_data = []
     db = load_db()
-    for record in db.values():
+    for internal_id, record in db.items():
         if record.get('folder_id') != fid:
             continue
         physical_path = record.get('physical_path', record['current_filename'])
@@ -2439,6 +3338,7 @@ def public_folder(folder_ref):
         if not safe_path or not os.path.isfile(safe_path):
             continue
         files_data.append({
+            'internal_id': internal_id,
             'name': record['display_name'],
             'ext': record['ext'],
             'icon': get_file_icon(record['ext']),
@@ -2447,8 +3347,22 @@ def public_folder(folder_ref):
             'mtime': record['mtime'],
             'download_url': f"{BASE_URL}/{url_path(physical_path)}",
             'view_url': f"{BASE_URL}/v/{url_path(physical_path)}",
+            'thumb_url': f"/thumb/mini/{internal_id}",
+            'thumb_medium_url': f"/thumb/medium/{internal_id}",
         })
     files_data.sort(key=lambda x: x['mtime'], reverse=True)
+    total_files = len(files_data)
+    per_page = 50
+    total_pages = max(1, (total_files + per_page - 1) // per_page)
+    try:
+        page = int(request.args.get('page', '1'))
+    except (TypeError, ValueError):
+        page = 1
+    page = min(max(1, page), total_pages)
+    start = (page - 1) * per_page
+    page_files = files_data[start:start + per_page]
+    public_base = f'/d/{urllib.parse.quote(str(folder_ref), safe="")}'
+    next_url = f'{public_base}?page={page + 1}' if page < total_pages else None
 
     app.logger.info('Публичный просмотр папки "%s" (%s) от %s',
                     folder['name'], fid, request.remote_addr)
@@ -2457,7 +3371,11 @@ def public_folder(folder_ref):
         folder=folder,
         breadcrumbs=breadcrumbs_data,
         subfolders=subfolders_data,
-        files=files_data)
+        files=page_files,
+        total_files=total_files,
+        total_pages=total_pages,
+        page=page,
+        next_url=next_url)
 
 # ===== ИНТЕГРАЦИЯ: МАШИННЫЕ ТОКЕНЫ (без сессии и CSRF) =====
 INTEGRATION_TTL_MAX_DAYS = 3650
@@ -2487,6 +3405,7 @@ def integration_verify():
         'name': meta.get('name'),
         'scopes': meta.get('scopes') or ['download'],
         'folder_id': meta.get('folder_id'),
+        'token_expires_at': meta.get('expires_at'),
         'base_url': BASE_URL,
         'limits': {'max_upload_gb': max_upload_gb},
     })
@@ -2499,17 +3418,14 @@ def integration_upload():
     if error:
         return error
 
-    # Привязка к папке: токен с folder_id пишет только туда.
+    # Запись всегда ограничена папкой, выданной вместе с токеном.
     token_folder = meta.get('folder_id')
     requested_folder = (request.form.get('folder_id') or '').strip() or None
-    if token_folder:
-        if requested_folder and requested_folder != token_folder:
-            return jsonify({'error': 'Токен привязан к другой папке'}), 403
-        folder_id = token_folder
-    else:
-        if not requested_folder:
-            return jsonify({'error': 'Токен не привязан к папке; укажите folder_id'}), 403
-        folder_id = requested_folder
+    if not token_folder:
+        return jsonify({'error': 'Токен не привязан к папке'}), 403
+    if requested_folder and requested_folder != token_folder:
+        return jsonify({'error': 'Токен привязан к другой папке'}), 403
+    folder_id = token_folder
 
     folders = load_folders()
     if folder_id not in folders:
@@ -2908,6 +3824,33 @@ def upload_folder():
     app.logger.info('Загрузка папки завершена: %d файл(ов), %d папок создано (принято в запросе: %d)',
                     saved_count, len(created_folders), count)
     return jsonify({'count': saved_count, 'folders_created': len(created_folders)})
+
+@app.route('/thumb/<size>/<file_id>', methods=['GET', 'HEAD'])
+@limiter.exempt
+def thumbnail_file(size, file_id):
+    """Serve a cached mini/medium preview without incrementing view_count.
+
+    Anonymous preview loads still consume the download budget so /thumb/ cannot
+    become an unlimited full-size download bypass. Opening /v/ remains the
+    explicit, counted view action.
+    """
+    if size not in THUMBNAIL_SIZES:
+        abort(404)
+    record = load_db().get(file_id)
+    if not isinstance(record, dict) or not record.get('is_image'):
+        abort(404)
+    thumb_path = ensure_thumbnail(record, size)
+    if not thumb_path:
+        abort(404)
+    if request.method != 'HEAD' and not session.get('logged_in'):
+        retry_after = check_download_budget(request.remote_addr, os.path.getsize(thumb_path))
+        if retry_after:
+            response = jsonify({'error': 'Бюджет скачивания исчерпан'})
+            response.headers['Retry-After'] = str(retry_after)
+            return response, 429
+    return send_file(thumb_path, mimetype='image/webp', as_attachment=False,
+                     conditional=True, max_age=3600)
+
 
 @app.route('/v/<path:filepath>')
 @limiter.limit("200 per minute", deduct_when=lambda response: g.get('api_key') is None)
@@ -3502,6 +4445,21 @@ def export_all():
     Не чаще раза в час на IP (анонимно) или на API-ключ."""
     if request.method == 'HEAD':
         return '', 405
+
+    # A provided machine key must explicitly allow downloads/exports. Otherwise
+    # an upload-only key could retrieve the entire storage archive.
+    provided_key = request.headers.get('X-API-Key')
+    api_key_meta = g.get('api_key_meta')
+    export_key_id = None
+    if provided_key:
+        if not api_key_meta:
+            return jsonify({'error': 'Требуется корректный заголовок X-API-Key'}), 401
+        if api_key_meta.get('expired'):
+            return jsonify({'error': 'Токен просрочен'}), 403
+        if not token_store.has_scope(api_key_meta, 'download'):
+            return jsonify({'error': 'Токену не разрешено: download'}), 403
+        export_key_id = api_key_meta['id']
+
     quota_settings = load_quota_settings()
     if quota_settings.get('export_all_internal_only', True):
         client_addr = request.remote_addr or ''
@@ -3516,10 +4474,10 @@ def export_all():
             (not TRUST_PROXY and not peer_is_loopback)
             or (TRUST_PROXY and is_trusted_proxy_peer(peer_addr))
         )
-        if not (g.get('api_key_id') or has_valid_admin_session or trusted_lan_client):
+        if not (export_key_id or has_valid_admin_session or trusted_lan_client):
             app.logger.warning('Полный экспорт запрещён для внешнего адреса %s', client_addr)
             return jsonify({'error': 'Полный экспорт доступен только из локальной сети или с API-ключом'}), 403
-    scope = f"key:{g.api_key_id}" if g.get('api_key_id') else f"ip:{request.remote_addr}"
+    scope = f"key:{export_key_id}" if export_key_id else f"ip:{request.remote_addr}"
     with _EXPORT_ALL_LOCK:
         now = time.time()
         last = _export_all_scopes.get(scope)

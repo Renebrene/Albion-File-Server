@@ -1,0 +1,13 @@
+{
+  "name": "albion-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:admin": "bun admin.spec.mjs",
+    "test:public": "bun public.spec.mjs",
+    "test:mobile": "bun mobile.spec.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.64.1"
+  }
+}

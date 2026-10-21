@@ -140,7 +140,7 @@ class IntegrationApiTests(unittest.TestCase):
 
         unbound = self.add_token(name='Unbound', scopes=['upload'], folder_id=None)
         response = self.post_file(unbound, folder_id='missing-folder-id')
-        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.status_code, 403)
 
         response = self.post_file(unbound)
         self.assertEqual(response.status_code, 403)
@@ -290,6 +290,38 @@ class IntegrationApiTests(unittest.TestCase):
         self.assertEqual(statuses[:60], [200] * 60)
         self.assertEqual(statuses[60], 429)
 
+    def test_export_all_requires_download_scope(self):
+        uploader = self.add_token(name='UploadOnly', scopes=['upload'])
+        self.assertEqual(self.post_file(uploader, filename='export.txt').status_code, 200)
+
+        no_download = self.client.get('/export_all', headers={'X-API-Key': uploader})
+        self.assertEqual(no_download.status_code, 403)
+        self.assertIn('download', no_download.get_json()['error'])
+        no_download.close()
+
+        downloader = self.add_token(name='DownloadOnly', scopes=['download'], folder_id=None)
+        server._export_all_scopes.clear()
+        exported = self.client.get('/export_all', headers={'X-API-Key': downloader})
+        self.assertEqual(exported.status_code, 200)
+        self.assertEqual(exported.data[:2], b'PK')
+        exported.close()
+
+    def test_export_all_rejects_invalid_key_instead_of_anonymous_fallback(self):
+        response = self.client.get('/export_all', headers={'X-API-Key': 'alb_' + '0' * 48})
+        self.assertEqual(response.status_code, 401)
+        response.close()
+
+    def test_unbound_delete_token_is_rejected(self):
+        uploader = self.add_token(name='UploaderForDelete', scopes=['upload'])
+        uploaded = self.post_file(uploader, filename='delete-me.txt').get_json()
+        deleter = self.add_token(name='GlobalDelete', scopes=['delete'], folder_id=None)
+        response = self.client.delete(
+            f"/api/v1/integration/files/{uploaded['file_id']}",
+            headers={'X-API-Key': deleter},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn(uploaded['file_id'], server.load_db())
+
     # 11. Удаление: только с правом delete и только в своей папке.
     def test_delete_requires_delete_scope(self):
         key = self.add_token(scopes=['upload'])
@@ -351,6 +383,9 @@ class ManageTokensCliTests(unittest.TestCase):
         self.env['ALBION_DATA_DIR'] = self.data_dir
         self.script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                    'manage_tokens.py')
+        with open(os.path.join(self.data_dir, 'folders_db.json'), 'w', encoding='utf-8') as handle:
+            json.dump({FOLDER_ID: {'name': 'Inbox', 'parent_id': None,
+                                   'created': '20.10.2026 12:00', 'slug': 'inbox'}}, handle)
 
     def tearDown(self):
         shutil.rmtree(self.data_dir, ignore_errors=True)
@@ -375,7 +410,7 @@ class ManageTokensCliTests(unittest.TestCase):
         listing = self.run_cli('list')
         self.assertEqual(listing.returncode, 0)
         self.assertIn('upload,download', listing.stdout)
-        self.assertIn(FOLDER_ID, listing.stdout)
+        self.assertIn('Inbox', listing.stdout)
 
     def test_add_without_scopes_is_download_only(self):
         result = self.run_cli('add', 'Legacy')
@@ -390,7 +425,37 @@ class ManageTokensCliTests(unittest.TestCase):
         self.assertNotEqual(invalid_scope.returncode, 0)
         missing_folder = self.run_cli('add', 'NoFolder', '--scopes', 'upload')
         self.assertNotEqual(missing_folder.returncode, 0)
+        delete_without_folder = self.run_cli('add', 'DeleteNoFolder', '--scopes', 'delete')
+        self.assertNotEqual(delete_without_folder.returncode, 0)
+        unknown_folder = self.run_cli('add', 'Unknown', '--scopes', 'upload',
+                                      '--folder', 'missing-folder')
+        self.assertNotEqual(unknown_folder.returncode, 0)
         self.assertFalse(os.path.exists(os.path.join(self.data_dir, 'tokens.json')))
+
+    def test_default_and_custom_token_expiry(self):
+        default = self.run_cli('add', 'DefaultTTL', '--scopes', 'upload',
+                               '--folder', FOLDER_ID)
+        self.assertEqual(default.returncode, 0, default.stderr)
+        with open(os.path.join(self.data_dir, 'tokens.json'), encoding='utf-8') as handle:
+            default_meta = next(iter(json.load(handle).values()))
+        expires = datetime.fromisoformat(default_meta['expires_at'])
+        self.assertIsNotNone(expires.tzinfo)
+        delta = expires - datetime.now(timezone.utc)
+        self.assertGreaterEqual(delta, timedelta(days=89, hours=23))
+        self.assertLessEqual(delta, timedelta(days=90, minutes=1))
+
+        custom = self.run_cli('add', 'CustomTTL', '--scopes', 'download',
+                              '--expires-days', '30')
+        self.assertEqual(custom.returncode, 0, custom.stderr)
+        endless = self.run_cli('add', 'Endless', '--scopes', 'download', '--no-expiry')
+        self.assertEqual(endless.returncode, 0, endless.stderr)
+        with open(os.path.join(self.data_dir, 'tokens.json'), encoding='utf-8') as handle:
+            records = {meta['name']: meta for meta in json.load(handle).values()}
+        custom_expires = datetime.fromisoformat(records['CustomTTL']['expires_at'])
+        custom_delta = custom_expires - datetime.now(timezone.utc)
+        self.assertGreaterEqual(custom_delta, timedelta(days=29, hours=23))
+        self.assertLessEqual(custom_delta, timedelta(days=30, minutes=1))
+        self.assertIsNone(records['Endless']['expires_at'])
 
 
 if __name__ == '__main__':

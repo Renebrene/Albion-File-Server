@@ -2,6 +2,7 @@
 
 Run: python -m unittest discover -s tests -v
 """
+import hashlib
 import io
 import json
 import os
@@ -359,6 +360,90 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 302)
         response.close()
 
+    def test_admin_shell_has_logout_and_accessible_dialogs(self):
+        self.login()
+        response = self.client.get('/f/')
+        body = response.get_data(as_text=True)
+        self.assertIn('href="/logout"', body)
+        self.assertIn('name="viewport"', body)
+        self.assertEqual(body.count('role="dialog"'), 5)
+        self.assertIn('aria-live="polite"', body)
+        self.assertIn('aria-label="Выбрать все на странице"', body)
+        response.close()
+
+    def test_tokens_page_requires_login(self):
+        response = self.anon.get('/settings/tokens')
+        self.assertEqual(response.status_code, 302)
+        response.close()
+
+    def _add_test_folder(self):
+        folder_id = '11111111-1111-1111-1111-111111111111'
+        server._save_json(server.FOLDERS_DB_FILE, {
+            folder_id: {'name': 'Inbox', 'parent_id': None,
+                        'created': '20.10.2026 12:00', 'slug': 'inbox'},
+        })
+        return folder_id
+
+    def test_admin_can_create_list_and_revoke_token(self):
+        self.login()
+        folder_id = self._add_test_folder()
+        response = self.client.post('/settings/tokens/create', data={
+            'name': 'Upload integration',
+            'scopes': ['upload', 'download'],
+            'folder_id': folder_id,
+            'expires_days': '90',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get('Cache-Control'), 'no-store')
+        body = response.get_data(as_text=True)
+        raw_match = re.search(r'alb_[0-9a-f]{48}', body)
+        self.assertIsNotNone(raw_match)
+        raw_key = raw_match.group(0)
+
+        tokens = server.load_tokens()
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        self.assertIn(key_hash, tokens)
+        self.assertEqual(tokens[key_hash]['scopes'], ['upload', 'download'])
+        self.assertEqual(tokens[key_hash]['folder_id'], folder_id)
+        self.assertIsNotNone(tokens[key_hash]['expires_at'])
+        self.assertNotIn(raw_key, json.dumps(tokens, ensure_ascii=False))
+
+        listing = self.client.get('/settings/tokens')
+        listing_body = listing.get_data(as_text=True)
+        self.assertIn(key_hash[:12], listing_body)
+        self.assertNotIn(raw_key, listing_body)
+        listing.close()
+
+        revoked = self.client.post('/settings/tokens/revoke', data={'token_id': key_hash})
+        self.assertEqual(revoked.status_code, 302)
+        self.assertNotIn(key_hash, server.load_tokens())
+        self.assertIsNone(server.check_api_key(raw_key))
+
+    def test_admin_token_creation_validates_binding_and_csrf(self):
+        self.login()
+        self._add_test_folder()
+        unbound = self.client.post('/settings/tokens/create', data={
+            'name': 'Bad upload',
+            'scopes': ['upload'],
+            'expires_days': '90',
+        })
+        self.assertEqual(unbound.status_code, 400)
+        self.assertIn('привязка к папке', unbound.get_data(as_text=True))
+        unbound.close()
+        self.assertFalse(server.load_tokens())
+
+        token = self.client.environ_base.pop('HTTP_X_CSRF_TOKEN')
+        try:
+            no_csrf = self.client.post('/settings/tokens/create', data={
+                'name': 'No CSRF',
+                'scopes': ['download'],
+                'expires_days': '90',
+            })
+            self.assertEqual(no_csrf.status_code, 403)
+            no_csrf.close()
+        finally:
+            self.client.environ_base['HTTP_X_CSRF_TOKEN'] = token
+
     def test_upload_quota_and_free_space_helpers(self):
         old_quota = server.STORAGE_QUOTA_BYTES
         old_free = server.MIN_FREE_BYTES
@@ -452,6 +537,54 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertTrue(response.data.startswith(b'PK'))
         response.close()
 
+    def test_browse_filters_and_active_view_rendering(self):
+        self.login()
+        for name in ('alpha.txt', 'beta.pdf', 'gamma.txt'):
+            self.client.post('/upload', data={
+                'count': '1', 'file_0': (io.BytesIO(name.encode()), name),
+            }, content_type='multipart/form-data')
+        response = self.client.get('/f/?q=alpha&ext=txt&sort=name_asc&per_page=25&view=grid')
+        self.assertEqual(response.status_code, 200)
+        body = response.get_data(as_text=True)
+        self.assertIn('alpha.txt', body)
+        self.assertNotIn('beta.pdf', body)
+        self.assertIn('id="view-grid"', body)
+        self.assertNotIn('id="view-table"', body)
+        self.assertNotIn('id="view-list"', body)
+        self.assertIn('Найдено:', body)
+        response.close()
+
+        empty = self.client.get('/f/?q=missing-file')
+        self.assertEqual(empty.status_code, 200)
+        self.assertIn('По фильтрам ничего не найдено', empty.get_data(as_text=True))
+        empty.close()
+
+    def test_thumbnail_does_not_increment_view_count(self):
+        from PIL import Image
+        image = io.BytesIO()
+        Image.new('RGB', (800, 600), (30, 90, 180)).save(image, 'PNG')
+        image.seek(0)
+        self.login()
+        response = self.client.post('/upload', data={
+            'count': '1', 'file_0': (image, 'preview.png'),
+        }, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 200)
+        record = next(iter(server.load_db().values()))
+        expected = {'mini': (160, 120), 'medium': (480, 360)}
+        for size, dimensions in expected.items():
+            thumb = self.anon.get(f"/thumb/{size}/{record['access_id']}")
+            self.assertEqual(thumb.status_code, 200)
+            self.assertEqual(thumb.mimetype, 'image/webp')
+            with Image.open(io.BytesIO(thumb.data)) as rendered:
+                self.assertEqual(rendered.size, dimensions)
+            thumb.close()
+        self.assertEqual(server.load_db()[record['access_id']].get('view_count', 0), 0)
+
+        view = self.anon.get('/v/' + record['physical_path'])
+        self.assertEqual(view.status_code, 200)
+        view.close()
+        self.assertEqual(server.load_db()[record['access_id']].get('view_count', 0), 1)
+
     def test_public_folder_slug_and_uuid(self):
         self.login()
         result = self.client.post('/api/create_folder', json={'name':'Публичная'}).get_json()
@@ -465,7 +598,9 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         self.assertNotIn(child_slug, page.get_data(as_text=True))
         self.assertNotIn('Секретная подпапка', page.get_data(as_text=True))
-        self.assertEqual(self.anon.get('/d/' + folder_id).status_code, 200)
+        public_page = self.anon.get('/d/' + folder_id)
+        self.assertEqual(public_page.status_code, 200)
+        self.assertIn('name="viewport"', public_page.get_data(as_text=True))
 
     def test_export_selected_zip_and_public_link(self):
         self.login()

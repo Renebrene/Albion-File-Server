@@ -47,7 +47,7 @@ WantedBy=multi-user.target
 4. Настроить TLS сертификат и nginx на `files.example.ru`; пример — `deploy/nginx.conf.example`. Nginx должен проксировать к `http://127.0.0.1:5000`, задавать `Host`, перезаписывать `X-Forwarded-For` через `$remote_addr` и передавать `X-Forwarded-Proto`.
 5. Firewall: снаружи разрешить только 443 (и 80 для TLS-проверки/redirect); порт 5000 закрыть. Для доступа только сотрудникам предпочтительнее VPN или IP allowlist на nginx.
 6. При первом запуске без `auth.json` автоматически создаётся `admin / альбион`. Сразу смените логин/пароль в `/settings` или командой `ALBION_DATA_DIR=/srv/albion/data /opt/albion-files/venv/bin/python change_password.py`.
-7. При необходимости создать ключ автоматики `manage_tokens.py add "Назначение ключа"`.
+7. При необходимости выдать токен автоматики в `/settings/tokens` или командой `manage_tokens.py add "Назначение ключа"`; новые токены по умолчанию действуют 90 дней, write scopes требуют папку.
 
 По умолчанию `ALBION_TRUST_PROXY=0`: прямой клиентский `X-Forwarded-For` игнорируется. При nginx на том же хосте включите `ALBION_TRUST_PROXY=1`; middleware доверяет одному proxy hop только когда непосредственный peer входит в `ALBION_TRUSTED_PROXY_IPS` (по умолчанию loopback). Шаблон nginx перезаписывает `X-Forwarded-For` на `$remote_addr`. Не включайте ProxyFix, если backend доступен клиентам в обход доверенного прокси. Если nginx и приложение в разных контейнерах, настройте `ALBION_TRUSTED_PROXY_IPS` по фактической Docker-сети.
 
@@ -78,7 +78,7 @@ docker compose exec app python change_password.py
 
 ## Резервные копии и обновления
 
-- Регулярно резервировать весь `ALBION_DATA_DIR` согласованным snapshot/rsync/borg: `uploads/`, JSON DB, `auth.json`, `tokens.json`, `.secret_key`, `ziplinks/`.
+- Регулярно резервировать весь `ALBION_DATA_DIR` согласованным snapshot/rsync/borg: `uploads/`, JSON DB, `auth.json`, `tokens.json`, `.secret_key`, `ziplinks/`; `thumbnails/` можно не копировать — кэш регенерируется.
 - Периодически проверять восстановление из backup, а не только факт создания архива.
 - Обновление: остановить сервис/контейнер, сохранить backup данных, обновить код, выполнить тесты, поднять сервис, проверить `/login`, `/f/`, публичную тестовую ссылку и журналы.
 - Не коммитить реальные `auth.json`, `tokens.json`, `.secret_key`, пользовательские файлы, архивы или экспорт чата.
