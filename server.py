@@ -32,6 +32,11 @@ import token_store
 # SQLite-слой метаданных. Режим выбирает ALBION_METADATA_BACKEND (json | sqlite):
 # json — прежние файлы, sqlite — база albion.db. Откат — вернуть флаг.
 import db as metadata_store
+# Учётные записи и серверные сессии работают поверх SQLite: персональные логины,
+# роли и немедленный отзыв сессий. В режиме json сохраняется прежний единственный
+# администратор из auth.json, поэтому откат флага остаётся рабочим.
+import users as user_store
+import sessions as session_store
 
 # Каталог данных (uploads + json-базы): '.' по умолчанию, в Docker — /app/data
 DATA_DIR = os.environ.get('ALBION_DATA_DIR', '.')
@@ -59,6 +64,10 @@ _REDIS_URL = os.environ.get('ALBION_REDIS_URL', '').strip()
 RATE_LIMIT_STORAGE_URI = os.environ.get('ALBION_RATE_LIMIT_STORAGE_URI', 'memory://').strip() or 'memory://'
 TRUST_PROXY = os.environ.get('ALBION_TRUST_PROXY', '0').lower() in {'1', 'true', 'yes'}
 APP_HOST = os.environ.get('ALBION_HOST', '127.0.0.1')
+# Второй слушатель для локальной сети: офисные пользователи ходят напрямую,
+# а через тоннель остаётся только внешний доступ. Пусто — листенер выключен.
+LAN_HOST = os.environ.get('ALBION_LAN_HOST', '').strip()
+LAN_PORT = int(os.environ.get('ALBION_LAN_PORT') or os.environ.get('ALBION_PORT', '5000'))
 TRUSTED_PROXY_IPS = tuple(
     addr.strip() for addr in os.environ.get('ALBION_TRUSTED_PROXY_IPS', '127.0.0.1,::1').split(',')
     if addr.strip()
@@ -1081,8 +1090,12 @@ HTML_TEMPLATE = """
             <h1 class="header-title">АЛЬБИОН: Файлы</h1>
             <div class="header-subtitle">Файловый сервер для обмена документами</div>
         </div>
-        <a href="/settings/tokens" class="btn btn-sm" style="margin:0 0 0 auto; background:rgba(255,255,255,.18);" title="API-токены">🔑 Токены</a>
+        <a href="/password" class="btn btn-sm" style="margin:0 0 0 auto; background:rgba(255,255,255,.18);" title="Сменить свой пароль">🔒 Пароль</a>
+        {% if is_admin() %}
+        <a href="/settings/tokens" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="API-токены">🔑 Токены</a>
+        <a href="/settings/users" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Пользователи">👥 Пользователи</a>
         <a href="/settings" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Настройки квот">⚙️ Настройки</a>
+        {% endif %}
         <a href="/logout" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Завершить сессию">Выйти</a>
     </header>
 
@@ -2453,6 +2466,14 @@ SETTINGS_TEMPLATE = """
                     <div class="hint">Если выключено, GET /export_all доступен анонимно в пределах часовой квоты.</div>
                 </div>
                 <hr style="border:0;border-top:1px solid #e2e8f0;margin:22px 0;">
+                {% if multi_user %}
+                <h2>Учётные записи</h2>
+                <p style="color:#64748b;font-size:13px;margin-top:0;">
+                    Логины, роли и пароли ведутся в разделе
+                    <a href="/settings/users">👥 Пользователи</a>; свой пароль каждый меняет
+                    на странице <a href="/password">🔒 Пароль</a>.
+                </p>
+                {% else %}
                 <h2>Учётные данные администратора</h2>
                 <div class="group">
                     <label>Логин</label>
@@ -2461,14 +2482,16 @@ SETTINGS_TEMPLATE = """
                 <div class="group">
                     <label>Новый пароль</label>
                     <input type="password" name="new_password" autocomplete="new-password" placeholder="Оставьте пустым, чтобы не менять">
-                    <div class="hint">Минимум 6 символов. После публикации сервера смените стартовый пароль.</div>
+                    <div class="hint">Минимум 6 символов (режим JSON). В режиме SQLite пароли ведёт раздел «Пользователи».</div>
                 </div>
                 <div class="group">
                     <label>Повторите новый пароль</label>
                     <input type="password" name="new_password_confirm" autocomplete="new-password">
                 </div>
+                {% endif %}
                 <div class="actions">
                     <button class="btn" type="submit">Сохранить</button>
+                    {% if multi_user %}<a class="btn btn-secondary" href="/settings/users">👥 Пользователи</a>{% endif %}
                     <a class="btn btn-secondary" href="/settings/tokens">🔑 API-токены</a>
                     <a class="btn btn-secondary" href="/f/">← К файлам</a>
                     <a class="btn btn-secondary" href="/logout">Выйти</a>
@@ -2644,7 +2667,14 @@ DEFAULT_AUTH_USERNAME = 'admin'
 DEFAULT_AUTH_PASSWORD = 'альбион'
 
 def ensure_default_auth():
-    """Create the requested bootstrap admin only when auth.json is absent."""
+    """Create the requested bootstrap admin only when auth.json is absent.
+
+    В режиме SQLite стартовая учётная запись с известным паролем не создаётся
+    никогда (находка F-01 аудита): администратор заводится командой
+    `manage_users.py add-admin`, а до этого вход закрыт.
+    """
+    if metadata_store.sqlite_enabled():
+        return os.path.exists(AUTH_FILE)
     if os.path.exists(AUTH_FILE):
         return True
     try:
@@ -2881,13 +2911,164 @@ def serialized_mutation(f):
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        auth = get_auth()
-        if (not session.get('logged_in') or auth is None
-                or session.get('_auth_fingerprint') != auth_fingerprint(auth)):
+        if not _session_valid():
             session.clear()
             return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
     return decorated_function
+
+
+# ===== КТО ПРИШЁЛ: ЛОКАЛЬНАЯ СЕТЬ ИЛИ ИНТЕРНЕТ =====
+
+def _peer_address():
+    """Адрес непосредственного клиента — до подстановок из forwarded-заголовков."""
+    original = request.environ.get('werkzeug.proxy_fix.orig') or {}
+    return original.get('REMOTE_ADDR') or request.environ.get('REMOTE_ADDR', '')
+
+
+def _is_loopback(address):
+    try:
+        peer = ipaddress.ip_address(address)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped:
+        peer = peer.ipv4_mapped
+    return peer.is_loopback
+
+
+def request_is_external():
+    """True — запрос пришёл через тоннель, False — напрямую из локальной сети.
+
+    Тоннель cloudpub подключается с loopback, а офисные клиенты — со своих
+    адресов локальной сети, поэтому признак «внешний» — loopback-сосед.
+    """
+    return _is_loopback(_peer_address())
+
+
+def multi_user_auth():
+    """Персональные учётные записи и сессии в базе доступны в режиме SQLite."""
+    return metadata_store.sqlite_enabled()
+
+
+def remote_access_allowed(user):
+    """Кому разрешён вход через тоннель.
+
+    По решению правил доступа из интернета входит только администратор; флаг
+    учётки `allow_remote` — явное исключение для конкретного сотрудника.
+    """
+    if not user:
+        return False
+    return user.get('role') == 'admin' or bool(user.get('allow_remote'))
+
+
+def ensure_users_ready():
+    """Перенести единственного администратора из auth.json в таблицу users.
+
+    Выполняется лениво, при первой попытке входа: к этому моменту тесты уже
+    создали свой auth.json, а сервер не трогает базу на импорте модуля.
+    """
+    if not multi_user_auth():
+        return None
+    try:
+        if user_store.list_users():
+            return None
+        user, note = user_store.migrate_from_auth_json(AUTH_FILE)
+        if user:
+            app.logger.warning('Учётная запись перенесена из auth.json: «%s» (%s)',
+                               user['login'], note)
+        return user
+    except Exception:
+        app.logger.exception('Не удалось подготовить таблицу пользователей')
+        return None
+
+
+def current_user():
+    """Кто выполняет запрос: запись из users либо прежний админ из auth.json."""
+    if multi_user_auth():
+        user_id = session.get('user_id')
+        if not user_id:
+            return None
+        user = user_store.get_user_by_id(user_id)
+        if not user or not user['active']:
+            return None
+        return user
+    auth = get_auth()
+    if not auth:
+        return None
+    return {'id': None, 'login': auth['username'], 'display_name': auth['username'],
+            'role': 'admin', 'active': True, 'must_change_password': False,
+            'allow_remote': True, 'email': None}
+
+
+def current_role():
+    user = current_user()
+    return user['role'] if user else None
+
+
+def is_admin():
+    return current_role() == 'admin'
+
+
+def admin_required(f):
+    """Раздел настроек доступен только администратору: роль user туда не входит."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not _session_valid():
+            session.clear()
+            return redirect(url_for('login', next=request.url))
+        if not is_admin():
+            app.logger.warning('Отказ в доступе к настройкам: «%s» (%s)',
+                               session.get('username'), request.path)
+            return 'Раздел доступен только администратору', 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+# Шаблоны проверяют роль теми же функциями, что и маршруты, — расхождение между
+# «что видно» и «что разрешено» становится невозможным.
+app.jinja_env.globals['is_admin'] = is_admin
+app.jinja_env.globals['current_user'] = current_user
+
+
+def _session_valid():
+    """Сессия жива: cookie действительна, запись сессии не отозвана и не истекла."""
+    if not session.get('logged_in'):
+        return False
+    if multi_user_auth():
+        # Проверка записи в базе даёт немедленный отзыв: выход, смена пароля,
+        # деактивация учётки или ручной отзыв в разделе пользователей.
+        return bool(session_store.resolve(session.get('sid'))) and current_user() is not None
+    auth = get_auth()
+    return bool(auth) and session.get('_auth_fingerprint') == auth_fingerprint(auth)
+
+
+# Страницы, доступные пользователю с обязательной сменой пароля
+PASSWORD_CHANGE_ALLOWED = {'/password', '/logout', '/login', '/favicon.ico', '/robots.txt'}
+
+
+@app.before_request
+def _enforce_session_policy():
+    """Обязательная смена пароля и правило «из интернета — только администратор»."""
+    if not multi_user_auth() or not session.get('logged_in'):
+        return None
+    if request.path in PASSWORD_CHANGE_ALLOWED or request.path.startswith('/static/'):
+        return None
+    if not _session_valid():
+        session.clear()
+        return redirect(url_for('login', next=request.url))
+
+    user = current_user()
+    if user is None:
+        session.clear()
+        return redirect(url_for('login', next=request.url))
+    if user['must_change_password']:
+        return redirect('/password')
+    if not remote_access_allowed(user) and LAN_HOST and request_is_external():
+        session_store.revoke(session.get('sid'))
+        session.clear()
+        return _login_page('Вход из интернета разрешён только администратору. '
+                           'Подключитесь к локальной сети.'), 403
+    return None
 
 
 def auth_fingerprint(auth):
@@ -2942,8 +3123,121 @@ def _login_csrf_input():
     token = session.setdefault('_csrf_token', secrets.token_urlsafe(32))
     return f'<input type="hidden" name="csrf_token" value="{token}">'
 
+LOGIN_STYLE = """body{font-family:'Segoe UI',Arial,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;background:#f4f4f9;margin:0}
+.box{background:white;padding:40px;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.1);width:320px;text-align:center}
+h2{color:#1e3a8a;margin-top:0}input{width:100%;padding:12px;margin:10px 0;border:1px solid #cbd5e1;border-radius:6px;font-size:14px;box-sizing:border-box}
+button{width:100%;padding:12px;background:#2563eb;color:white;border:none;border-radius:6px;cursor:pointer;font-size:15px;font-weight:600;margin-top:10px}
+button:hover{background:#1e3a8a}.error{color:#dc3545;font-size:14px;margin-bottom:10px}.notice{color:#475569;font-size:13px;margin-bottom:10px}"""
+
+
+def _login_page(error=None, notice=None):
+    message = f'<p class="error">{error}</p>' if error else ''
+    if notice:
+        message += f'<p class="notice">{notice}</p>'
+    page = ('<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>Вход - АЛЬБИОН</title><style>' + LOGIN_STYLE + '</style></head><body>'
+            '<div class="box"><h2>🔒 АЛЬБИОН: Вход</h2>' + message +
+            '<form method="post"><input name="username" placeholder="Логин" required autocomplete="username">'
+            '<input type="password" name="password" placeholder="Пароль" required autocomplete="current-password">'
+            '<button type="submit">Войти</button></form></div></body></html>')
+    return page.replace('<form method="post">', '<form method="post">' + _login_csrf_input())
+
+
+def _safe_next_page(default='/f/'):
+    """Защита от open redirect: только относительные пути внутри сайта."""
+    next_page = request.args.get('next', default)
+    if not next_page.startswith('/') or next_page.startswith('//'):
+        return default
+    return next_page
+
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    """Вход: персональные учётки в режиме SQLite, прежний администратор в json."""
+    if multi_user_auth():
+        return _login_multi_user()
+    return _login_legacy()
+
+
+def _login_multi_user():
+    ensure_users_ready()
+    if not user_store.list_users():
+        return ('<!DOCTYPE html><html lang="ru"><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width, initial-scale=1">'
+                '<title>Требуется настройка</title>'
+                '<h1>Вход отключён: учётных записей нет</h1>'
+                '<p>Создайте администратора командой '
+                '<code>venv/bin/python manage_users.py add-admin ЛОГИН</code> '
+                'и обновите страницу.</p></html>'), 503
+
+    if request.method == 'POST':
+        expected_csrf = session.get('_csrf_token')
+        provided_csrf = request.form.get('csrf_token', '')
+        if not expected_csrf or not hmac.compare_digest(expected_csrf, provided_csrf):
+            return 'CSRF-токен отсутствует или неверен', 400
+
+        login_name = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        user = user_store.get_user(login_name)
+
+        # Текст ошибки одинаков для «нет такого логина» и «неверный пароль»:
+        # иначе форма подсказывает, какие логины существуют.
+        if user is None:
+            app.logger.warning('Неудачная попытка входа: логин «%s» с %s', login_name, request.remote_addr)
+            return _login_page('Неверный логин или пароль')
+
+        if not user['active']:
+            app.logger.warning('Вход отклонён (учётка отключена): «%s» с %s', login_name, request.remote_addr)
+            return _login_page('Учётная запись отключена администратором')
+
+        if user_store.is_locked(user):
+            minutes = user_store.lock_remaining_minutes(user)
+            app.logger.warning('Вход отклонён (учётка заблокирована): «%s» с %s', login_name, request.remote_addr)
+            return _login_page(f'Учётная запись временно заблокирована, повторите через {minutes} мин'), 429
+
+        ok, needs_rehash = user_store.verify_password(user['password_hash'], password)
+        if not ok:
+            locked_until = user_store.register_failure(user['id'])
+            app.logger.warning('Неудачная попытка входа: логин «%s» с %s', login_name, request.remote_addr)
+            if locked_until:
+                return _login_page(
+                    f'Превышено число попыток. Учётная запись заблокирована на '
+                    f'{user_store.LOCK_MINUTES} мин'), 429
+            return _login_page('Неверный логин или пароль')
+
+        if not remote_access_allowed(user) and LAN_HOST and request_is_external():
+            app.logger.warning('Вход снаружи запрещён для «%s» с %s', login_name, request.remote_addr)
+            return _login_page('Вход из интернета разрешён только администратору. '
+                              'Подключитесь к локальной сети.')
+
+        rehash = user_store.hash_password(password) if needs_rehash else None
+        user_store.register_success(user['id'], rehash=rehash)
+
+        session.clear()
+        session.permanent = True
+        session['logged_in'] = True
+        session['user_id'] = user['id']
+        session['username'] = user['login']
+        session['role'] = user['role']
+        session['_csrf_token'] = secrets.token_urlsafe(32)
+        # Токен сессии: в базе лежит только его хэш, поэтому запись можно отозвать.
+        session['sid'] = session_store.create(
+            user['id'], role=user['role'], ip=request.remote_addr,
+            user_agent=request.headers.get('User-Agent'))
+        app.logger.info('Вход: «%s» (%s) с %s', user['login'], user['role'], request.remote_addr)
+        if user['must_change_password']:
+            return redirect('/password')
+        return redirect(_safe_next_page())
+
+    if _session_valid():
+        return redirect('/f/')
+    if session.get('logged_in'):
+        session.clear()
+    return _login_page()
+
+
+def _login_legacy():
     auth = get_auth()
     if auth is None:
         return '''<!DOCTYPE html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Требуется настройка</title>
@@ -3001,8 +3295,61 @@ def login():
 
 @app.route('/logout')
 def logout():
-    session.pop('logged_in', None)
+    if multi_user_auth():
+        session_store.revoke(session.get('sid'))
+    session.clear()
     return redirect('/login')
+
+
+@app.route('/password', methods=['GET', 'POST'])
+@login_required
+def change_own_password():
+    """Смена собственного пароля; при must_change_password поле текущего пароля не спрашиваем."""
+    user = current_user()
+    forced = bool(user and user['must_change_password'])
+    error = None
+    notice = None
+    if request.method == 'POST':
+        current = request.form.get('current_password', '')
+        new_password = request.form.get('new_password', '')
+        confirm = request.form.get('new_password_confirm', '')
+
+        if not forced:
+            ok, _ = user_store.verify_password(user['password_hash'], current)
+            if not ok:
+                error = 'Текущий пароль указан неверно'
+        if error is None and new_password != confirm:
+            error = 'Повтор нового пароля не совпадает'
+        if error is None and password_reuse(user, new_password):
+            error = 'Новый пароль совпадает с текущим'
+        if error is None:
+            problem = user_store.password_error(new_password)
+            if problem:
+                error = problem
+
+        if error is None:
+            try:
+                user_store.set_password(user['id'], new_password)
+                # Смена пароля завершает все прочие сессии этого пользователя.
+                current_record = session_store.resolve(session.get('sid'), touch=False)
+                session_store.revoke_all_for_user(
+                    user['id'], keep_session_id=current_record['id'] if current_record else None)
+                app.logger.info('Пароль изменён: «%s» с %s', user['login'], request.remote_addr)
+                session['logged_in'] = True
+                return redirect('/f/')
+            except user_store.UserError as exc:
+                error = str(exc)
+
+    return render_template_string(
+        PASSWORD_TEMPLATE, user=user, forced=forced, error=error, notice=notice,
+        csrf_token=session.get('_csrf_token', ''), admin=is_admin())
+
+
+def password_reuse(user, new_password):
+    if not user or not new_password:
+        return False
+    ok, _ = user_store.verify_password(user['password_hash'], new_password)
+    return ok
 
 @app.route('/')
 def index():
@@ -3160,7 +3507,7 @@ def browse_folder(folder_id=None):
         csrf_token=session.setdefault('_csrf_token', secrets.token_urlsafe(32)))
 
 @app.route('/settings', methods=['GET', 'POST'])
-@login_required
+@admin_required
 def settings_page():
     """Quota and credential settings, available only after admin login."""
     values = load_quota_settings()
@@ -3171,13 +3518,16 @@ def settings_page():
         form_username = request.form.get('username', '').strip()
         new_password = request.form.get('new_password', '')
         confirm_password = request.form.get('new_password_confirm', '')
-        if not form_username:
-            error = 'Логин не может быть пустым'
-        elif new_password or confirm_password:
-            if len(new_password) < 6:
-                error = 'Новый пароль должен быть не короче 6 символов'
-            elif new_password != confirm_password:
-                error = 'Повтор нового пароля не совпадает'
+        # В режиме SQLite учётные данные здесь не меняются: логины и пароли ведёт
+        # раздел «Пользователи», свой пароль пользователь меняет на /password.
+        if not multi_user_auth():
+            if not form_username:
+                error = 'Логин не может быть пустым'
+            elif new_password or confirm_password:
+                if len(new_password) < 6:
+                    error = 'Новый пароль должен быть не короче 6 символов'
+                elif new_password != confirm_password:
+                    error = 'Повтор нового пароля не совпадает'
         if error is None:
             try:
                 parsed = {}
@@ -3195,24 +3545,24 @@ def settings_page():
                 parsed['max_zip_files'] = max_files
                 parsed['export_all_internal_only'] = request.form.get('export_all_internal_only') == '1'
 
-                # Persist quotas and credentials together only after all validation.
                 save_quota_settings(parsed)
-                new_auth = {
-                    'username': form_username,
-                    'password_hash': (generate_password_hash(new_password)
-                                      if new_password else current_auth['password_hash']),
-                }
-                with DB_LOCK:
-                    _save_json(AUTH_FILE, new_auth)
-                try:
-                    os.chmod(AUTH_FILE, 0o600)
-                except OSError:
-                    pass
-                if form_username != current_auth.get('username') or new_password:
-                    session.clear()
-                app.logger.info(
-                    'Настройки изменены администратором; логин=%s; пароль_изменён=%s',
-                    form_username, bool(new_password))
+                if not multi_user_auth():
+                    # Режим JSON: единственный администратор правится здесь же.
+                    new_auth = {
+                        'username': form_username,
+                        'password_hash': (generate_password_hash(new_password)
+                                          if new_password else current_auth['password_hash']),
+                    }
+                    with DB_LOCK:
+                        _save_json(AUTH_FILE, new_auth)
+                    try:
+                        os.chmod(AUTH_FILE, 0o600)
+                    except OSError:
+                        pass
+                    if form_username != current_auth.get('username') or new_password:
+                        session.clear()
+                app.logger.info('Квоты изменены администратором «%s»',
+                                session.get('username') or 'admin')
                 return redirect('/settings?saved=1')
             except (TypeError, ValueError, OSError) as e:
                 error = f'Проверьте значения: {e}'
@@ -3222,6 +3572,7 @@ def settings_page():
         SETTINGS_TEMPLATE,
         values=values,
         auth_username=auth_username,
+        multi_user=multi_user_auth(),
         saved=request.args.get('saved') == '1',
         error=error,
         csrf_token=session.setdefault('_csrf_token', secrets.token_urlsafe(32)),
@@ -3319,13 +3670,13 @@ def _render_tokens_page(error=None, form=None, new_token=None,
 
 
 @app.route('/settings/tokens')
-@login_required
+@admin_required
 def tokens_page():
     return _render_tokens_page()
 
 
 @app.route('/settings/tokens/create', methods=['POST'])
-@login_required
+@admin_required
 def token_create():
     form = {
         'name': request.form.get('name', '').strip(),
@@ -3365,7 +3716,7 @@ def token_create():
 
 
 @app.route('/settings/tokens/revoke', methods=['POST'])
-@login_required
+@admin_required
 def token_revoke():
     token_id = request.form.get('token_id', '').strip()
     if not TOKEN_HASH_RE.fullmatch(token_id):
@@ -3386,6 +3737,413 @@ def token_revoke():
     app.logger.info('Отозван API-токен: имя=%s, hash=%s…',
                     removed['meta'].get('name', 'без имени'), token_id[:12])
     return redirect('/settings/tokens?revoked=1')
+
+
+# ===== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ (только администратор) =====
+
+PASSWORD_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Смена пароля - АЛЬБИОН</title>
+<style>
+    * { box-sizing: border-box; }
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #f4f4f9; margin: 0; }
+    .wrapper { max-width: 460px; margin: 60px auto; padding: 0 16px; }
+    .card { background: white; border-radius: 10px; padding: 28px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+    h1 { color: #1e3a8a; margin-top: 0; font-size: 20px; }
+    label { display: block; font-size: 13px; color: #334155; margin: 14px 0 4px; }
+    input { width: 100%; padding: 11px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; }
+    .hint { font-size: 12px; color: #64748b; margin-top: 4px; }
+    .error { background: #fee2e2; color: #991b1b; padding: 10px 12px; border-radius: 6px; font-size: 13px; }
+    .actions { display: flex; gap: 10px; margin-top: 20px; }
+    .btn { padding: 11px 18px; background: #2563eb; color: white; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; text-decoration: none; text-align: center; }
+    .btn-secondary { background: #e2e8f0; color: #334155; }
+</style>
+</head>
+<body>
+<div class="wrapper">
+    <div class="card">
+        <h1>🔒 {% if forced %}Задайте новый пароль{% else %}Смена пароля{% endif %}</h1>
+        {% if forced %}<p class="hint">Администратор выдал временный пароль — его нужно заменить.</p>{% endif %}
+        {% if error %}<p class="error">{{ error }}</p>{% endif %}
+        <form method="post" autocomplete="off">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            {% if not forced %}
+            <label>Текущий пароль</label>
+            <input type="password" name="current_password" autocomplete="current-password" required>
+            {% endif %}
+            <label>Новый пароль</label>
+            <input type="password" name="new_password" autocomplete="new-password" required>
+            <div class="hint">Не короче {{ min_length }} символов.</div>
+            <label>Повторите новый пароль</label>
+            <input type="password" name="new_password_confirm" autocomplete="new-password" required>
+            <div class="actions">
+                <button class="btn" type="submit">Сохранить пароль</button>
+                <a class="btn btn-secondary" href="/f/">← К файлам</a>
+            </div>
+        </form>
+    </div>
+</div>
+</body>
+</html>
+"""
+
+
+USERS_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Пользователи - АЛЬБИОН</title>
+<style>
+    * { box-sizing: border-box; }
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #f4f4f9; margin: 0; }
+    header { background: #1e3a8a; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    header h1 { font-size: 18px; margin: 0; }
+    .btn { padding: 9px 14px; background: #2563eb; color: white; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; text-decoration: none; display: inline-block; }
+    .btn-sm { padding: 6px 10px; font-size: 12px; }
+    .btn-secondary { background: #e2e8f0; color: #334155; }
+    .btn-danger { background: #dc2626; }
+    .main { max-width: 1100px; margin: 20px auto; padding: 0 16px 40px; display: flex; flex-direction: column; gap: 18px; }
+    .card { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+    .card h2 { font-size: 16px; color: #1e3a8a; margin-top: 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eef2f7; vertical-align: middle; }
+    th { color: #64748b; font-weight: 600; font-size: 12px; }
+    .muted { color: #94a3b8; font-size: 12px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .pill-admin { background: #dbeafe; color: #1e40af; }
+    .pill-user { background: #e2e8f0; color: #475569; }
+    .pill-off { background: #fee2e2; color: #991b1b; }
+    .error { background: #fee2e2; color: #991b1b; padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 12px; }
+    .notice { background: #dcfce7; color: #166534; padding: 10px 12px; border-radius: 6px; font-size: 13px; margin-bottom: 12px; }
+    .secret { font-family: monospace; background: #0f172a; color: #e2e8f0; padding: 10px 12px; border-radius: 6px; display: inline-block; margin: 6px 0; }
+    form.inline { display: inline; }
+    .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    label { display: block; font-size: 13px; color: #334155; margin: 10px 0 4px; }
+    input[type=text], input[type=password], select, textarea { width: 100%; padding: 9px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 13px; }
+    textarea { min-height: 110px; font-family: monospace; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+    .checkline { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; }
+    .checkline input { width: auto; }
+    .hint { font-size: 12px; color: #64748b; }
+</style>
+</head>
+<body>
+<header>
+    <h1>👥 Пользователи</h1>
+    <a href="/settings" class="btn btn-sm" style="margin-left:auto;background:rgba(255,255,255,.18);">⚙️ Настройки</a>
+    <a href="/settings/tokens" class="btn btn-sm" style="background:rgba(255,255,255,.18);">🔑 Токены</a>
+    <a href="/f/" class="btn btn-sm" style="background:rgba(255,255,255,.18);">← К файлам</a>
+    <a href="/logout" class="btn btn-sm" style="background:rgba(255,255,255,.18);">Выйти</a>
+</header>
+<div class="main">
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    {% if notice %}<div class="notice">{{ notice }}</div>{% endif %}
+    {% if new_secret %}
+    <div class="card" style="border-left:4px solid #16a34a;">
+        <h2>Пароль для «{{ new_secret.login }}»</h2>
+        <div class="hint">Показывается один раз — передайте пользователю и попросите сменить при входе.</div>
+        <div class="secret">{{ new_secret.password }}</div>
+    </div>
+    {% endif %}
+    {% if import_report %}
+    <div class="card">
+        <h2>Импорт из CSV</h2>
+        {% if import_report.created %}
+        <p>Создано учётных записей: <b>{{ import_report.created|length }}</b></p>
+        <table>
+            <tr><th>Логин</th><th>Роль</th><th>Временный пароль</th></tr>
+            {% for row in import_report.created %}
+            <tr><td>{{ row.login }}</td><td>{{ row.role }}</td>
+                <td>{% if row.password %}<span class="secret">{{ row.password }}</span>{% else %}<span class="muted">задан в файле</span>{% endif %}</td></tr>
+            {% endfor %}
+        </table>
+        {% endif %}
+        {% if import_report.errors %}
+        <p class="error" style="margin-top:12px;">Отклонённые строки:</p>
+        <ul style="font-size:13px;color:#991b1b;">
+            {% for line in import_report.errors %}<li>{{ line }}</li>{% endfor %}
+        </ul>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    <div class="card">
+        <h2>Учётные записи ({{ users|length }})</h2>
+        <table>
+            <tr>
+                <th>Логин</th><th>Имя</th><th>Роль</th><th>Состояние</th>
+                <th>Внешний вход</th><th>Вход</th><th>Действия</th>
+            </tr>
+            {% for u in users %}
+            <tr>
+                <td><b>{{ u.login }}</b>{% if u.must_change_password %}<div class="muted">сменит пароль при входе</div>{% endif %}</td>
+                <td>{{ u.display_name }}{% if u.email %}<div class="muted">{{ u.email }}</div>{% endif %}</td>
+                <td><span class="pill pill-{{ u.role }}">{{ role_titles[u.role] }}</span></td>
+                <td>{% if u.active %}<span class="pill pill-user">активна</span>{% else %}<span class="pill pill-off">отключена</span>{% endif %}
+                    {% if locked[u.id] %}<div class="muted">заблокирована</div>{% endif %}</td>
+                <td>{% if u.allow_remote %}разрешён{% else %}<span class="muted">только локальная сеть</span>{% endif %}</td>
+                <td class="muted">{{ u.last_login_at or '—' }}<div>{{ session_counts.get(u.id, 0) }} сессий</div></td>
+                <td>
+                    <div class="row-actions">
+                        <form class="inline" method="post" action="/settings/users/update">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <input type="hidden" name="user_id" value="{{ u.id }}">
+                            <input type="hidden" name="action" value="{{ 'deactivate' if u.active else 'activate' }}">
+                            <button class="btn btn-sm btn-secondary" type="submit">{{ 'Отключить' if u.active else 'Включить' }}</button>
+                        </form>
+                        <form class="inline" method="post" action="/settings/users/update">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <input type="hidden" name="user_id" value="{{ u.id }}">
+                            <input type="hidden" name="action" value="{{ 'to_user' if u.role == 'admin' else 'to_admin' }}">
+                            <button class="btn btn-sm btn-secondary" type="submit">{{ 'Сделать пользователем' if u.role == 'admin' else 'Сделать админом' }}</button>
+                        </form>
+                        <form class="inline" method="post" action="/settings/users/update">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <input type="hidden" name="user_id" value="{{ u.id }}">
+                            <input type="hidden" name="action" value="{{ 'deny_remote' if u.allow_remote else 'allow_remote' }}">
+                            <button class="btn btn-sm btn-secondary" type="submit">{{ 'Запретить снаружи' if u.allow_remote else 'Разрешить снаружи' }}</button>
+                        </form>
+                        <form class="inline" method="post" action="/settings/users/reset">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <input type="hidden" name="user_id" value="{{ u.id }}">
+                            <button class="btn btn-sm" type="submit">Сбросить пароль</button>
+                        </form>
+                        <form class="inline" method="post" action="/settings/users/revoke">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <input type="hidden" name="user_id" value="{{ u.id }}">
+                            <button class="btn btn-sm btn-secondary" type="submit">Завершить сессии</button>
+                        </form>
+                        <form class="inline" method="post" action="/settings/users/delete"
+                              onsubmit="return confirm('Удалить учётную запись и её сессии?');">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <input type="hidden" name="user_id" value="{{ u.id }}">
+                            <button class="btn btn-sm btn-danger" type="submit">Удалить</button>
+                        </form>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>Новая учётная запись</h2>
+        <form method="post" action="/settings/users/create" autocomplete="off">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="grid">
+                <div>
+                    <label>Логин</label>
+                    <input type="text" name="login" required placeholder="ivan">
+                    <div class="hint">3–64 символа: латиница, цифры, . _ @ + -</div>
+                </div>
+                <div>
+                    <label>Имя</label>
+                    <input type="text" name="display_name" placeholder="Иван Петров">
+                </div>
+                <div>
+                    <label>Роль</label>
+                    <select name="role">
+                        <option value="user">Пользователь</option>
+                        <option value="admin">Администратор</option>
+                    </select>
+                </div>
+                <div>
+                    <label>Пароль</label>
+                    <input type="text" name="password" placeholder="оставьте пустым — сгенерируется">
+                    <div class="hint">Не короче {{ min_length }} символов</div>
+                </div>
+            </div>
+            <label class="checkline"><input type="checkbox" name="allow_remote" value="1"> Разрешить вход из интернета</label>
+            <div class="actions" style="margin-top:16px;">
+                <button class="btn" type="submit">Создать</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>Импорт из CSV</h2>
+        <div class="hint">Колонки: <code>login</code>, <code>display_name</code>, <code>role</code>, <code>allow_remote</code>, <code>password</code>.
+            Обязательна только <code>login</code>; пустой пароль означает «сгенерировать».</div>
+        <form method="post" action="/settings/users/import">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label>Вставьте содержимое CSV</label>
+            <textarea name="csv_text" placeholder="login;display_name;role;allow_remote&#10;ivan;Иван Петров;user;да"></textarea>
+            <div class="actions" style="margin-top:12px;">
+                <button class="btn" type="submit">Импортировать</button>
+            </div>
+        </form>
+    </div>
+</div>
+</body>
+</html>
+"""
+
+
+def _render_users_page(error=None, notice=None, import_report=None, new_secret=None, status=200):
+    users = user_store.list_users()
+    counts = {}
+    for record in session_store.list_active():
+        counts[record['user_id']] = counts.get(record['user_id'], 0) + 1
+    body = render_template_string(
+        USERS_TEMPLATE,
+        users=users,
+        locked={user['id']: user_store.is_locked(user) for user in users},
+        session_counts=counts,
+        role_titles=user_store.ROLE_TITLES,
+        min_length=user_store.MIN_PASSWORD_LENGTH,
+        csrf_token=session.setdefault('_csrf_token', secrets.token_urlsafe(32)),
+        error=error,
+        notice=notice,
+        import_report=import_report,
+        new_secret=new_secret,
+    )
+    return body, status
+
+
+@app.route('/settings/users')
+@admin_required
+def users_page():
+    if not multi_user_auth():
+        return _render_users_page(
+            error='Управление пользователями доступно в режиме ALBION_METADATA_BACKEND=sqlite.', status=400)
+    pending = session.pop('_users_secret', None)
+    report = session.pop('_users_import', None)
+    return _render_users_page(new_secret=pending, import_report=report,
+                              notice=request.args.get('saved') == '1' and 'Сохранено.' or None)
+
+
+@app.route('/settings/users/create', methods=['POST'])
+@admin_required
+def user_create():
+    if not multi_user_auth():
+        return _render_users_page(error='Режим JSON: управление пользователями недоступно.', status=400)
+    login_name = request.form.get('login', '').strip()
+    password = request.form.get('password', '')
+    role = request.form.get('role', 'user')
+    generated = False
+    if not password:
+        password = user_store.generate_password()
+        generated = True
+    try:
+        user = user_store.create_user(
+            login_name, password, role=role,
+            display_name=request.form.get('display_name') or None,
+            allow_remote=request.form.get('allow_remote') == '1',
+            must_change_password=generated)
+    except user_store.UserError as exc:
+        return _render_users_page(error=str(exc), status=400)
+    app.logger.info('Создана учётная запись «%s» (%s) администратором «%s»',
+                    user['login'], user['role'], session.get('username'))
+    if generated:
+        session['_users_secret'] = {'login': user['login'], 'password': password}
+    return redirect('/settings/users?saved=1')
+
+
+@app.route('/settings/users/update', methods=['POST'])
+@admin_required
+def user_update():
+    if not multi_user_auth():
+        return _render_users_page(error='Режим JSON: управление пользователями недоступно.', status=400)
+    user_id = request.form.get('user_id', '')
+    action = request.form.get('action', '')
+    actions = {
+        'activate': {'active': True},
+        'deactivate': {'active': False},
+        'to_admin': {'role': 'admin'},
+        'to_user': {'role': 'user'},
+        'allow_remote': {'allow_remote': True},
+        'deny_remote': {'allow_remote': False},
+    }
+    if action not in actions:
+        return _render_users_page(error='Неизвестное действие.', status=400)
+    try:
+        user = user_store.update_user(user_id, **actions[action])
+    except user_store.UserError as exc:
+        return _render_users_page(error=str(exc), status=400)
+    if action == 'deactivate' or action == 'to_user' or action == 'deny_remote':
+        # Изменение прав немедленно завершает уже открытые сессии этой учётки.
+        session_store.revoke_all_for_user(user['id'])
+    app.logger.info('Учётная запись «%s» изменена (%s) администратором «%s»',
+                    user['login'], action, session.get('username'))
+    return redirect('/settings/users?saved=1')
+
+
+@app.route('/settings/users/reset', methods=['POST'])
+@admin_required
+def user_reset_password():
+    if not multi_user_auth():
+        return _render_users_page(error='Режим JSON: управление пользователями недоступно.', status=400)
+    user = user_store.get_user_by_id(request.form.get('user_id', ''))
+    if not user:
+        return _render_users_page(error='Учётная запись не найдена.', status=404)
+    password = user_store.generate_password()
+    try:
+        user_store.set_password(user['id'], password, must_change=True)
+    except user_store.UserError as exc:
+        return _render_users_page(error=str(exc), status=400)
+    session_store.revoke_all_for_user(user['id'])
+    session['_users_secret'] = {'login': user['login'], 'password': password}
+    app.logger.info('Пароль «%s» сброшен администратором «%s»', user['login'], session.get('username'))
+    return redirect('/settings/users?saved=1')
+
+
+@app.route('/settings/users/revoke', methods=['POST'])
+@admin_required
+def user_revoke_sessions():
+    user = user_store.get_user_by_id(request.form.get('user_id', ''))
+    if not user:
+        return _render_users_page(error='Учётная запись не найдена.', status=404)
+    revoked = session_store.revoke_all_for_user(user['id'])
+    app.logger.info('Завершены сессии «%s» (%d) администратором «%s»',
+                    user['login'], revoked, session.get('username'))
+    return _render_users_page(notice=f'Завершено сессий: {revoked}.')
+
+
+@app.route('/settings/users/delete', methods=['POST'])
+@admin_required
+def user_delete():
+    if not multi_user_auth():
+        return _render_users_page(error='Режим JSON: управление пользователями недоступно.', status=400)
+    user = user_store.get_user_by_id(request.form.get('user_id', ''))
+    if not user:
+        return _render_users_page(error='Учётная запись не найдена.', status=404)
+    if user['id'] == (current_user() or {}).get('id'):
+        return _render_users_page(error='Нельзя удалить учётную запись, под которой вы работаете.', status=400)
+    try:
+        user_store.delete_user(user['id'])
+    except user_store.UserError as exc:
+        return _render_users_page(error=str(exc), status=400)
+    session_store.revoke_all_for_user(user['id'])
+    app.logger.info('Учётная запись «%s» удалена администратором «%s»',
+                    user['login'], session.get('username'))
+    return redirect('/settings/users?saved=1')
+
+
+@app.route('/settings/users/import', methods=['POST'])
+@admin_required
+def users_import():
+    if not multi_user_auth():
+        return _render_users_page(error='Режим JSON: управление пользователями недоступно.', status=400)
+    text = request.form.get('csv_text', '')
+    uploaded = request.files.get('csv_file')
+    if uploaded and uploaded.filename:
+        try:
+            text = uploaded.read().decode('utf-8-sig', errors='replace')
+        except (OSError, UnicodeDecodeError) as exc:
+            return _render_users_page(error=f'Файл не прочитан: {exc}', status=400)
+    try:
+        created, errors = user_store.import_csv(text)
+    except user_store.UserError as exc:
+        return _render_users_page(error=str(exc), status=400)
+    app.logger.info('Импорт CSV: создано %d, отклонено %d (администратор «%s»)',
+                    len(created), len(errors), session.get('username'))
+    return _render_users_page(import_report={'created': created, 'errors': errors})
 
 
 @app.route('/d/<folder_ref>')
@@ -4546,11 +5304,16 @@ def export_all():
     quota_settings = load_quota_settings()
     if quota_settings.get('export_all_internal_only', True):
         client_addr = request.remote_addr or ''
-        current_auth = get_auth() or {}
-        has_valid_admin_session = bool(
-            session.get('logged_in') and current_auth
-            and session.get('_auth_fingerprint') == auth_fingerprint(current_auth)
-        )
+        if multi_user_auth():
+            # Решение принимается по роли, а не по адресу: администратор может
+            # выгрузить архив и из интернета, обычный пользователь — нет.
+            has_valid_admin_session = bool(session.get('logged_in') and is_admin())
+        else:
+            current_auth = get_auth() or {}
+            has_valid_admin_session = bool(
+                session.get('logged_in') and current_auth
+                and session.get('_auth_fingerprint') == auth_fingerprint(current_auth)
+            )
         peer_addr = request.environ.get('werkzeug.proxy_fix.orig', {}).get('REMOTE_ADDR', client_addr)
         peer_is_loopback = peer_addr in {'127.0.0.1', '::1', '::ffff:127.0.0.1'}
         trusted_lan_client = bool(_PRIVATE_RE.match(client_addr)) and (
@@ -4764,14 +5527,41 @@ if TRUST_PROXY:
     # Trust exactly one proxy hop, and ignore forwarded headers from any other peer.
     app.wsgi_app = trusted_proxy_middleware(app.wsgi_app)
 
+def start_lan_listener():
+    """Поднять второй слушатель для локальной сети (если задан ALBION_LAN_HOST).
+
+    Тоннель подключается к loopback, офисные пользователи — напрямую к адресу
+    локальной сети. По этому признаку различаются «внешний» и «локальный» клиент.
+    """
+    if not LAN_HOST:
+        return None
+
+    def run():
+        try:
+            serve(app, host=LAN_HOST, port=LAN_PORT, threads=8,
+                  max_request_body_size=1024 * 1024 * 1024 * 1024,
+                  channel_timeout=300)
+        except Exception:
+            app.logger.exception('Локальный слушатель %s:%s не запустился', LAN_HOST, LAN_PORT)
+
+    thread = threading.Thread(target=run, name='waitress-lan', daemon=True)
+    thread.start()
+    return thread
+
+
 if __name__ == '__main__':
+    port = int(os.environ.get('ALBION_PORT', '5000'))
     print("=" * 60)
     print("АЛЬБИОН: Файловый сервер с каталогами")
-    print(f"Локально: http://127.0.0.1:5000")
+    print(f"Тоннель/локально: http://{APP_HOST}:{port}")
+    if LAN_HOST:
+        print(f"Локальная сеть:   http://{LAN_HOST}:{LAN_PORT}")
+    print(f"Учётные записи:   {'SQLite (роли и сессии)' if multi_user_auth() else 'JSON (один админ)'}")
     print("=" * 60)
+    start_lan_listener()
     serve(app,
           host=APP_HOST,
-          port=int(os.environ.get('ALBION_PORT', '5000')),
+          port=port,
           threads=8,
           # Transport ceiling; the admin-configurable per-request limit is lower.
           max_request_body_size=1024 * 1024 * 1024 * 1024,

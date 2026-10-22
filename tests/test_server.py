@@ -123,6 +123,16 @@ class ServerSmokeTests(unittest.TestCase):
     def test_default_auth_bootstrap(self):
         os.remove(server.AUTH_FILE)
         page = self.anon.get('/login')
+        if metadata_store.sqlite_enabled():
+            # Режим SQLite: стартовая учётка с известным паролем не создаётся (F-01),
+            # вход закрыт до `manage_users.py add-admin`.
+            conn = metadata_store.connect()
+            conn.execute('DELETE FROM sessions')
+            conn.execute('DELETE FROM users')
+            page = self.anon.get('/login')
+            self.assertEqual(page.status_code, 503)
+            self.assertFalse(os.path.exists(server.AUTH_FILE))
+            return
         self.assertEqual(page.status_code, 200)
         self.assertTrue(os.path.exists(server.AUTH_FILE))
         token = re.search(rb'name="csrf_token" value="([^"]+)"', page.data).group(1).decode()
@@ -322,6 +332,9 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertIn('Проверьте значения', invalid.get_data(as_text=True))
 
     def test_settings_changes_admin_password(self):
+        if metadata_store.sqlite_enabled():
+            self.skipTest('в режиме SQLite пароли ведёт раздел пользователей, '
+                          'а свой пароль меняется на /password (см. tests/test_users.py)')
         stale_client = server.app.test_client()
         page = stale_client.get('/login')
         stale_token = re.search(rb'name="csrf_token" value="([^"]+)"', page.data).group(1).decode()
@@ -355,6 +368,9 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertEqual(stale_client.get('/f/').status_code, 302)
 
     def test_external_auth_file_change_invalidates_existing_session(self):
+        if metadata_store.sqlite_enabled():
+            self.skipTest('в режиме SQLite учётные данные живут в таблице users; '
+                          'отзыв сессий проверяется в tests/test_users.py')
         self.login()
         old_auth = server.get_auth()
         server._save_json(server.AUTH_FILE, {

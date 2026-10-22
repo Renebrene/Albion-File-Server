@@ -28,13 +28,22 @@
 | Метод/путь | Доступ | Описание |
 |---|---|---|
 | `GET /` | публичный | Перенаправляет на `/f/` |
-| `GET /login` | публичный | Форма входа |
-| `POST /login` | публичный | Параметры формы: `username`, `password`; безопасный относительный `next` |
-| `GET /logout` | сессия | Удаляет флаг входа и перенаправляет на логин |
+| `GET /login` | публичный | Форма входа. В режиме SQLite без учётных записей отдаёт 503 с подсказкой про `manage_users.py add-admin` |
+| `POST /login` | публичный | Параметры формы: `username`, `password`; безопасный относительный `next`. При 10 неудачных попытках учётка блокируется на 15 минут (429), ответ «неверный логин или пароль» одинаков для несуществующего логина и неверного пароля |
+| `GET /logout` | сессия | Отзывает серверную сессию и перенаправляет на логин |
+| `GET /password` | сессия | Смена собственного пароля; при обязательной смене текущий пароль не запрашивается |
+| `POST /password` | сессия + CSRF | Новый пароль: `current_password`, `new_password`, `new_password_confirm`. Прочие сессии учётки отзываются |
+| `GET /settings/users` | админ | Управление учётными записями: список, роли, состояние, счётчик сессий |
+| `POST /settings/users/create` | админ + CSRF | Создать учётку (`login`, `display_name`, `role`, `password`, `allow_remote`); пустой пароль — сгенерировать временный и показать один раз |
+| `POST /settings/users/update` | админ + CSRF | Действия `activate`/`deactivate`, `to_admin`/`to_user`, `allow_remote`/`deny_remote`; понижение прав и запрет внешнего входа завершают сессии учётки |
+| `POST /settings/users/reset` | админ + CSRF | Сбросить пароль (временный показывается один раз, смена обязательна, сессии отозваны) |
+| `POST /settings/users/revoke` | админ + CSRF | Завершить все сессии указанной учётки |
+| `POST /settings/users/delete` | админ + CSRF | Удалить учётку и её сессии; последнего администратора и себя удалить нельзя |
+| `POST /settings/users/import` | админ + CSRF | Импорт CSV (`csv_text` или файл `csv_file`); обязательна колонка `login`, отчёт об отклонённых строках |
 | `GET /f/` | сессия | Корень проводника; query: `q`, `ext`, `sort`, `per_page` (25/50/100), `page`, `view` (table/grid/list) |
 | `GET /f/<folder_id>` | сессия | Содержимое папки в админке; те же фильтр/сортировка и активное представление; `page` используется lazy-загрузкой |
-| `GET /settings` | сессия | Форма квот; только администратор |
-| `POST /settings` | сессия + CSRF | Сохранить `max_upload_gb`, `storage_quota_gb`, `min_free_gb`, `max_zip_gb`, `max_zip_files` в `settings.json` |
+| `GET /settings` | админ | Форма квот; роль `user` получает 403 |
+| `POST /settings` | админ + CSRF | Сохранить `max_upload_gb`, `storage_quota_gb`, `min_free_gb`, `max_zip_gb`, `max_zip_files`. В режиме SQLite учётные данные здесь не меняются — ими управляет раздел пользователей |
 | `GET /settings/tokens` | сессия | Админская страница API-токенов и их срока действия |
 | `POST /settings/tokens/create` | сессия + CSRF | Создать токен; секрет показывается один раз |
 | `POST /settings/tokens/revoke` | сессия + CSRF | Отозвать токен по полному hash-id |

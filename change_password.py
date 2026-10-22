@@ -7,6 +7,11 @@ from werkzeug.security import generate_password_hash
 DATA_DIR = os.environ.get('ALBION_DATA_DIR', '.')
 AUTH_FILE = os.path.join(DATA_DIR, 'auth.json')
 
+if os.environ.get('ALBION_METADATA_BACKEND', 'json').strip().lower() == 'sqlite':
+    print("Внимание: включён режим SQLite — учётные данные здесь не используются.")
+    print("Создание и смена паролей: python manage_users.py (см. manage_users.py --help).")
+    raise SystemExit(1)
+
 print("=== Смена учетных данных АЛЬБИОН ===")
 username = input("Введите новый логин: ").strip()
 password = getpass.getpass("Введите новый пароль: ")

@@ -123,6 +123,37 @@ systemctl --user enable --now albion-backup.timer
 systemctl --user list-timers albion-backup.timer
 ```
 
+## Пользователи и локальный доступ
+
+```bash
+# Первый администратор (стартовый пароль больше не создаётся)
+venv/bin/python manage_users.py add-admin админ
+# Остальные учётные записи: вручную, из CSV или через /settings/users
+venv/bin/python manage_users.py add ivan --name "Иван Петров"
+venv/bin/python manage_users.py import users.csv
+venv/bin/python manage_users.py list
+```
+
+Существующий `auth.json` переносится в таблицу `users` автоматически при первой попытке
+входа: логин и пароль остаются прежними. Проверить перенос заранее можно командой
+`venv/bin/python manage_users.py migrate`.
+
+Локальный слушатель задаётся в unit-файле:
+
+```ini
+Environment="ALBION_LAN_HOST=192.168.1.7"
+Environment="ALBION_LAN_PORT=5000"
+```
+
+После этого офисные пользователи работают по `http://192.168.1.7:5000` напрямую, а через
+тоннель идут только внешние запросы. Пока переменная не задана, правило «из интернета
+входит только администратор» и флаг `allow_remote` не применяются — различать клиентов
+нечем. Если локальный адрес изменится, обновите значение в unit и перезапустите службу.
+
+Откат этапа 2: метаданные остаются в базе, но вход можно вернуть к прежней схеме, убрав
+`ALBION_METADATA_BACKEND=sqlite`. Тогда снова действует единственный администратор из
+`auth.json`, а учётные записи в базе сохраняются и продолжат работать при возврате флага.
+
 ## Мониторинг/лимиты
 
 - `albion.log` ротируется 5 MiB × 3; systemd вывод также доступен через `journalctl -u albion-files`.
