@@ -246,7 +246,12 @@ FOLDERS_DB_FILE = os.path.join(DATA_DIR, 'folders_db.json')
 TOKENS_FILE = os.path.join(DATA_DIR, 'tokens.json')
 ZIPLINKS_DIR = os.path.join(DATA_DIR, 'ziplinks')
 THUMBNAIL_DIR = os.path.join(DATA_DIR, 'thumbnails')
-THUMBNAIL_SIZES = {'mini': 160, 'medium': 480}
+# Размеры превью подобраны по фактической вёрстке (замер в браузере):
+# mini рисуется 24–32 px (список, публичная страница) — 96 px покрывает DPR3;
+# medium рисуется ~180 px в плитке десктопа и до 320 px на телефоне — 384 px
+# даёт запас на DPR2 без лишнего веса.
+THUMBNAIL_SIZES = {'mini': 96, 'medium': 384}
+THUMBNAIL_QUALITY = 80
 THUMBNAIL_LOCK = threading.Lock()
 
 ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'zip', 'rar',
@@ -495,7 +500,10 @@ def ensure_thumbnail(record, size):
         return None
     max_edge = THUMBNAIL_SIZES[size]
     safe_id = re.sub(r'[^A-Za-z0-9_-]', '_', str(record.get('access_id', 'file')))
-    cache_path = os.path.join(THUMBNAIL_DIR, f'{safe_id}-{size}.webp')
+    # Размер и качество входят в имя файла: после смены параметров старый кэш
+    # не отдаётся как актуальный, а просто перестаёт использоваться.
+    cache_path = os.path.join(
+        THUMBNAIL_DIR, f'{safe_id}-{size}-{max_edge}-q{THUMBNAIL_QUALITY}.webp')
     try:
         source_mtime = os.path.getmtime(source)
         if os.path.isfile(cache_path) and os.path.getmtime(cache_path) >= source_mtime:
@@ -518,7 +526,7 @@ def ensure_thumbnail(record, size):
                 image = image.convert('RGBA' if has_alpha else 'RGB')
                 tmp_path = os.path.join(THUMBNAIL_DIR, f'.{uuid.uuid4()}.tmp')
                 try:
-                    image.save(tmp_path, 'WEBP', quality=82, method=6)
+                    image.save(tmp_path, 'WEBP', quality=THUMBNAIL_QUALITY, method=6)
                     os.replace(tmp_path, cache_path)
                 finally:
                     if os.path.exists(tmp_path):

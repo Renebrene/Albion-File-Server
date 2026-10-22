@@ -575,20 +575,56 @@ class ServerSmokeTests(unittest.TestCase):
         }, content_type='multipart/form-data')
         self.assertEqual(response.status_code, 200)
         record = next(iter(server.load_db().values()))
-        expected = {'mini': (160, 120), 'medium': (480, 360)}
-        for size, dimensions in expected.items():
+        # Ожидаемый размер считаем из настроек: тест не должен ломаться при
+        # подборе чисел, но обязан ловить расхождение «обещали — отдали».
+        for size, edge in server.THUMBNAIL_SIZES.items():
             thumb = self.anon.get(f"/thumb/{size}/{record['access_id']}")
             self.assertEqual(thumb.status_code, 200)
             self.assertEqual(thumb.mimetype, 'image/webp')
             with Image.open(io.BytesIO(thumb.data)) as rendered:
-                self.assertEqual(rendered.size, dimensions)
+                self.assertEqual(rendered.size, (edge, round(edge * 600 / 800)))
+                self.assertLessEqual(max(rendered.size), edge)
             thumb.close()
+        cached = os.listdir(server.THUMBNAIL_DIR)
+        for size, edge in server.THUMBNAIL_SIZES.items():
+            marker = f'-{size}-{edge}-q{server.THUMBNAIL_QUALITY}.webp'
+            self.assertTrue(any(name.endswith(marker) for name in cached),
+                            f'в кэше нет файла с параметрами {marker}: {cached}')
         self.assertEqual(server.load_db()[record['access_id']].get('view_count', 0), 0)
 
         view = self.anon.get('/v/' + record['physical_path'])
         self.assertEqual(view.status_code, 200)
         view.close()
         self.assertEqual(server.load_db()[record['access_id']].get('view_count', 0), 1)
+
+    def test_thumbnail_cache_ignores_stale_files_after_param_change(self):
+        """Смена размера или качества не должна отдавать старый файл из кэша."""
+        from PIL import Image
+        for entry in os.listdir(server.THUMBNAIL_DIR):
+            os.remove(os.path.join(server.THUMBNAIL_DIR, entry))
+        image = io.BytesIO()
+        Image.new('RGB', (800, 600), (200, 120, 60)).save(image, 'PNG')
+        image.seek(0)
+        self.login()
+        self.client.post('/upload', data={'count': '1', 'file_0': (image, 'stale.png')},
+                         content_type='multipart/form-data')
+        record = next(iter(server.load_db().values()))
+        first = self.anon.get(f"/thumb/mini/{record['access_id']}")
+        first.close()
+        before = set(os.listdir(server.THUMBNAIL_DIR))
+
+        old_quality = server.THUMBNAIL_QUALITY
+        server.THUMBNAIL_QUALITY = 55
+        try:
+            second = self.anon.get(f"/thumb/mini/{record['access_id']}")
+            self.assertEqual(second.status_code, 200)
+            with Image.open(io.BytesIO(second.data)) as rendered:
+                self.assertEqual(max(rendered.size), server.THUMBNAIL_SIZES['mini'])
+            second.close()
+        finally:
+            server.THUMBNAIL_QUALITY = old_quality
+        after = set(os.listdir(server.THUMBNAIL_DIR))
+        self.assertGreater(len(after - before), 0, 'превью с новыми параметрами не создалось')
 
     def test_public_folder_slug_and_uuid(self):
         self.login()
