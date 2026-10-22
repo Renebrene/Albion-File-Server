@@ -753,7 +753,13 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertEqual(limited.status_code, 429)
         limited.close()
 
-    def test_export_all_rejects_spoofed_private_forwarded_ip(self):
+    def test_export_all_requires_lan_only_for_direct_lan_clients(self):
+        """Полный экспорт: LAN-право даёт прямой клиент локальной сети, а не тоннель.
+
+        Раньше запрос от доверенного прокси (тоннеля) получал LAN-исключение —
+        то есть любой внешний посетитель мог выгрузить весь архив. Теперь
+        тоннель считается внешним клиентом независимо от его forwarded-адреса.
+        """
         original_wsgi = server.app.wsgi_app
         original_trust = server.TRUST_PROXY
         original_peers = server.TRUSTED_PROXY_IPS
@@ -761,17 +767,25 @@ class ServerSmokeTests(unittest.TestCase):
             server.TRUST_PROXY = True
             server.TRUSTED_PROXY_IPS = ('127.0.0.1',)
             server.app.wsgi_app = server.trusted_proxy_middleware(original_wsgi)
-            client = server.app.test_client()
-            client.environ_base['REMOTE_ADDR'] = '203.0.113.5'
-            denied = client.get('/export_all', headers={'X-Forwarded-For': '10.0.0.7'})
-            self.assertEqual(denied.status_code, 403)
-            denied.close()
-
-            # A request genuinely received from the trusted local proxy may use the LAN allowance.
-            client.environ_base['REMOTE_ADDR'] = '127.0.0.1'
             server._save_json(server.DB_FILE, {})
-            local = client.get('/export_all', headers={'X-Forwarded-For': '10.0.0.7'})
-            self.assertEqual(local.status_code, 404)  # authorized; no files in fixture
+            client = server.app.test_client()
+
+            # Подставленный приватный XFF от недоверенного соседа
+            client.environ_base['REMOTE_ADDR'] = '203.0.113.5'
+            spoofed = client.get('/export_all', headers={'X-Forwarded-For': '10.0.0.7'})
+            self.assertEqual(spoofed.status_code, 403)
+            spoofed.close()
+
+            # Запрос через доверенный прокси (тоннель) — тоже внешний клиент
+            client.environ_base['REMOTE_ADDR'] = '127.0.0.1'
+            from_tunnel = client.get('/export_all', headers={'X-Forwarded-For': '10.0.0.7'})
+            self.assertEqual(from_tunnel.status_code, 403)
+            from_tunnel.close()
+
+            # Прямой клиент локальной сети — допускается (404: в фикстуре нет файлов)
+            client.environ_base['REMOTE_ADDR'] = '192.168.1.20'
+            local = client.get('/export_all')
+            self.assertEqual(local.status_code, 404)
             local.close()
         finally:
             server.app.wsgi_app = original_wsgi

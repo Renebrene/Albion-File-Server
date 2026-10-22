@@ -203,18 +203,54 @@ DB_LOCK = threading.Lock()
 UPLOAD_LOCK = threading.Lock()
 
 # ===== RATE LIMITING =====
-# Локальные адреса (LAN/localhost) не лимитируем — лимит нужен против роботов из интернета.
-# Если key_func вернёт None, flask-limiter пропускает запрос без учёта.
-_PRIVATE_RE = re.compile(r'^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1|localhost)')
+# Локальная сеть не ограничивается: лимит нужен против роботов из интернета.
+# Запрос из тоннеля приходит с loopback-соседом, поэтому ключом лимита служит
+# настоящий адрес клиента (при доверии forwarded-заголовкам), а не адрес тоннеля.
+# Учёт запроса отключается флагом deduct_when, а не пустым ключом: пустой ключ
+# заставлял flask-limiter писать ошибку в лог на каждый запрос из локальной сети.
 
-def _rate_limit_key():
-    addr = get_remote_address()
-    return None if (not addr or _PRIVATE_RE.match(addr)) else addr
+
+# Сети, которые считаются локальными. Проверка перечислением, а не по
+# «приватности» в терминах Python: ipaddress.is_private возвращает True и для
+# документационных диапазонов (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24),
+# а также для CGNAT — путать их с офисной сетью нельзя.
+_LAN_NETWORKS = tuple(ipaddress.ip_network(network) for network in (
+    '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8',
+    '169.254.0.0/16', 'fc00::/7', 'fe80::/10', '::1/128',
+))
+
+
+def _address_is_lan(address):
+    """Адрес принадлежит локальной сети (или самой машине)."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return any(ip in network for network in _LAN_NETWORKS)
+
+
+def rate_limit_key():
+    """Ключ лимита — настоящий адрес клиента (после доверенного прокси — его)."""
+    return request.remote_addr or 'unknown'
+
+
+def rate_limit_applies():
+    """Считать ли запрос в лимитах: только для клиентов из интернета."""
+    peer = request.environ.get('REMOTE_ADDR', '')
+    if _address_is_lan(peer):
+        # Прямой запрос из локальной сети — не ограничиваем. Запрос от тоннеля
+        # тоже приходит с приватного адреса (loopback), но его ограничивать нужно.
+        return is_trusted_proxy_peer(peer)
+    return True
+
 
 limiter = Limiter(
-    key_func=_rate_limit_key,
+    key_func=rate_limit_key,
     app=app,
     default_limits=["100 per hour", "20 per minute"],
+    default_limits_deduct_when=lambda response: rate_limit_applies(),
     storage_uri=RATE_LIMIT_STORAGE_URI
 )
 
@@ -3097,7 +3133,9 @@ def is_trusted_proxy_peer(peer_addr):
 
 
 def trusted_proxy_middleware(app_wsgi):
-    proxy_app = ProxyFix(app_wsgi, x_for=1, x_proto=1)
+    # x_for — настоящий адрес клиента, x_proto — схема (у тоннеля https),
+    # x_host — публичное имя: от него зависят абсолютные ссылки в ответах.
+    proxy_app = ProxyFix(app_wsgi, x_for=1, x_proto=1, x_host=1)
 
     def wrapped(environ, start_response):
         if is_trusted_proxy_peer(environ.get('REMOTE_ADDR', '')):
@@ -3153,8 +3191,13 @@ def _safe_next_page(default='/f/'):
 
 
 @app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("10 per minute", deduct_when=lambda response: rate_limit_applies())
 def login():
-    """Вход: персональные учётки в режиме SQLite, прежний администратор в json."""
+    """Вход: персональные учётки в режиме SQLite, прежний администратор в json.
+
+    Частота попыток ограничена для внешних клиентов; дополнительно учётка
+    блокируется после 10 неудачных попыток.
+    """
     if multi_user_auth():
         return _login_multi_user()
     return _login_legacy()
@@ -4147,7 +4190,7 @@ def users_import():
 
 
 @app.route('/d/<folder_ref>')
-@limiter.limit("60 per minute")
+@limiter.limit("60 per minute", deduct_when=lambda response: rate_limit_applies())
 def public_folder(folder_ref):
     """Публичный просмотр папки: по короткой ссылке (слагу) или по uuid.
     Без логина: скачивание в проекте публичное, ссылка лишь открывает доступ
@@ -4694,7 +4737,8 @@ def thumbnail_file(size, file_id):
 
 
 @app.route('/v/<path:filepath>')
-@limiter.limit("200 per minute", deduct_when=lambda response: g.get('api_key') is None)
+@limiter.limit("200 per minute",
+               deduct_when=lambda response: g.get('api_key') is None and rate_limit_applies())
 def view_file(filepath):
     try:
         filepath = urllib.parse.unquote(filepath)
@@ -5222,7 +5266,8 @@ def export_xlsx():
 
 
 @app.route('/<path:filepath>')
-@limiter.limit("30 per minute", deduct_when=lambda response: g.get('api_key') is None)
+@limiter.limit("30 per minute",
+               deduct_when=lambda response: g.get('api_key') is None and rate_limit_applies())
 def direct_file_access(filepath):
     if filepath.startswith('static/') or filepath.startswith('f/') or filepath.startswith('d/') or filepath.startswith('z/') or filepath in [
         'export_xlsx', 'export_all', 'upload', 'upload_folder', 'settings', 'favicon.ico'
@@ -5279,7 +5324,7 @@ def direct_file_access(filepath):
                                download_name=record['current_filename'].replace('+', '_'))
 
 @app.route('/export_all', methods=['GET', 'HEAD'])
-@limiter.limit("2 per minute")
+@limiter.limit("2 per minute", deduct_when=lambda response: rate_limit_applies())
 @serialized_zip_build
 def export_all():
     """Массовое скачивание всего хранилища одним ZIP.
@@ -5314,12 +5359,12 @@ def export_all():
                 session.get('logged_in') and current_auth
                 and session.get('_auth_fingerprint') == auth_fingerprint(current_auth)
             )
-        peer_addr = request.environ.get('werkzeug.proxy_fix.orig', {}).get('REMOTE_ADDR', client_addr)
-        peer_is_loopback = peer_addr in {'127.0.0.1', '::1', '::ffff:127.0.0.1'}
-        trusted_lan_client = bool(_PRIVATE_RE.match(client_addr)) and (
-            (not TRUST_PROXY and not peer_is_loopback)
-            or (TRUST_PROXY and is_trusted_proxy_peer(peer_addr))
-        )
+        # Локальным считается клиент, пришедший напрямую из приватной сети.
+        # Запрос через тоннель тоже имеет приватного соседа (loopback), но
+        # локальным не является — поэтому доверенный прокси исключается.
+        peer_addr = _peer_address()
+        trusted_lan_client = (_address_is_lan(peer_addr)
+                              and not is_trusted_proxy_peer(peer_addr))
         if not (export_key_id or has_valid_admin_session or trusted_lan_client):
             app.logger.warning('Полный экспорт запрещён для внешнего адреса %s', client_addr)
             return jsonify({'error': 'Полный экспорт доступен только из локальной сети или с API-ключом'}), 403
@@ -5493,7 +5538,7 @@ def export_zip():
     return jsonify({'url': f"{BASE_URL}/z/{zip_id}", 'count': len(items), 'size': format_size(size)})
 
 @app.route('/z/<zip_id>')
-@limiter.limit("30 per minute")
+@limiter.limit("30 per minute", deduct_when=lambda response: rate_limit_applies())
 def download_zip(zip_id):
     """Публичная ссылка на созданный архив (id неугадываемый, живёт сутки)."""
     if not re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', zip_id):
