@@ -1,0 +1,22 @@
+[Unit]
+Description=Albion File Server
+After=network.target
+
+[Service]
+Type=simple
+User=alexice
+Group=alexice
+WorkingDirectory=/home/alexice/projects/albion-files
+Environment="PATH=/home/alexice/projects/albion-files/venv/bin"
+Environment="ALBION_DATA_DIR=/home/alexice/projects/albion-files"
+# Метаданные в SQLite (albion.db). Откат: убрать строку и перезапустить службу.
+Environment="ALBION_METADATA_BACKEND=sqlite"
+Environment="ALBION_BACKUP_DIR=/home/alexice/projects/albion-files/backups"
+ExecStart=/home/alexice/projects/albion-files/venv/bin/python /home/alexice/projects/albion-files/server.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

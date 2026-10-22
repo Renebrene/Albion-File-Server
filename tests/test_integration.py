@@ -381,6 +381,9 @@ class ManageTokensCliTests(unittest.TestCase):
         self.data_dir = tempfile.mkdtemp(prefix='albion-tokens-cli-')
         self.env = os.environ.copy()
         self.env['ALBION_DATA_DIR'] = self.data_dir
+        # Эти тесты проверяют CLI на JSON-хранилище: sqlite-путь CLI
+        # проверяется отдельно в tests/test_sqlite_backend.py.
+        self.env.pop('ALBION_METADATA_BACKEND', None)
         self.script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                    'manage_tokens.py')
         with open(os.path.join(self.data_dir, 'folders_db.json'), 'w', encoding='utf-8') as handle:

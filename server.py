@@ -29,6 +29,9 @@ from flask import Flask, request, send_from_directory, render_template_string, s
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import token_store
+# SQLite-слой метаданных. Режим выбирает ALBION_METADATA_BACKEND (json | sqlite):
+# json — прежние файлы, sqlite — база albion.db. Откат — вернуть флаг.
+import db as metadata_store
 
 # Каталог данных (uploads + json-базы): '.' по умолчанию, в Docker — /app/data
 DATA_DIR = os.environ.get('ALBION_DATA_DIR', '.')
@@ -77,33 +80,40 @@ def _quota_defaults():
     }
 
 def load_quota_settings():
-    """Return validated quota settings; settings.json overrides env defaults."""
+    """Return validated quota settings; сохранённые значения перекрывают env-умолчания."""
     values = _quota_defaults()
-    if os.path.exists(SETTINGS_FILE):
+    raw = None
+    if metadata_store.sqlite_enabled():
+        raw = metadata_store.load_document('settings') or None
+    elif os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
                 raw = json.load(f)
-            if isinstance(raw, dict):
-                for key in QUOTA_KEYS:
-                    if key not in raw:
-                        continue
-                    val = raw[key]
-                    if key == 'export_all_internal_only':
-                        values[key] = bool(val)
-                        continue
-                    if key == 'max_zip_files':
-                        val = int(val)
-                    else:
-                        val = float(val)
-                    if val < 0:
-                        raise ValueError(f'negative value for {key}')
-                    values[key] = val
             try:
                 os.chmod(SETTINGS_FILE, 0o600)
             except OSError:
                 pass
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+        except (OSError, ValueError, json.JSONDecodeError) as e:
             print(f'⚠️ settings.json проигнорирован: {e}')
+            raw = None
+    if isinstance(raw, dict):
+        try:
+            for key in QUOTA_KEYS:
+                if key not in raw:
+                    continue
+                val = raw[key]
+                if key == 'export_all_internal_only':
+                    values[key] = bool(val)
+                    continue
+                if key == 'max_zip_files':
+                    val = int(val)
+                else:
+                    val = float(val)
+                if val < 0:
+                    raise ValueError(f'negative value for {key}')
+                values[key] = val
+        except (ValueError, TypeError) as e:
+            print(f'⚠️ настройки квот проигнорированы: {e}')
     return values
 
 def save_quota_settings(values):
@@ -113,8 +123,11 @@ def save_quota_settings(values):
             clean[key] = bool(values[key])
         else:
             clean[key] = int(values[key]) if key == 'max_zip_files' else float(values[key])
-    with DB_LOCK:
-        _save_json(SETTINGS_FILE, clean)
+    if metadata_store.sqlite_enabled():
+        metadata_store.save_document('settings', clean)
+    else:
+        with DB_LOCK:
+            _save_json(SETTINGS_FILE, clean)
     app.config['MAX_CONTENT_LENGTH'] = int(clean['max_upload_gb'] * 1024 ** 3) or None
 
 app = Flask(__name__, static_folder='static')
@@ -345,9 +358,38 @@ def is_valid_foldername(name):
     return True
 
 # ===== БАЗА ДАННЫХ ФАЙЛОВ =====
+def _sqlite_target(path):
+    """Какой набор метаданных соответствует файлу JSON (для режима sqlite).
+
+    Маршрутизация живёт здесь, чтобы ни один вызов _load_json/_save_json не
+    остался в обход SQLite. auth.json в неё не входит: учётные записи
+    переезжают в таблицу users на следующем этапе.
+    """
+    if not metadata_store.sqlite_enabled():
+        return None
+    normalized = os.path.normpath(path)
+    mapping = {
+        os.path.normpath(DB_FILE): ('files', None),
+        os.path.normpath(FOLDERS_DB_FILE): ('folders', None),
+        os.path.normpath(TOKENS_FILE): ('tokens', None),
+        os.path.normpath(STATS_FILE): ('document', 'stats'),
+        os.path.normpath(SETTINGS_FILE): ('document', 'settings'),
+    }
+    return mapping.get(normalized)
+
 def _load_json(path):
     """Загрузка JSON. Повреждённый файл переносится в .corrupt-бэкап,
     чтобы пустая база не затёрла данные при следующем сохранении."""
+    target = _sqlite_target(path)
+    if target:
+        kind, name = target
+        if kind == 'files':
+            return metadata_store.load_files()
+        if kind == 'folders':
+            return metadata_store.load_folders()
+        if kind == 'tokens':
+            return metadata_store.load_tokens()
+        return metadata_store.load_document(name, {})
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
@@ -362,7 +404,22 @@ def _load_json(path):
     return {}
 
 def _save_json(path, data):
-    """Атомарная запись приватной JSON-БД (режим 0600) через tmp + replace."""
+    """Атомарная запись приватной JSON-БД (режим 0600) через tmp + replace.
+
+    В режиме sqlite запись уходит в базу, файл JSON не создаётся.
+    """
+    target = _sqlite_target(path)
+    if target:
+        kind, name = target
+        if kind == 'files':
+            metadata_store.save_files(data)
+        elif kind == 'folders':
+            metadata_store.save_folders(data)
+        elif kind == 'tokens':
+            metadata_store.save_tokens(data)
+        else:
+            metadata_store.save_document(name, data)
+        return
     tmp = f"{path}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -373,17 +430,29 @@ def _save_json(path, data):
     os.replace(tmp, path)
 
 def load_db():
+    if metadata_store.sqlite_enabled():
+        return metadata_store.load_files()
     return _load_json(DB_FILE)
 
 def save_db(db):
+    if metadata_store.sqlite_enabled():
+        # Запись одним запросом: обновляются только изменившиеся записи,
+        # удалённые из словаря удаляются из базы.
+        metadata_store.save_files(db)
+        return
     with DB_LOCK:
         _save_json(DB_FILE, db)
 
 # ===== БАЗА ДАННЫХ ПАПОК =====
 def load_folders():
+    if metadata_store.sqlite_enabled():
+        return metadata_store.load_folders()
     return _load_json(FOLDERS_DB_FILE)
 
 def save_folders(folders):
+    if metadata_store.sqlite_enabled():
+        metadata_store.save_folders(folders)
+        return
     with DB_LOCK:
         _save_json(FOLDERS_DB_FILE, folders)
 
@@ -575,7 +644,10 @@ migrate_folders()
 
 # ===== СТАТИСТИКА =====
 def load_stats():
-    stats = _load_json(STATS_FILE)
+    if metadata_store.sqlite_enabled():
+        stats = metadata_store.load_document('stats')
+    else:
+        stats = _load_json(STATS_FILE)
     if not isinstance(stats, dict):
         return {'last_upload': None, 'last_export': None}
     stats.setdefault('last_upload', None)
@@ -583,6 +655,9 @@ def load_stats():
     return stats
 
 def save_stats(stats):
+    if metadata_store.sqlite_enabled():
+        metadata_store.save_document('stats', stats)
+        return
     with DB_LOCK:
         _save_json(STATS_FILE, stats)
 

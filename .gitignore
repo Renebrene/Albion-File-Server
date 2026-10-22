@@ -50,3 +50,9 @@ desktop.ini
 *.tmp
 *.bak
 *.backup
+backups/
+
+# SQLite-метаданные и их служебные файлы (данные, не код)
+albion.db
+albion.db-wal
+albion.db-shm

@@ -14,6 +14,7 @@ from werkzeug.security import generate_password_hash
 _DATA = tempfile.mkdtemp(prefix='albion-unittest-')
 os.environ['ALBION_DATA_DIR'] = _DATA
 
+import db as metadata_store  # noqa: E402
 import server  # noqa: E402
 
 
@@ -46,6 +47,10 @@ class ServerSmokeTests(unittest.TestCase):
             os.remove(os.path.join(server.ZIPLINKS_DIR, entry))
         if os.path.exists(server.SETTINGS_FILE):
             os.remove(server.SETTINGS_FILE)
+        if metadata_store.sqlite_enabled():
+            # В режиме sqlite файла настроек нет: сбрасываем документ,
+            # как это делало удаление settings.json.
+            metadata_store.save_document('settings', {})
         server.app.config['MAX_CONTENT_LENGTH'] = (
             int(server.load_quota_settings()['max_upload_gb'] * 1024 ** 3) or None)
         with open(server.AUTH_FILE, 'w', encoding='utf-8') as f:

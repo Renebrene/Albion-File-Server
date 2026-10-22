@@ -33,6 +33,8 @@ Browser / curl / integration
 ├── settings.json     квоты, изменяемые администратором в /settings (0600)
 ├── auth.json         единственный admin username + werkzeug password hash
 ├── tokens.json       SHA-256 ключей автоматики → name/created
+├── albion.db         метаданные в SQLite (режим ALBION_METADATA_BACKEND=sqlite, 0600)
+├── backups/          ежедневные копии метаданных (db + JSON + MANIFEST.json)
 ├── .secret_key       Flask signing key, нужен для сохранения сессий
 ├── albion.log        лог приложения, ротация 5 MiB × 3
 └── .corrupt-*        резерв повреждённого JSON при ошибке чтения
@@ -42,9 +44,40 @@ Browser / curl / integration
 
 `folders_db.json` — объект UUID → `name`, `parent_id`, `created`, `slug`. Публичный `/d/<slug>` ищет короткий slug; ссылки `/d/<uuid>` также поддержаны.
 
-## Путь масштабирования на SQLite/PostgreSQL
+## Хранилище метаданных: JSON и SQLite
 
-Сначала вынести `files` и `folders` в таблицы с полями из JSON-записей, добавив индексы по `folder_id`, `slug`, `custom_alias` и `physical_path`. Счётчики обновлять атомарным `UPDATE ... SET download_count = download_count + 1` в транзакции, а не read-modify-write JSON. Затем заменить `load_db/save_db` на repository-функции. SQLite подходит для нескольких процессов на одной машине при WAL + `busy_timeout`; PostgreSQL — для нескольких хостов/реплик. Redis оставить для rate-limit/budget/export quota. `uploads/` должно быть общим сетевым/filesystem volume, а ZIP/temp-файлы — локальными для процесса либо в объектном хранилище.
+Режим выбирает `ALBION_METADATA_BACKEND`:
+
+- `json` (по умолчанию) — прежние файлы `files_db.json`, `folders_db.json`, `tokens.json`, `stats.json`, `settings.json`;
+- `sqlite` — одна база `albion.db` (WAL, `busy_timeout=5000`, внешние ключи) в каталоге данных.
+
+Слой `db.py` держит **ту же модель данных**, что и JSON: наборы читаются и пишутся словарями
+`{id: record}`, поэтому весь код маршрутов работает без изменений, а переключение режима
+обратимо. Наборы маршрутизируются в одном месте (`_sqlite_target` в `server.py`), так что ни
+один вызов `_load_json`/`_save_json` не может пройти мимо активного хранилища.
+
+Схема подготовлена сразу под следующие этапы: `sections`, `users`, `sessions`, `links`,
+`audit`, `quota_usage` создаются вместе с `files`, `folders`, `tokens`, `documents`.
+Колонки дублируют поля записей (для индексов и запросов), а полная запись хранится в
+JSON-поле `data` — это даёт сверку «байт в байт» при миграции и сохранность полей, которые
+пока не вынесены в колонки.
+
+Запись набора — одна транзакция `BEGIN IMMEDIATE`: обновляются только реально изменившиеся
+записи (сравнение сериализованного вида), отсутствующие в словаре удаляются. Отсюда два
+следствия: параллельные загрузки не теряют записи (проверено тестом на 50 потоков), а
+`mutate_files/mutate_folders/mutate_tokens` дают атомарный read-modify-write, в том числе
+между процессами — именно так CLI `manage_tokens.py` и веб-выдача не конфликтуют.
+
+Ограничение: SQLite-файл **нельзя** размещать на NFS/SMB — WAL требует локальной ФС.
+`uploads/` при этом может жить на сетевом хранилище.
+
+## Путь масштабирования на PostgreSQL
+
+Дальше: перевести маршруты с «прочитать весь набор» на запросы по записям (репозитории),
+заменить общий `DB_LOCK` на транзакции БД, вынести счётчики в `UPDATE ... SET x = x + 1`.
+PostgreSQL нужен при нескольких хостах/репликах; на одной машине SQLite WAL достаточен.
+Redis оставить для rate-limit/budget/export quota. ZIP/temp-файлы — локальными для процесса
+либо в объектном хранилище.
 
 `tokens.json` имеет вид `{sha256(raw_key): {"name", "created", "created_at", "scopes", "folder_id", "expires_at"}}`. Открытый API-ключ показывается только один раз при создании в `/settings/tokens` или командой `manage_tokens.py add`; новые токены по умолчанию действуют 90 дней. Записи старых версий без `scopes` трактуются как `download`, без `expires_at` — как бессрочные. `upload`, `delete` и `*` обязаны иметь `folder_id`; `/export_all` принимает API-ключ только со scope `download` или `*`. Запись `tokens.json` сериализуется блокировкой `tokens.json.lock`, общей для CLI и веб-выдачи.
 

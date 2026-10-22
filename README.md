@@ -41,6 +41,11 @@ python server.py
 | Переменная | Значение по умолчанию | Назначение |
 |---|---:|---|
 | `ALBION_DATA_DIR` | `.` | Каталог `uploads/`, JSON-БД, ключей и логов |
+| `ALBION_METADATA_BACKEND` | `json` | Хранилище метаданных: `json` — прежние файлы, `sqlite` — база `albion.db` (WAL) рядом с ними |
+| `ALBION_DB_FILE` | пусто | Явный путь к файлу SQLite, если база лежит не рядом с JSON |
+| `ALBION_BACKUP_DIR` | `<данные>/backups` | Каталог ежедневных копий метаданных |
+| `ALBION_BACKUP_OFFSITE` | пусто | Каталог офсайт-копий (например внешний диск); недоступен — копия просто пропускается |
+| `ALBION_BACKUP_KEEP` / `ALBION_BACKUP_OFFSITE_KEEP` | `30` / `8` | Сколько копий хранить локально и офсайт |
 | `ALBION_HOST` | `127.0.0.1` | Адрес Waitress; `0.0.0.0` включайте явно только при нужде в прямом LAN-доступе |
 | `ALBION_TRUST_PROXY` | `0` | `1` доверяет одному hop только от peer IP из списка `ALBION_TRUSTED_PROXY_IPS`; включать только за закрытым backend |
 | `ALBION_TRUSTED_PROXY_IPS` | `127.0.0.1,::1` | IP/CIDR прокси, от которых разрешено LAN-исключение `/export_all` при `ALBION_TRUST_PROXY=1` |
@@ -58,6 +63,38 @@ python server.py
 | `ALBION_EXPORT_ALL_INTERNAL_ONLY` | `1` | `/export_all` только из LAN за доверенным proxy, с API-ключом или действующей админ-сессией |
 | `ALBION_REDIS_URL` | пусто | Redis для общих бюджетов скачивания и часовой квоты экспорта |
 | `ALBION_RATE_LIMIT_STORAGE_URI` | `memory://` | Storage для Flask-Limiter; для нескольких процессов — `redis://...` |
+
+## Хранилище метаданных: JSON и SQLite
+
+Метаданные (файлы, папки, токены, статистика, настройки) хранятся либо в прежних
+JSON-файлах, либо в одной локальной базе SQLite в режиме WAL. Режим выбирает
+`ALBION_METADATA_BACKEND`; переключение обратимо — JSON-файлы при миграции не удаляются,
+откат делается возвратом флага на `json`.
+
+```bash
+# Перенести JSON → SQLite со сверкой количества, суммы размеров и выборочных полей
+venv/bin/python db.py migrate              # откажется работать, если база не пуста (--force для повтора)
+venv/bin/python db.py verify               # сверить базу с JSON в любой момент
+venv/bin/python db.py stats                # что лежит в базе
+venv/bin/python db.py backup --dest /path  # согласованная копия базы без остановки сервиса
+```
+
+База создаётся в каталоге данных (`albion.db`, режим `0600`) и **не должна** лежать на
+сетевом диске: WAL требует локальной файловой системы. Файлы пользователей при этом
+могут находиться на NAS.
+
+## Резервное копирование метаданных
+
+```bash
+venv/bin/python scripts/backup_metadata.py            # ежедневная копия (запускает таймер)
+venv/bin/python scripts/backup_metadata.py --list     # какие копии есть
+venv/bin/python scripts/backup_metadata.py --force-offsite   # сделать и офсайт-копию вручную
+```
+
+Каждая копия — каталог с базой, JSON-файлами и `MANIFEST.json` (там же результат
+`integrity_check` и число записей). Старые копии удаляются по сроку хранения.
+Готовые unit-файлы: `deploy/albion-backup.service` и `deploy/albion-backup.timer`
+(ежедневно в 03:30, `Persistent=true` — пропущенный запуск выполнится после включения машины).
 
 Rate-limit Flask-Limiter по умолчанию хранится в памяти и сбрасывается при рестарте; для нескольких процессов задайте `ALBION_RATE_LIMIT_STORAGE_URI=redis://...`. Бюджеты скачивания и часовой `/export_all` также можно перевести на общий Redis через `ALBION_REDIS_URL`. Для Redis установите пакет `redis` (он включён в `requirements.txt`). Локальные адреса (loopback и RFC1918 IPv4) освобождены от request-rate limits, но байтовый бюджет скачивания применяется и к ним.
 

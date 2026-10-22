@@ -1,0 +1,12 @@
+[Unit]
+Description=Резервная копия метаданных АЛЬБИОН.ДИСК
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/alexice/projects/albion-files
+Environment=ALBION_DATA_DIR=/home/alexice/projects/albion-files
+Environment=ALBION_BACKUP_DIR=/home/alexice/projects/albion-files/backups
+Environment=ALBION_BACKUP_OFFSITE=/media/alexice/QOPP/albion-metadata
+Environment=ALBION_BACKUP_KEEP=30
+Environment=ALBION_BACKUP_OFFSITE_KEEP=8
+ExecStart=/home/alexice/projects/albion-files/venv/bin/python /home/alexice/projects/albion-files/scripts/backup_metadata.py

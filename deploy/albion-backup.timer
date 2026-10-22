@@ -1,0 +1,11 @@
+[Unit]
+Description=Ежедневная резервная копия метаданных АЛЬБИОН.ДИСК
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=albion-backup.service
+
+[Install]
+WantedBy=timers.target

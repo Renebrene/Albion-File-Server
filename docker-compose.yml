@@ -10,6 +10,9 @@ services:
       # Docker bridge is normally 172.16.0.0/12; restrict to the actual proxy subnet if customized.
       ALBION_TRUSTED_PROXY_IPS: 172.16.0.0/12,127.0.0.1,::1
       ALBION_SESSION_HOURS: "12"
+      # Хранилище метаданных: json (по умолчанию) или sqlite (albion.db в томе data)
+      ALBION_METADATA_BACKEND: ${ALBION_METADATA_BACKEND:-json}
+      ALBION_BACKUP_DIR: ${ALBION_BACKUP_DIR:-/app/data/backups}
       ALBION_MAX_UPLOAD_GB: ${ALBION_MAX_UPLOAD_GB:-50}
       ALBION_STORAGE_QUOTA_GB: ${ALBION_STORAGE_QUOTA_GB:-0}
       ALBION_MIN_FREE_GB: ${ALBION_MIN_FREE_GB:-5}

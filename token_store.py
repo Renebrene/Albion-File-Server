@@ -16,6 +16,10 @@ try:
 except ImportError:  # pragma: no cover - the project targets Linux
     fcntl = None
 
+# Хранилище метаданных: в режиме ALBION_METADATA_BACKEND=sqlite токены живут
+# в таблице tokens (albion.db), иначе — в tokens.json рядом с остальными файлами.
+import db as metadata_store
+
 ALLOWED_SCOPES = {'download', 'upload', 'delete', '*'}
 # Scopes that allow changing data must be bound to one concrete folder.
 FOLDER_REQUIRED_SCOPES = {'upload', 'delete', '*'}
@@ -138,6 +142,8 @@ def build_record(name, scopes, folder_id, expires_at, now=None):
 
 
 def load_tokens_file(path):
+    if metadata_store.sqlite_enabled():
+        return metadata_store.load_tokens()
     if not os.path.exists(path):
         return {}
     try:
@@ -151,6 +157,9 @@ def load_tokens_file(path):
 
 
 def save_tokens_file(path, data):
+    if metadata_store.sqlite_enabled():
+        metadata_store.save_tokens(data)
+        return
     directory = os.path.dirname(path) or '.'
     os.makedirs(directory, exist_ok=True)
     tmp = f'{path}.tmp'
@@ -192,6 +201,10 @@ def locked_tokens_file(path):
 
 def mutate_tokens(path, mutation):
     """Reload under an exclusive lock, apply mutation(tokens), then save."""
+    if metadata_store.sqlite_enabled():
+        # В SQLite блокировку держит транзакция BEGIN IMMEDIATE (в том числе
+        # между процессами: сервер и CLI), поэтому flock не нужен.
+        return metadata_store.mutate_tokens(mutation)
     with locked_tokens_file(path):
         tokens = load_tokens_file(path)
         result = mutation(tokens)

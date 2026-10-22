@@ -84,6 +84,45 @@ docker compose exec app python change_password.py
 - Не коммитить реальные `auth.json`, `tokens.json`, `.secret_key`, пользовательские файлы, архивы или экспорт чата.
 - Проверять зависимости `requirements.txt` и уязвимости перед обновлением.
 
+## Переход метаданных на SQLite
+
+Порядок (выполняется при остановленном или работающем сервисе — база создаётся рядом, JSON не трогается):
+
+```bash
+# 1. Свежая копия перед изменениями
+venv/bin/python scripts/backup_metadata.py
+
+# 2. Перенос со сверкой: количество, сумма размеров, выборочные поля
+venv/bin/python db.py migrate
+venv/bin/python db.py verify          # ожидается «РЕЗУЛЬТАТ: OK»
+
+# 3. Переключение: в unit добавить ALBION_METADATA_BACKEND=sqlite и перезапустить
+systemctl restart albion-files
+
+# 4. Проверка после переключения
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5000/    # 302
+venv/bin/python db.py stats
+```
+
+Откат: убрать `ALBION_METADATA_BACKEND` (или поставить `json`) и перезапустить сервис —
+данные вернутся к JSON-файлам, которые при миграции не удалялись. Изменения, сделанные
+в режиме SQLite, в JSON не попадут: перед откатом выгрузите их (`db.py verify` покажет
+расхождения по количеству).
+
+Технические ограничения:
+
+- база должна лежать на **локальном** диске (WAL не работает поверх NFS/SMB);
+- один writer: параллельные записи сериализуются транзакцией `BEGIN IMMEDIATE`, поэтому
+  второй экземпляр приложения на той же базе допустим, но конкуренция записи ограничена;
+- ежедневная копия ставится таймером:
+
+```bash
+cp deploy/albion-backup.service deploy/albion-backup.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now albion-backup.timer
+systemctl --user list-timers albion-backup.timer
+```
+
 ## Мониторинг/лимиты
 
 - `albion.log` ротируется 5 MiB × 3; systemd вывод также доступен через `journalctl -u albion-files`.

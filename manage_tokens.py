@@ -21,6 +21,8 @@ import sys
 from datetime import datetime, timezone
 
 import token_store
+# Тот же переключатель хранилища, что и у сервера: json | sqlite
+import db as metadata_store
 
 DATA_DIR = os.environ.get('ALBION_DATA_DIR', '.')
 TOKENS_FILE = os.path.join(DATA_DIR, 'tokens.json')
@@ -28,6 +30,8 @@ FOLDERS_FILE = os.path.join(DATA_DIR, 'folders_db.json')
 
 
 def load_folders():
+    if metadata_store.sqlite_enabled():
+        return metadata_store.load_folders()
     if not os.path.exists(FOLDERS_FILE):
         return {}
     try:
