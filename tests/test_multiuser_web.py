@@ -10,7 +10,16 @@ import shutil
 import tempfile
 import unittest
 
-import db as metadata_store
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _isolation import assert_isolated, ensure_temp_data_dir  # noqa: E402
+
+# Каталог данных — временный даже при отдельном запуске модуля:
+# ни один тест не должен трогать рабочую базу и auth.json.
+ensure_temp_data_dir('albion-multiuser-run-')
+
+import db as metadata_store  # noqa: E402
 
 # Режим sqlite включается только в setUp: на уровне модуля флаг протёк бы в
 # остальные тесты и в дочерние процессы.
@@ -45,6 +54,7 @@ class MultiUserWebTests(unittest.TestCase):
         self._saved_lan = os.environ.get('ALBION_LAN_HOST')
         server.LAN_HOST = ''           # по умолчанию правило внешнего входа выключено
         metadata_store.close()
+        assert_isolated(os.environ.get('ALBION_DATA_DIR'), metadata_store.db_path())
         conn = metadata_store.init_schema()
         conn.execute('DELETE FROM sessions')
         conn.execute('DELETE FROM users')

@@ -12,6 +12,13 @@ from werkzeug.security import generate_password_hash
 
 _DATA = tempfile.mkdtemp(prefix='albion-users-test-')
 
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _isolation import assert_isolated, ensure_temp_data_dir  # noqa: E402  # noqa: E402
+
+ensure_temp_data_dir('albion-users-run-')
+
 import db  # noqa: E402
 import sessions  # noqa: E402
 import users  # noqa: E402
@@ -26,6 +33,7 @@ class BaseUsersTest(unittest.TestCase):
         os.environ['ALBION_DATA_DIR'] = _DATA
         os.environ['ALBION_METADATA_BACKEND'] = 'sqlite'
         db.close()
+        assert_isolated(os.environ.get('ALBION_DATA_DIR'), db.db_path())
         db.init_schema()
         conn = db.connect()
         conn.execute('DELETE FROM sessions')

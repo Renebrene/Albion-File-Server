@@ -20,13 +20,19 @@ from werkzeug.security import generate_password_hash
 if 'server' not in sys.modules:
     os.environ['ALBION_DATA_DIR'] = tempfile.mkdtemp(prefix='albion-sqlite-run-')
 
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _isolation import assert_isolated, ensure_temp_data_dir  # noqa: E402  # noqa: E402
+
+ensure_temp_data_dir('albion-sqlite-run-')
+
 import db  # noqa: E402
 import server  # noqa: E402
 
 # Режим sqlite включается только внутри setUp: на уровне модуля флаг протёк бы
 # в остальные тесты и в дочерние процессы (CLI-тесты запускают manage_tokens.py).
-assert os.path.abspath(server.DATA_DIR) != '/home/alexice/projects/albion-files', \
-    'тесты не должны работать с каталогом проекта'
+assert_isolated(server.DATA_DIR)
 
 
 class SqliteBackendTests(unittest.TestCase):
