@@ -79,7 +79,10 @@ class ServerSmokeTests(unittest.TestCase):
 
     def test_default_bind_is_loopback_and_proxy_trust_is_opt_in(self):
         self.assertEqual(server.APP_HOST, '127.0.0.1')
-        self.assertFalse(server.TRUST_PROXY)
+        trusted_by_env = os.environ.get('ALBION_TRUST_PROXY', '0').lower() in {'1', 'true', 'yes'}
+        if trusted_by_env:
+            self.skipTest('прогон с включённым доверием прокси: проверяется отдельно')
+        self.assertFalse(server.TRUST_PROXY, 'по умолчанию доверие заголовкам выключено')
 
     def test_security_headers_on_html_and_errors(self):
         for path in ('/login', '/unknown-security-probe'):

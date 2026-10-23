@@ -5572,6 +5572,27 @@ if TRUST_PROXY:
     # Trust exactly one proxy hop, and ignore forwarded headers from any other peer.
     app.wsgi_app = trusted_proxy_middleware(app.wsgi_app)
 
+def waitress_options(behind_proxy):
+    """Параметры waitress для конкретного слушателя.
+
+    Waitress по умолчанию сам вырезает `X-Forwarded-*` у всех, кто не объявлен
+    доверенным (`clear_untrusted_proxy_headers=True`), — тогда наш middleware их
+    просто не видит, и адрес клиента остаётся loopback. Решение о доверии
+    принимает приложение по списку `ALBION_TRUSTED_PROXY_IPS`, поэтому на
+    слушателе для тоннеля заголовки сохраняются. На слушателе локальной сети
+    они по-прежнему вырезаются.
+    """
+    options = {
+        'threads': 8,
+        # Transport ceiling; the admin-configurable per-request limit is lower.
+        'max_request_body_size': 1024 * 1024 * 1024 * 1024,
+        'channel_timeout': 300,
+    }
+    if behind_proxy and TRUST_PROXY:
+        options['clear_untrusted_proxy_headers'] = False
+    return options
+
+
 def start_lan_listener():
     """Поднять второй слушатель для локальной сети (если задан ALBION_LAN_HOST).
 
@@ -5583,9 +5604,7 @@ def start_lan_listener():
 
     def run():
         try:
-            serve(app, host=LAN_HOST, port=LAN_PORT, threads=8,
-                  max_request_body_size=1024 * 1024 * 1024 * 1024,
-                  channel_timeout=300)
+            serve(app, host=LAN_HOST, port=LAN_PORT, **waitress_options(behind_proxy=False))
         except Exception:
             app.logger.exception('Локальный слушатель %s:%s не запустился', LAN_HOST, LAN_PORT)
 
@@ -5604,10 +5623,4 @@ if __name__ == '__main__':
     print(f"Учётные записи:   {'SQLite (роли и сессии)' if multi_user_auth() else 'JSON (один админ)'}")
     print("=" * 60)
     start_lan_listener()
-    serve(app,
-          host=APP_HOST,
-          port=port,
-          threads=8,
-          # Transport ceiling; the admin-configurable per-request limit is lower.
-          max_request_body_size=1024 * 1024 * 1024 * 1024,
-          channel_timeout=300)
+    serve(app, host=APP_HOST, port=port, **waitress_options(behind_proxy=True))

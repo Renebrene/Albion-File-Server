@@ -84,7 +84,7 @@ class ManageUsersCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('последний активный администратор', result.stderr)
 
-    def test_passwd_resets_hash_and_requires_change(self):
+    def test_passwd_with_explicit_password_does_not_force_change(self):
         self.run_cli_ok('add', 'ivan', '--password', 'Иван-Пароль-2026')
         before = self.sql('SELECT password_hash FROM users WHERE login=?', ('ivan',))[0][0]
         result = self.run_cli_ok('passwd', 'ivan', '--password', 'Новый-Пароль-2026')
@@ -92,7 +92,24 @@ class ManageUsersCliTests(unittest.TestCase):
         after, must_change = self.sql(
             'SELECT password_hash, must_change_password FROM users WHERE login=?', ('ivan',))[0]
         self.assertNotEqual(before, after)
+        self.assertEqual(must_change, 0, 'явно заданный пароль окончательный')
+
+    def test_passwd_generated_password_requires_change(self):
+        self.run_cli_ok('add', 'ivan', '--password', 'Иван-Пароль-2026')
+        result = self.run_cli_ok('passwd', 'ivan')
+        self.assertIn('Временный пароль:', result.stdout)
+        must_change = self.sql(
+            'SELECT must_change_password FROM users WHERE login=?', ('ivan',))[0][0]
         self.assertEqual(must_change, 1)
+
+    def test_passwd_flags_override_behaviour(self):
+        self.run_cli_ok('add', 'ivan', '--password', 'Иван-Пароль-2026')
+        self.run_cli_ok('passwd', 'ivan', '--password', 'Новый-Пароль-2026', '--must-change')
+        self.assertEqual(self.sql('SELECT must_change_password FROM users WHERE login=?',
+                                  ('ivan',))[0][0], 1)
+        self.run_cli_ok('passwd', 'ivan', '--no-must-change')
+        self.assertEqual(self.sql('SELECT must_change_password FROM users WHERE login=?',
+                                  ('ivan',))[0][0], 0)
 
     def test_password_policy_is_enforced(self):
         self.run_cli_ok('add', 'ivan', '--password', 'Иван-Пароль-2026')

@@ -92,8 +92,13 @@ def cmd_passwd(args):
         print('ОШИБКА: учётная запись не найдена', file=sys.stderr)
         return 1
     password = args.password or user_store.generate_password()
+    # Пароль, заданный явно, — окончательный: требовать его смены при входе не нужно.
+    # Сгенерированный временный пароль всегда требует смены (если не отключено флагом).
+    must_change = args.must_change or (not args.password)
+    if args.no_must_change:
+        must_change = False
     try:
-        user_store.set_password(user['id'], password, must_change=not args.no_must_change)
+        user_store.set_password(user['id'], password, must_change=must_change)
     except user_store.UserError as exc:
         print('ОШИБКА:', exc, file=sys.stderr)
         return 1
@@ -254,8 +259,10 @@ def build_parser():
     passwd = sub.add_parser('passwd', help='сменить пароль')
     passwd.add_argument('login')
     passwd.add_argument('--password')
+    passwd.add_argument('--must-change', action='store_true',
+                        help='потребовать смену пароля при следующем входе')
     passwd.add_argument('--no-must-change', action='store_true',
-                        help='не требовать смены пароля при следующем входе')
+                        help='не требовать смены пароля (для сгенерированного пароля)')
     passwd.set_defaults(func=cmd_passwd)
 
     role = sub.add_parser('role', help='сменить роль')
