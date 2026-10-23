@@ -990,6 +990,7 @@ HTML_TEMPLATE = """
         .files-table tr:hover { background: #f8fafc; }
         .files-table .checkbox-cell { width: 40px; text-align: center; }
         .files-table .icon-cell { width: 40px; text-align: center; }
+        .files-table .link-cell { width: 40px; text-align: center; }
         .files-table .actions-cell { width: 160px; text-align: right; white-space: nowrap; }
         .thumb-sm { width: 32px; height: 32px; object-fit: cover; border-radius: 3px; vertical-align: middle; }
         .emoji-icon { font-size: 22px; }
@@ -1044,6 +1045,7 @@ HTML_TEMPLATE = """
         .list-item.folder-item.drag-over { background: #dbeafe; border: 2px dashed #2563eb; }
         .list-item.dragging { opacity: 0.5; }
         .thumb-xs { width: 24px; height: 24px; object-fit: cover; border-radius: 3px; flex-shrink: 0; }
+        .list-link { flex-shrink: 0; padding: 2px 6px; }
         .emoji-icon-sm { font-size: 18px; flex-shrink: 0; width: 24px; text-align: center; }
         .list-name-wrap { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
         .list-name { color: #1e293b; text-decoration: none; word-break: break-all; }
@@ -1231,6 +1233,7 @@ HTML_TEMPLATE = """
                             <thead>
                                 <tr>
                                     <th class="checkbox-cell"><input type="checkbox" id="selectAll" aria-label="Выбрать все на странице" onchange="toggleSelectAll()"></th>
+                                    <th class="link-cell"></th>
                                     <th class="icon-cell"></th>
                                     <th>Имя</th>
                                     <th class="size-col">Размер</th>
@@ -1244,6 +1247,7 @@ HTML_TEMPLATE = """
                                 {% for folder in subfolders %}
                                 <tr class="folder-row" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
                                     <td class="checkbox-cell"><input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)"></td>
+                                    <td class="link-cell"><button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку">🔗</button></td>
                                     <td class="icon-cell"><span class="folder-icon">📁</span></td>
                                     <td><a href="/f/{{ folder.id }}" style="font-weight: 600;">{{ folder.name }}</a></td>
                                     <td class="size-col">{% if folder.file_count %}{{ folder.size }}{% else %}—{% endif %}</td>
@@ -1251,7 +1255,6 @@ HTML_TEMPLATE = """
                                     <td class="type-col">Папка · 📄 {{ folder.file_count }} · 📁 {{ folder.subdir_count }}</td>
                                     <td class="dl-col">—</td>
                                     <td class="actions-cell">
-                                        <button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку">🔗</button>
                                         <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить папку">🗑️</button>
                                     </td>
                                 </tr>
@@ -1259,6 +1262,7 @@ HTML_TEMPLATE = """
                                 {% for f in files %}
                                 <tr class="file-row" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
                                     <td class="checkbox-cell"><input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)"></td>
+                                    <td class="link-cell"><button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку">🔗</button></td>
                                     <td class="icon-cell">
                                         {% if f.is_image %}
                                             <img src="{{ f.thumb_url }}" class="thumb-sm" loading="lazy" decoding="async" alt="">
@@ -1287,7 +1291,6 @@ HTML_TEMPLATE = """
                                         <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить на уровень выше">⬆️</button>
                                         {% endif %}
                                         <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать">✏️</button>
-                                        <button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку">🔗</button>
                                         <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить">🗑️</button>
                                     </td>
                                 </tr>
@@ -1346,13 +1349,13 @@ HTML_TEMPLATE = """
                             {% for folder in subfolders %}
                             <div class="list-item folder-item" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
                                 <input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)">
+                                <button class="btn btn-sm btn-icon list-link" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку">🔗</button>
                                 <span class="emoji-icon-sm">📁</span>
                                 <div class="list-name-wrap">
                                     <a href="/f/{{ folder.id }}" class="list-name" style="font-weight: 600;">{{ folder.name }}</a>
                                 </div>
                                 <span class="list-date">{{ folder.created }}</span>
                                 <div class="list-actions">
-                                    <button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку">🔗</button>
                                     <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить">🗑️</button>
                                 </div>
                             </div>
@@ -1360,6 +1363,7 @@ HTML_TEMPLATE = """
                             {% for f in files %}
                             <div class="list-item" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
                                 <input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)">
+                                <button class="btn btn-sm btn-icon list-link" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку">🔗</button>
                                 {% if f.is_image %}
                                     <img src="{{ f.thumb_url }}" class="thumb-xs" loading="lazy" decoding="async" alt="">
                                 {% else %}
@@ -1377,7 +1381,6 @@ HTML_TEMPLATE = """
                                     <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше">⬆️</button>
                                     {% endif %}
                                     <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать">✏️</button>
-                                    <button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку">🔗</button>
                                     <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить">🗑️</button>
                                 </div>
                             </div>

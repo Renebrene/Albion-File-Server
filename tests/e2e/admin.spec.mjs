@@ -19,6 +19,7 @@ const allSteps = [
   '6 edit modal role/active, Escape closes, focus returns',
   '7 create token: secret once, hash prefix, revoke',
   '8 upload txt via UI and verify it appears',
+  '9 short link icon sits between checkbox and preview',
 ];
 
 async function runStep(name, fn) {
@@ -270,6 +271,47 @@ try {
     assert.match(footer, /Файлов:\s*61/, 'file counter includes upload');
     assert.match(await uploadedRow.innerText(), /TXT/i, 'uploaded row type is TXT');
   });
+await runStep('9 short link icon sits between checkbox and preview', async () => {
+  // Таблица: чекбокс, затем кнопка «ссылка», затем превью
+  await page.click('.view-btn[data-view="table"]');
+  await page.waitForTimeout(300);
+  const table = await page.evaluate(() => {
+    const head = document.querySelectorAll('#view-table thead th').length;
+    const row = document.querySelector('#view-table .file-row');
+    const cells = [...row.children];
+    return {
+      head,
+      cells: cells.length,
+      checkIndex: cells.findIndex((td) => td.querySelector('input[type=checkbox]')),
+      linkIndex: cells.findIndex((td) => td.querySelector('button[title*="ссылк"]')),
+      previewIndex: cells.findIndex((td) => td.querySelector('img.thumb-sm, .emoji-icon')),
+      linkInActions: !!row.querySelector('.actions-cell button[title*="ссылк"]'),
+    };
+  });
+  assert.equal(table.head, table.cells, 'число столбцов шапки и строки совпадает');
+  assert.equal(table.checkIndex, 0, 'первый столбец — чекбокс');
+  assert.equal(table.linkIndex, 1, 'ссылка идёт сразу после чекбокса');
+  assert.equal(table.previewIndex, 2, 'превью идёт после ссылки');
+  assert.equal(table.linkInActions, false, 'в действиях ссылки больше нет');
+
+  // Список: тот же порядок
+  await page.click('.view-btn[data-view="list"]');
+  await page.waitForTimeout(300);
+  const list = await page.evaluate(() => {
+    const row = document.querySelector('#view-list .list-item[data-file-id]');
+    const kind = (el) => {
+      if (el.matches('input[type=checkbox]')) return 'checkbox';
+      if (el.matches('button[title*="ссылк"]')) return 'link';
+      if (el.matches('img.thumb-xs, .emoji-icon-sm')) return 'thumb';
+      return 'other';
+    };
+    return [...row.children].slice(0, 3).map(kind);
+  });
+  assert.deepEqual(list, ['checkbox', 'link', 'thumb'], `порядок в списке: ${list.join(', ')}`);
+  await page.click('.view-btn[data-view="table"]');
+  await page.waitForTimeout(200);
+});
+
 } catch (error) {
   console.log(`ABORT at step: ${currentStep}`);
 } finally {
