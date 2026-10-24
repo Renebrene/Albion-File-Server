@@ -253,6 +253,38 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertEqual(current['slug'], original_slug)
         self.assertEqual(self.anon.get('/' + original_slug).status_code, 200)
 
+    def test_select_by_filter_returns_all_matching_ids(self):
+        """«Выбрать все найденные»: сервер отдаёт id по текущему фильтру, а не только подгруженные."""
+        self.login()
+        for name in ('one.txt', 'two.txt', 'three.png'):
+            self.client.post('/upload', data={'count': '1', 'file_0': (io.BytesIO(name.encode()), name)},
+                             content_type='multipart/form-data')
+
+        payload = self.client.post('/api/select_by_filter', json={'folder_id': None}).get_json()
+        self.assertEqual(payload['total'], 3)
+        self.assertEqual(len(payload['file_ids']), 3)
+        self.assertFalse(payload['truncated'])
+
+        by_ext = self.client.post('/api/select_by_filter',
+                                  json={'folder_id': None, 'ext': 'txt'}).get_json()
+        self.assertEqual(by_ext['total'], 2)
+
+        by_query = self.client.post('/api/select_by_filter',
+                                    json={'folder_id': None, 'q': 'two'}).get_json()
+        self.assertEqual(by_query['total'], 1)
+        self.assertEqual(len(by_query['file_ids']), 1)
+
+        folder = self.client.post('/api/create_folder', json={'name': 'Found'}).get_json()['folder_id']
+        root = self.client.post('/api/select_by_filter', json={'folder_id': None}).get_json()
+        self.assertIn(folder, root['folder_ids'])
+        inside = self.client.post('/api/select_by_filter', json={'folder_id': folder}).get_json()
+        self.assertEqual(inside['total'], 0)
+
+        missing = self.client.post('/api/select_by_filter', json={'folder_id': 'нет-такой'})
+        self.assertEqual(missing.status_code, 404)
+        anon = server.app.test_client()
+        self.assertEqual(anon.post('/api/select_by_filter', json={}).status_code, 302)
+
     def test_batch_move_and_delete(self):
         self.login()
         for name in ('one.txt','two.txt'):

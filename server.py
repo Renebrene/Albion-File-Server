@@ -967,6 +967,8 @@ HTML_TEMPLATE = """
         .breadcrumbs .separator { color: #94a3b8; }
         .breadcrumbs .current { color: #1e293b; font-weight: 600; }
 
+        .batch-result { padding: 8px 12px; margin-top: 8px; background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 6px; font-size: 13px; }
+        .batch-result a { color: #047857; font-weight: 600; }
         .batch-actions { display: none; align-items: center; gap: 10px; padding: 10px 15px; background: #eff6ff; border-radius: 6px; margin-bottom: 12px; }
         .batch-actions.active { display: flex; }
         .batch-actions .count { font-weight: 600; color: #1e3a8a; }
@@ -1187,7 +1189,7 @@ HTML_TEMPLATE = """
             </div>
 
             <form class="file-filters" method="get" action="{{ request.path }}">
-                <input type="search" name="q" value="{{ q }}" placeholder="Поиск по имени, ссылке или алиасу" aria-label="Поиск файлов">
+                <input type="search" name="q" value="{{ q }}" placeholder="Поиск по имени, ссылке или алиасу (Enter — применить)" aria-label="Поиск файлов">
                 <select name="ext" aria-label="Тип файла">
                     <option value="">Все типы</option>
                     {% for option in ext_options %}
@@ -1207,22 +1209,29 @@ HTML_TEMPLATE = """
                 <input type="hidden" name="view" value="{{ view }}">
                 <button class="btn btn-sm" type="submit">Применить</button>
                 <a class="btn btn-sm btn-secondary" href="{{ reset_url }}">Сбросить</a>
-                <span class="filter-result">Найдено: <strong>{{ total_files }}</strong></span>
+                <span class="filter-result">Найдено: <strong>{{ total_files }}</strong>{% if files|length < total_files %} · показано {{ files|length }}{% endif %}</span>
             </form>
 
             <div class="batch-actions" id="batchActions">
                 <span class="count">Выбрано: <span id="selectedCount">0</span></span>
-                <button class="btn btn-sm btn-success" onclick="executeBatchZip()">⬇ Скачать архив</button>
-                <button class="btn btn-sm btn-danger file-selection-action" onclick="batchDelete()">🗑️ Удалить выбранные</button>
+                <button class="btn btn-sm btn-success" id="batchZipBtn" data-idle-label="⬇ Скачать архив" onclick="executeBatchZip()">⬇ Скачать архив</button>
+                <button class="btn btn-sm btn-danger file-selection-action" id="batchDeleteBtn" data-idle-label="🗑️ Удалить выбранные" onclick="batchDelete()">🗑️ Удалить выбранные</button>
                 <button class="btn btn-sm file-selection-action" onclick="openBatchMoveModal()">📁 Переместить</button>
                 <button class="btn btn-sm btn-secondary" onclick="clearSelection()">✕ Снять выделение</button>
             </div>
+            <div class="batch-result" id="batchResult" hidden></div>
 
             <div class="view-switcher">
                 <button class="view-btn {% if view == 'table' %}active{% endif %}" data-view="table" aria-pressed="{{ 'true' if view == 'table' else 'false' }}">🗂 Таблица</button>
                 <button class="view-btn {% if view == 'grid' %}active{% endif %}" data-view="grid" aria-pressed="{{ 'true' if view == 'grid' else 'false' }}">🖼 Плитка</button>
                 <button class="view-btn {% if view == 'list' %}active{% endif %}" data-view="list" aria-pressed="{{ 'true' if view == 'list' else 'false' }}">📋 Список</button>
                 <button type="button" class="view-btn" id="selectAllBtn" onclick="selectAllItems()" title="Выбрать все на текущей странице" aria-label="Выбрать все на странице">☑️ Выбрать все</button>
+                {% if total_files > files|length %}
+                <button type="button" class="view-btn" id="selectAllFoundBtn" onclick="selectAllFound()"
+                        data-idle-label="🔎 Выбрать все найденные ({{ total_files }})"
+                        title="Выделить все файлы и папки по текущему фильтру, включая не подгруженные"
+                        aria-label="Выбрать все найденные">{{ '🔎 Выбрать все найденные (%d)' % total_files }}</button>
+                {% endif %}
             </div>
 
             <div class="files-content">
@@ -1453,7 +1462,7 @@ HTML_TEMPLATE = """
             </div>
             <div class="modal-actions">
                 <button class="btn btn-secondary" onclick="closeEditModal()">Отмена</button>
-                <button class="btn" onclick="saveFileEdit()">Сохранить</button>
+                <button class="btn" id="editSaveBtn" data-idle-label="Сохранить" data-modal-primary onclick="saveFileEdit()">Сохранить</button>
             </div>
         </div>
     </div>
@@ -1467,7 +1476,7 @@ HTML_TEMPLATE = """
             </div>
             <div class="modal-actions">
                 <button class="btn btn-secondary" onclick="closeCreateFolderModal()">Отмена</button>
-                <button class="btn" onclick="createFolder()">Создать</button>
+                <button class="btn" id="createFolderBtn" data-idle-label="Создать" data-modal-primary onclick="createFolder()">Создать</button>
             </div>
         </div>
     </div>
@@ -1481,7 +1490,7 @@ HTML_TEMPLATE = """
             </div>
             <div class="modal-actions">
                 <button class="btn btn-secondary" onclick="closeBatchMoveModal()">Отмена</button>
-                <button class="btn" onclick="executeBatchMove()">Переместить</button>
+                <button class="btn" id="batchMoveBtn" data-idle-label="Переместить" data-modal-primary onclick="executeBatchMove()">Переместить</button>
             </div>
         </div>
     </div>
@@ -1494,7 +1503,7 @@ HTML_TEMPLATE = """
             <p class="confirm-text" style="color: #dc3545; font-size: 13px;">⚠️ Файл будет удалён безвозвратно</p>
             <div class="modal-actions">
                 <button class="btn btn-secondary" onclick="closeDeleteModal()">Отмена</button>
-                <button class="btn btn-danger" onclick="executeDelete()">Удалить</button>
+                <button class="btn btn-danger" id="deleteFileBtn" data-idle-label="Удалить" data-modal-primary onclick="executeDelete()">Удалить</button>
             </div>
         </div>
     </div>
@@ -1507,7 +1516,7 @@ HTML_TEMPLATE = """
             <p class="confirm-text" style="color: #dc3545; font-size: 13px;">⚠️ Будут удалены все файлы и подпапки внутри!</p>
             <div class="modal-actions">
                 <button class="btn btn-secondary" onclick="closeDeleteFolderModal()">Отмена</button>
-                <button class="btn btn-danger" onclick="executeDeleteFolder()">Удалить</button>
+                <button class="btn btn-danger" id="deleteFolderBtn" data-idle-label="Удалить" data-modal-primary onclick="executeDeleteFolder()">Удалить</button>
             </div>
         </div>
     </div>
@@ -1582,6 +1591,16 @@ HTML_TEMPLATE = """
                 closeModal(activeModal.id);
                 return;
             }
+            if (event.key === 'Enter') {
+                const target = event.target;
+                if (target && (target.tagName === 'INPUT' || target.tagName === 'SELECT')) {
+                    const primary = activeModal.querySelector('[data-modal-primary]');
+                    if (primary && !primary.disabled) {
+                        event.preventDefault();
+                        primary.click();
+                    }
+                }
+            }
             if (event.key !== 'Tab') return;
             const items = modalFocusable(activeModal);
             if (!items.length) return;
@@ -1602,12 +1621,24 @@ HTML_TEMPLATE = """
         const viewBtns = document.querySelectorAll('.view-btn[data-view]');
         function setView(view) {
             if (!['table', 'grid', 'list'].includes(view)) return;
+            if (view === currentView) return;
+            if (!queueGuard('смена вида')) return;
             const url = new URL(window.location.href);
             if (url.searchParams.get('view') === view) return;
             url.searchParams.set('view', view);
             window.location.assign(url.toString());
         }
         viewBtns.forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
+
+        // Селекты фильтра применяются сразу: выбирать значение и затем жать
+        // «Применить» — лишний шаг. Поиск остаётся по Enter/кнопке: автосабмит
+        // на каждый пауза в наборе перерисовывал бы список.
+        const filterForm = document.querySelector('form.file-filters');
+        if (filterForm) {
+            filterForm.querySelectorAll('select').forEach(select => {
+                select.addEventListener('change', () => filterForm.submit());
+            });
+        }
 
         function handleDragStart(event, fileId) {
             draggedFileId = fileId;
@@ -1637,6 +1668,11 @@ HTML_TEMPLATE = """
             event.currentTarget.classList.remove('drag-over');
             const fileId = event.dataTransfer.getData('text/plain');
             if (!fileId) return;
+            if ((targetFolderId || '') === (currentFolderId || '')) {
+                showToast('Файл уже в этой папке');
+                return;
+            }
+            if (!queueGuard('перемещение файла')) return;
             const actionKey = `drop:${fileId}`;
             if (!lockAction(actionKey)) return;
             try {
@@ -1651,7 +1687,62 @@ HTML_TEMPLATE = """
             finally { unlockAction(actionKey); }
         }
 
-        function syncSelectionCheckboxes() {
+        // Количество строк в DOM кэшируется: после ленивой подгрузки их могут быть
+        // тысячи, и пересчёт на каждый клик чекбокса становится заметным.
+        let domTotals = { files: 0, folders: 0 };
+        let selectionIncludesAllFound = false;
+
+        function refreshDomTotals() {
+            domTotals = {
+                files: document.querySelectorAll('.file-checkbox').length,
+                folders: document.querySelectorAll('.folder-checkbox').length,
+            };
+        }
+
+        // Выделение переживает перезагрузку страницы: применение фильтра и смена
+        // вида перезагружают её, и раньше выделение пропадало молча.
+        const selectionStorageKey = `albionSelection:${currentFolderId || 'root'}`;
+        function saveSelection() {
+            try {
+                sessionStorage.setItem(selectionStorageKey, JSON.stringify({
+                    files: Array.from(selectedFiles),
+                    folders: Array.from(selectedFolders),
+                }));
+            } catch (err) { /* приватный режим — просто не сохраняем */ }
+        }
+        function restoreSelection() {
+            try {
+                const raw = sessionStorage.getItem(selectionStorageKey);
+                if (!raw) return;
+                const data = JSON.parse(raw) || {};
+                (data.files || []).forEach(id => selectedFiles.add(id));
+                (data.folders || []).forEach(id => selectedFolders.add(id));
+            } catch (err) { /* повреждённые данные игнорируем */ }
+        }
+
+        // Подпись кнопки запоминается в data-idle-label, чтобы не восстанавливать
+        // её жёсткой строкой после «Сохранение…».
+        function setIdleLabel(btn, busyText) {
+            if (!btn.dataset.idleLabel) btn.dataset.idleLabel = btn.textContent;
+            btn.textContent = busyText;
+        }
+        function restoreIdleLabel(btn) {
+            if (btn.dataset.idleLabel) btn.textContent = btn.dataset.idleLabel;
+        }
+
+        // Очередь загрузки нельзя сохранить между перезагрузками (File-объекты
+        // существуют только в памяти), поэтому предупреждаем вместо тихой потери.
+        function queueGuard(actionLabel) {
+            if (selectedUploadFiles.length === 0) return true;
+            return confirm(
+                `В очереди загрузки ${selectedUploadFiles.length} файл(ов). ` +
+                `Они будут потеряны, если продолжить «${actionLabel}» без обновления страницы.\n\n` +
+                'Продолжить? Сначала можно загрузить очередь.'
+            );
+        }
+
+        function syncSelectionCheckboxes(changed) {
+            if (changed) return;   // сам чекбокс уже в нужном состоянии
             document.querySelectorAll('.file-checkbox').forEach(cb => {
                 cb.checked = selectedFiles.has(cb.dataset.fileId);
             });
@@ -1660,22 +1751,27 @@ HTML_TEMPLATE = """
             });
         }
 
+        function markRowSelection(el) {
+            const fileId = el.dataset.fileId;
+            const folderId = el.dataset.folderId;
+            const on = (fileId && selectedFiles.has(fileId)) || (folderId && selectedFolders.has(folderId));
+            el.classList.toggle('selected', !!on);
+        }
+
         function updateSelection(changed) {
             if (changed) {
                 const isFile = changed.classList.contains('file-checkbox');
                 const id = isFile ? changed.dataset.fileId : changed.dataset.folderId;
                 const selection = isFile ? selectedFiles : selectedFolders;
                 if (changed.checked) selection.add(id); else selection.delete(id);
+                selectionIncludesAllFound = false;
+                const row = changed.closest('.file-row, .folder-row, .tile, .list-item');
+                if (row) markRowSelection(row);   // перерисовываем только затронутую строку
+            } else {
+                document.querySelectorAll('.file-row, .folder-row, .tile, .list-item').forEach(markRowSelection);
             }
 
-            // Sets are the source of truth; all three views must agree.
-            syncSelectionCheckboxes();
-            document.querySelectorAll('.file-row, .folder-row, .tile, .list-item').forEach(el => {
-                const fileId = el.dataset.fileId;
-                const folderId = el.dataset.folderId;
-                const on = (fileId && selectedFiles.has(fileId)) || (folderId && selectedFolders.has(folderId));
-                el.classList.toggle('selected', !!on);
-            });
+            syncSelectionCheckboxes(changed);
 
             const total = selectedFiles.size + selectedFolders.size;
             const batchActions = document.getElementById('batchActions');
@@ -1691,28 +1787,68 @@ HTML_TEMPLATE = """
                 btn.hidden = selectedFiles.size === 0;
             });
 
-            const allCheckboxes = Array.from(document.querySelectorAll('.file-checkbox, .folder-checkbox'));
-            const uniqueTotal = new Set(allCheckboxes.map(cb => (
-                cb.classList.contains('file-checkbox') ? 'f:' : 'd:'
-            ) + (cb.dataset.fileId || cb.dataset.folderId))).size;
             const selectAll = document.getElementById('selectAll');
+            const loadedAll = domTotals.files + domTotals.folders > 0
+                && selectedFiles.size >= domTotals.files
+                && selectedFolders.size >= domTotals.folders;
             if (selectAll) {
-                selectAll.checked = total > 0 && total === uniqueTotal;
-                selectAll.indeterminate = total > 0 && total < uniqueTotal;
+                selectAll.checked = loadedAll;
+                selectAll.indeterminate = total > 0 && !loadedAll;
             }
             const selectAllBtn = document.getElementById('selectAllBtn');
-            if (selectAllBtn) selectAllBtn.textContent = total > 0 && total === uniqueTotal ? '☑️ Всё выбрано' : '☑️ Выбрать все';
+            if (selectAllBtn) {
+                selectAllBtn.textContent = loadedAll ? '☑️ Всё выбрано' : '☑️ Выбрать все';
+                selectAllBtn.setAttribute('aria-pressed', loadedAll ? 'true' : 'false');
+            }
+            const foundBtn = document.getElementById('selectAllFoundBtn');
+            if (foundBtn) foundBtn.disabled = selectionIncludesAllFound;
+            saveSelection();
+        }
+
+        async function selectAllFound() {
+            const btn = document.getElementById('selectAllFoundBtn');
+            if (!btn || !lockAction('select-found')) return;
+            setIdleLabel(btn, '⏳ Выделение…');
+            btn.disabled = true;
+            try {
+                const form = document.querySelector('form.file-filters');
+                const response = await fetch('/api/select_by_filter', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        folder_id: currentFolderId || null,
+                        q: form ? form.querySelector('input[name="q"]').value.trim() : '',
+                        ext: form ? form.querySelector('select[name="ext"]').value : '',
+                    })
+                });
+                const result = await parseResponseJson(response);
+                if (!response.ok) { showToast('❌ ' + (result.error || 'Не удалось выделить'), true); return; }
+                (result.file_ids || []).forEach(id => selectedFiles.add(id));
+                (result.folder_ids || []).forEach(id => selectedFolders.add(id));
+                selectionIncludesAllFound = true;
+                updateSelection();
+                const selected = selectedFiles.size + selectedFolders.size;
+                if (result.truncated) {
+                    showToast(`⚠️ Выделено ${selected}: больше ${result.limit} элементов за раз не выделяем`, true);
+                } else {
+                    showToast(`✅ Выделено найденных: ${selected}`);
+                }
+            } catch (err) {
+                showToast('❌ Ошибка сети', true);
+            } finally {
+                restoreIdleLabel(btn);
+                btn.disabled = selectionIncludesAllFound;
+                unlockAction('select-found');
+            }
         }
 
         function setAllSelection(selected) {
-            document.querySelectorAll('.file-checkbox').forEach(cb => { cb.checked = selected; });
-            document.querySelectorAll('.folder-checkbox').forEach(cb => { cb.checked = selected; });
             selectedFiles.clear();
             selectedFolders.clear();
             if (selected) {
                 document.querySelectorAll('.file-checkbox').forEach(cb => selectedFiles.add(cb.dataset.fileId));
                 document.querySelectorAll('.folder-checkbox').forEach(cb => selectedFolders.add(cb.dataset.folderId));
             }
+            selectionIncludesAllFound = false;
             updateSelection();
         }
 
@@ -1721,23 +1857,47 @@ HTML_TEMPLATE = """
             setAllSelection(!!selectAll.checked);
         }
 
+        // «Выбрать все» выделяет только уже подгруженные строки; для полного
+        // набора по фильтру есть отдельная кнопка «Выбрать все найденные».
         function selectAllItems() {
-            const allCheckboxes = document.querySelectorAll('.file-checkbox, .folder-checkbox');
             const selectedTotal = selectedFiles.size + selectedFolders.size;
-            const uniqueTotal = new Set(Array.from(allCheckboxes).map(cb => (
-                cb.classList.contains('file-checkbox') ? 'f:' : 'd:'
-            ) + (cb.dataset.fileId || cb.dataset.folderId))).size;
-            setAllSelection(selectedTotal !== uniqueTotal);
+            const loadedTotal = domTotals.files + domTotals.folders;
+            const loadedAll = loadedTotal > 0
+                && selectedFiles.size >= domTotals.files
+                && selectedFolders.size >= domTotals.folders;
+            if (selectedTotal > 0 && !loadedAll) {
+                showToast('Выделены загруженные строки. Все найденные — кнопка «🔎 Выбрать все найденные»');
+            }
+            setAllSelection(!loadedAll);
         }
 
         function clearSelection() {
             setAllSelection(false);
         }
 
+        function setBatchBusy(busy) {
+            document.querySelectorAll('#batchActions button').forEach(btn => { btn.disabled = busy; });
+        }
+
+        function showBatchResult(url, count, size) {
+            const box = document.getElementById('batchResult');
+            if (!box) return;
+            box.innerHTML = '';
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = '';
+            link.textContent = `⬇ Скачать архив (${count} файл(ов), ${size})`;
+            box.appendChild(link);
+            box.hidden = false;
+        }
+
         async function batchDelete() {
             if (selectedFiles.size === 0) return;
+            if (!queueGuard('удаление выбранных')) return;
             if (!lockAction('batch-delete')) return;
             if (!confirm(`Удалить ${selectedFiles.size} файл(ов)?`)) { unlockAction('batch-delete'); return; }
+            const btn = document.getElementById('batchDeleteBtn');
+            if (btn) { setIdleLabel(btn, '⏳ Удаление…'); btn.disabled = true; }
             try {
                 const response = await fetch('/api/delete_files_batch', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1747,13 +1907,18 @@ HTML_TEMPLATE = """
                 if (response.ok) { showToast(`✅ Удалено: ${result.count}`); reloadPreservingScroll(800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
-            finally { unlockAction('batch-delete'); }
+            finally {
+                if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
+                unlockAction('batch-delete');
+            }
         }
 
         async function executeBatchZip() {
             if (selectedFiles.size === 0 && selectedFolders.size === 0) return;
-            const btn = document.querySelector('#batchActions .btn-success');
-            btn.disabled = true; btn.textContent = '⏳ Создание архива...';
+            if (!lockAction('batch-zip')) return;
+            const btn = document.getElementById('batchZipBtn');
+            setBatchBusy(true);
+            if (btn) setIdleLabel(btn, '⏳ Создание архива…');
             try {
                 const response = await fetch('/api/export_zip', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1762,14 +1927,16 @@ HTML_TEMPLATE = """
                 const result = await parseResponseJson(response);
                 if (response.ok) {
                     copyToClipboard(result.url);
-                    showToast(`✅ Архив: ${result.count} файл(ов), ${result.size}. Ссылка скопирована`);
-                    const a = document.createElement('a');
-                    a.href = result.url; a.download = '';
-                    document.body.appendChild(a); a.click(); a.remove();
-                    clearSelection();
+                    showBatchResult(result.url, result.count, result.size);
+                    showToast(`✅ Архив готов: ${result.count} файл(ов), ${result.size}. Ссылка скопирована`);
+                    setAllSelection(false);
                 } else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка сети', true); }
-            finally { btn.disabled = false; btn.textContent = '⬇ Скачать архив'; }
+            finally {
+                if (btn) restoreIdleLabel(btn);
+                setBatchBusy(false);
+                unlockAction('batch-zip');
+            }
         }
 
         async function openBatchMoveModal() {
@@ -1781,10 +1948,11 @@ HTML_TEMPLATE = """
         function closeBatchMoveModal() { closeModal('batchMoveModal'); }
 
         async function executeBatchMove() {
+            if (!queueGuard('перемещение выбранных')) return;
             if (!lockAction('batch-move')) return;
-            const btn = document.querySelector('#batchMoveModal .modal-actions .btn:last-child');
+            const btn = document.getElementById('batchMoveBtn');
             const targetFolderId = document.getElementById('batchMoveFolderId').value || null;
-            btn.disabled = true; btn.textContent = 'Перемещение...';
+            if (btn) { setIdleLabel(btn, 'Перемещение…'); btn.disabled = true; }
             try {
                 const response = await fetch('/api/move_files_batch', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1794,10 +1962,14 @@ HTML_TEMPLATE = """
                 if (response.ok) { showToast(`✅ Перемещено: ${result.count}`); closeBatchMoveModal(); reloadPreservingScroll(800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
-            finally { btn.disabled = false; btn.textContent = 'Переместить'; unlockAction('batch-move'); }
+            finally {
+                if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
+                unlockAction('batch-move');
+            }
         }
 
         async function moveFileUp(fileId) {
+            if (!queueGuard('перемещение файла')) return;
             const actionKey = `move:${fileId}`;
             if (!lockAction(actionKey)) return;
             try {
@@ -1879,8 +2051,9 @@ HTML_TEMPLATE = """
                 folder_id: document.getElementById('editFolderId').value || null
             };
             if (!data.display_name || !data.physical_filename) { showToast('❌ Имена не могут быть пустыми', true); return; }
-            const btn = document.querySelector('#editModal .modal-actions .btn:last-child');
-            btn.disabled = true; btn.textContent = 'Сохранение...';
+            if (!queueGuard('сохранение изменений')) return;
+            const btn = document.getElementById('editSaveBtn');
+            if (btn) { setIdleLabel(btn, 'Сохранение…'); btn.disabled = true; }
             try {
                 const response = await fetch('/api/update_file', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1890,7 +2063,9 @@ HTML_TEMPLATE = """
                 if (response.ok) { showToast('✅ Сохранено'); closeEditModal(); reloadPreservingScroll(800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
-            finally { btn.disabled = false; btn.textContent = 'Сохранить'; }
+            finally {
+                if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
+            }
         }
 
         function openCreateFolderModal() {
@@ -1903,8 +2078,9 @@ HTML_TEMPLATE = """
         async function createFolder() {
             const name = document.getElementById('newFolderName').value.trim();
             if (!name) { showToast('❌ Введите имя папки', true); return; }
-            const btn = document.querySelector('#createFolderModal .modal-actions .btn:last-child');
-            btn.disabled = true;
+            if (!queueGuard('создание папки')) return;
+            const btn = document.getElementById('createFolderBtn');
+            if (btn) { setIdleLabel(btn, 'Создание…'); btn.disabled = true; }
             try {
                 const response = await fetch('/api/create_folder', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1914,7 +2090,9 @@ HTML_TEMPLATE = """
                 if (response.ok) { showToast('✅ Папка создана'); closeCreateFolderModal(); reloadPreservingScroll(800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
-            finally { btn.disabled = false; }
+            finally {
+                if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
+            }
         }
 
         function confirmDelete(internalId, fileName) {
@@ -1924,9 +2102,10 @@ HTML_TEMPLATE = """
         }
         function closeDeleteModal() { closeModal('deleteModal'); }
         async function executeDelete() {
+            if (!queueGuard('удаление файла')) return;
             const internalId = document.getElementById('deleteFileId').value;
-            const btn = document.querySelector('#deleteModal .btn-danger');
-            btn.disabled = true;
+            const btn = document.getElementById('deleteFileBtn');
+            if (btn) { setIdleLabel(btn, 'Удаление…'); btn.disabled = true; }
             try {
                 const response = await fetch('/api/delete_file', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1935,7 +2114,9 @@ HTML_TEMPLATE = """
                 if (response.ok) { showToast('✅ Удалено'); closeDeleteModal(); reloadPreservingScroll(800); }
                 else { const data = await parseResponseJson(response); showToast('❌ ' + (data.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
-            finally { btn.disabled = false; }
+            finally {
+                if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
+            }
         }
 
         function confirmDeleteFolder(folderId, folderName) {
@@ -1945,9 +2126,10 @@ HTML_TEMPLATE = """
         }
         function closeDeleteFolderModal() { closeModal('deleteFolderModal'); }
         async function executeDeleteFolder() {
+            if (!queueGuard('удаление папки')) return;
             const folderId = document.getElementById('deleteFolderId').value;
-            const btn = document.querySelector('#deleteFolderModal .btn-danger');
-            btn.disabled = true;
+            const btn = document.getElementById('deleteFolderBtn');
+            if (btn) { setIdleLabel(btn, 'Удаление…'); btn.disabled = true; }
             try {
                 const response = await fetch('/api/delete_folder', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1956,7 +2138,9 @@ HTML_TEMPLATE = """
                 if (response.ok) { showToast('✅ Папка удалена'); closeDeleteFolderModal(); reloadPreservingScroll(800); }
                 else { const data = await parseResponseJson(response); showToast('❌ ' + (data.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
-            finally { btn.disabled = false; }
+            finally {
+                if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
+            }
         }
 
         const dropZone = document.getElementById('dropZone');
@@ -1990,12 +2174,15 @@ HTML_TEMPLATE = """
         }));
 
         function addFiles(files, mode) {
+            let skipped = 0;
             for (const file of files) {
                 const path = mode === 'folder' ? (file.webkitRelativePath || file.name) : file.name;
                 const key = `${mode}:${path}:${file.size}:${file.lastModified || 0}`;
                 const duplicate = selectedUploadFiles.some(item => item.key === key);
-                if (!duplicate) selectedUploadFiles.push({ file, path, mode, key });
+                if (duplicate) { skipped += 1; continue; }
+                selectedUploadFiles.push({ file, path, mode, key });
             }
+            if (skipped) showToast(`Уже в очереди: ${skipped} файл(ов) пропущено`);
             renderFileList();
         }
         function renderFileList() {
@@ -2079,6 +2266,12 @@ HTML_TEMPLATE = """
             }
         }
 
+        // Состояние выделения: считаем строки, возвращаем сохранённое выделение
+        // (страница могла быть перезагружена применением фильтра или сменой вида).
+        refreshDomTotals();
+        restoreSelection();
+        updateSelection();
+
         // ===== Ленивая подгрузка файлов вместо пагинации =====
         const lazyLoader = document.getElementById('lazyLoader');
         const loadMoreBtn = document.getElementById('loadMoreBtn');
@@ -2115,6 +2308,7 @@ HTML_TEMPLATE = """
                 const nextLoader = doc.getElementById('lazyLoader');
                 lazyNextUrl = nextLoader ? (nextLoader.dataset.nextUrl || '') : '';
                 lazyLoader.dataset.nextUrl = lazyNextUrl;
+                refreshDomTotals();
                 updateSelection();
                 if (!lazyNextUrl) {
                     lazyLoader.hidden = true;
@@ -2198,8 +2392,11 @@ HTML_TEMPLATE = """
                 const xhr = new XMLHttpRequest();
                 xhr.open('POST', batch.mode === 'folder' ? '/upload_folder' : '/upload');
                 xhr.setRequestHeader('X-CSRF-Token', csrfToken);
+                const batchBytes = batch.items.reduce((sum, item) => sum + item.file.size, 0);
                 xhr.upload.onprogress = (e) => {
-                    if (e.lengthComputable) { loadedByBatch.set(batch, e.loaded); updateProgress(); }
+                    // e.loaded включает служебные поля multipart, поэтому не даём
+                    // прогрессу обогнать реальный объём файлов в батче.
+                    if (e.lengthComputable) { loadedByBatch.set(batch, Math.min(e.loaded, batchBytes)); updateProgress(); }
                 };
                 xhr.onload = () => {
                     const expected = batch.items.length;
@@ -3410,6 +3607,41 @@ BROWSE_SORTS = (
 BROWSE_PER_PAGE = (25, 50, 100)
 
 
+def foldername_needle(query):
+    return query.casefold()
+
+
+def folder_files_matching(files, query, ext):
+    """Файлы, подходящие под строку поиска и тип — те же правила, что в проводнике."""
+    needle = foldername_needle(query or '')
+    result = []
+    for file_record in files:
+        if ext and file_record['ext'].lower() != ext:
+            continue
+        if needle:
+            haystack = ' '.join((
+                file_record.get('name', ''),
+                file_record.get('current_filename', ''),
+                file_record.get('physical_path', ''),
+                file_record.get('slug', ''),
+                file_record.get('custom_alias', ''),
+            )).casefold()
+            if needle not in haystack:
+                continue
+        result.append(file_record)
+    return result
+
+
+def sort_folder_files(files, sort):
+    if sort == 'name_asc':
+        return sorted(files, key=lambda item: item['name'].casefold())
+    if sort == 'size_desc':
+        return sorted(files, key=lambda item: item['size_raw'], reverse=True)
+    if sort == 'downloads_desc':
+        return sorted(files, key=lambda item: item.get('download_count', 0), reverse=True)
+    return files
+
+
 def _browse_url(folder_id, **params):
     path = f'/f/{folder_id}' if folder_id else '/f/'
     clean = {key: value for key, value in params.items() if value not in (None, '')}
@@ -3482,28 +3714,8 @@ def browse_folder(folder_id=None):
         ]
 
     all_files = get_files_in_folder(folder_id)
-    filtered_files = []
-    for file_record in all_files:
-        if ext and file_record['ext'].lower() != ext:
-            continue
-        if q:
-            haystack = ' '.join((
-                file_record.get('name', ''),
-                file_record.get('current_filename', ''),
-                file_record.get('physical_path', ''),
-                file_record.get('slug', ''),
-                file_record.get('custom_alias', ''),
-            )).casefold()
-            if q.casefold() not in haystack:
-                continue
-        filtered_files.append(file_record)
-
-    if sort == 'name_asc':
-        filtered_files.sort(key=lambda item: item['name'].casefold())
-    elif sort == 'size_desc':
-        filtered_files.sort(key=lambda item: item['size_raw'], reverse=True)
-    elif sort == 'downloads_desc':
-        filtered_files.sort(key=lambda item: item.get('download_count', 0), reverse=True)
+    filtered_files = folder_files_matching(all_files, q, ext)
+    filtered_files = sort_folder_files(filtered_files, sort)
     total_files = len(filtered_files)
     total_pages = max(1, (total_files + per_page - 1) // per_page)
     page = min(max(1, page), total_pages)
@@ -5211,6 +5423,51 @@ def get_all_folders():
             add_folder(fid, 0)
     
     return jsonify(result)
+
+
+# Сколько элементов разрешено выделить одним запросом: защита от гигантского
+# ответа и от случайного «выбрать всё» на десятки тысяч объектов.
+SELECT_BY_FILTER_LIMIT = 20000
+
+
+@app.route('/api/select_by_filter', methods=['POST'])
+@login_required
+def select_by_filter():
+    """Идентификаторы файлов и папок по текущему фильтру проводника.
+
+    Нужен для кнопки «Выбрать все найденные»: без него выделялись только
+    подгруженные строки, и пользователь мог собрать архив не из всего набора.
+    """
+    data = get_json_object()
+    if data is None:
+        return jsonify({'error': 'Ожидается JSON-объект'}), 400
+
+    folder_id = data.get('folder_id') or None
+    folders = load_folders()
+    if folder_id and folder_id not in folders:
+        return jsonify({'error': 'Папка не найдена'}), 404
+
+    q = (data.get('q') or '').strip()[:200]
+    ext = (data.get('ext') or '').strip().lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        ext = ''
+
+    matched_files = folder_files_matching(get_files_in_folder(folder_id), q, ext)
+    matched_folders = [
+        fid for fid, folder in folders.items()
+        if folder.get('parent_id') == folder_id
+        and (not q or q.casefold() in folder['name'].casefold())
+    ]
+
+    truncated = len(matched_files) + len(matched_folders) > SELECT_BY_FILTER_LIMIT
+    return jsonify({
+        'file_ids': [item['internal_id'] for item in matched_files][:SELECT_BY_FILTER_LIMIT],
+        'folder_ids': matched_folders[:SELECT_BY_FILTER_LIMIT],
+        'total': len(matched_files) + len(matched_folders),
+        'truncated': truncated,
+        'limit': SELECT_BY_FILTER_LIMIT,
+    })
+
 
 @app.route('/export_xlsx')
 @login_required

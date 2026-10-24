@@ -23,6 +23,24 @@ from waitress import create_server  # noqa: E402
 import server  # noqa: E402
 
 
+def shutdown(srv):
+    """Остановить сервер и его диспетчер задач.
+
+    Без остановки диспетчера поток waitress продолжает ждать задачу и на выходе
+    интерпретатора пишет OSError в stderr, засоряя вывод тестов.
+    """
+    try:
+        srv.close()
+    except Exception:  # noqa: BLE001 — сервер мог уже остановиться
+        pass
+    dispatcher = getattr(srv, 'task_dispatcher', None)
+    if dispatcher is not None:
+        try:
+            dispatcher.shutdown(timeout=1)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def echo_app(environ, start_response):
     body = '{}|{}'.format(
         environ.get('REMOTE_ADDR', ''),
@@ -54,7 +72,7 @@ class WaitressProxyTests(unittest.TestCase):
                 break
             except OSError:
                 time.sleep(0.05)
-        self.addCleanup(srv.close)
+        self.addCleanup(shutdown, srv)
         return port
 
     def request(self, port):
@@ -98,7 +116,7 @@ class WaitressProxyTests(unittest.TestCase):
         srv = create_server(server.app, host='127.0.0.1', port=port,
                             clear_untrusted_proxy_headers=False)
         threading.Thread(target=srv.run, daemon=True).start()
-        self.addCleanup(srv.close)
+        self.addCleanup(shutdown, srv)
         deadline = time.time() + 5
         while time.time() < deadline:
             try:

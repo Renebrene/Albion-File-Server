@@ -20,6 +20,8 @@ const allSteps = [
   '7 create token: secret once, hash prefix, revoke',
   '8 upload txt via UI and verify it appears',
   '9 short link icon sits between checkbox and preview',
+  '10 select all found across lazy pages, selection survives filter',
+  '11 upload queue guard and filter auto-apply',
 ];
 
 async function runStep(name, fn) {
@@ -310,6 +312,70 @@ await runStep('9 short link icon sits between checkbox and preview', async () =>
   assert.deepEqual(list, ['checkbox', 'link', 'thumb'], `порядок в списке: ${list.join(', ')}`);
   await page.click('.view-btn[data-view="table"]');
   await page.waitForTimeout(200);
+});
+
+await runStep('10 select all found across lazy pages, selection survives filter', async () => {
+  await page.goto(FOLDER_URL);
+  await page.waitForSelector('#view-table .file-row');
+  const total = parseInt((await page.locator('.card-files h2 span').first().innerText()).match(/(\d+)/)[1], 10);
+  const loaded = await page.locator('#view-table .file-row').count();
+  assert.ok(total > loaded, `файлов ${total}, подгружено ${loaded} — нужен случай с несколькими страницами`);
+
+  const foundBtn = page.locator('#selectAllFoundBtn');
+  assert.equal(await foundBtn.count(), 1, 'кнопка «Выбрать все найденные» показана');
+  await foundBtn.click();
+  await page.waitForFunction((expected) => document.getElementById('selectedCount').textContent === String(expected), total, { timeout: 15000 });
+  assert.equal(await page.locator('#selectedCount').innerText(), String(total),
+    'выделены все найденные, а не только подгруженная страница');
+
+  // выделение переживает применение фильтра (страница перезагружается)
+  await page.fill('.file-filters input[name="q"]', 'photo_059');
+  await Promise.all([
+    page.waitForURL((url) => url.searchParams.get('q') === 'photo_059', { timeout: 15000 }),
+    page.click('.file-filters button[type="submit"]'),
+  ]);
+  await page.waitForSelector('.file-row');
+  assert.equal(await page.locator('#selectedCount').innerText(), String(total),
+    'выделение восстановлено после перезагрузки');
+
+  await page.click('#batchActions .btn-secondary');
+  assert.equal(await page.locator('#selectedCount').innerText(), '0', 'снятие выделения работает');
+  await Promise.all([
+    page.waitForURL((url) => url.searchParams.get('q') === null, { timeout: 15000 }),
+    page.click('.file-filters a:has-text("Сбросить")'),
+  ]);
+  await page.waitForSelector('#view-table .file-row');
+});
+
+await runStep('11 upload queue guard and filter auto-apply', async () => {
+  await page.goto(FOLDER_URL);
+  await page.waitForSelector('#view-table .file-row');
+
+  // Очередь загрузки не должна теряться молча: сначала предупреждение
+  await page.setInputFiles('#fileInput', { name: 'guard.txt', mimeType: 'text/plain', buffer: Buffer.from('guard') });
+  assert.equal(await page.locator('#fileList .file-item').count(), 1, 'файл в очереди');
+
+  const messages = [];
+  const dismiss = async (dialog) => { messages.push(dialog.message()); await dialog.dismiss(); };
+  page.on('dialog', dismiss);
+  try {
+    await page.locator('#view-table .file-row .actions-cell button[title="Удалить"]').first().click();
+    await page.locator('#deleteModal .btn-danger').click();
+    await page.waitForTimeout(500);
+    assert.ok(messages.some((text) => /очереди загрузки/.test(text)), 'показано предупреждение об очереди');
+    assert.equal(await page.locator('#fileList .file-item').count(), 1, 'очередь сохранена после отказа');
+    assert.equal(await page.locator('#view-table .file-row').count(), 50, 'файл не удалён');
+  } finally {
+    page.off('dialog', dismiss);
+    await page.locator('#deleteModal .btn-secondary').click().catch(() => {});
+  }
+
+  // Селект фильтра применяется сразу, без кнопки «Применить»
+  await Promise.all([
+    page.waitForURL((url) => url.searchParams.get('sort') === 'name_asc', { timeout: 15000 }),
+    page.selectOption('.file-filters select[name="sort"]', 'name_asc'),
+  ]);
+  await page.waitForSelector('#view-table .file-row');
 });
 
 } catch (error) {
