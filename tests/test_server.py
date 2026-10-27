@@ -312,6 +312,74 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertNotIn(parent,server.load_folders())
         self.assertNotIn(child,server.load_folders())
 
+    def test_mutations_return_affected_ids(self):
+        """Ответы удаления/перемещения отдают точные id — клиент обновляет строки без перезагрузки."""
+        self.login()
+        for name in ('one.txt', 'two.txt'):
+            self.client.post('/upload', data={'count': '1', 'file_0': (io.BytesIO(name.encode()), name)},
+                             content_type='multipart/form-data')
+        ids = list(server.load_db())
+        folder = self.client.post('/api/create_folder', json={'name': 'Ids'}).get_json()['folder_id']
+
+        moved = self.client.post('/api/move_files_batch', json={'file_ids': ids, 'target_folder_id': folder})
+        self.assertEqual(moved.status_code, 200)
+        self.assertEqual(sorted(moved.get_json()['moved_ids']), sorted(ids))
+
+        partial = self.client.post('/api/delete_files_batch',
+                                   json={'file_ids': [ids[0], 'нет-такого-id']})
+        self.assertEqual(partial.status_code, 200)
+        self.assertEqual(partial.get_json()['deleted_ids'], [ids[0]])
+        self.assertEqual(partial.get_json()['count'], 1)
+
+        single = self.client.post('/api/delete_file', json={'internal_id': ids[1]})
+        self.assertEqual(single.status_code, 200)
+        self.assertEqual(single.get_json()['deleted_ids'], [ids[1]])
+        self.assertFalse(server.load_db())
+
+    def test_move_file_reports_moved_flag(self):
+        """Отсутствующий на диске файл не двигается: ответ success, но moved=False."""
+        self.login()
+        self.client.post('/upload', data={'count': '1', 'file_0': (io.BytesIO(b'x'), 'gone.txt')},
+                         content_type='multipart/form-data')
+        fid, rec = next(iter(server.load_db().items()))
+        folder = self.client.post('/api/create_folder', json={'name': 'Dest'}).get_json()['folder_id']
+
+        os.remove(server.safe_upload_path(rec.get('physical_path', rec['current_filename'])))
+        response = self.client.post('/api/move_file', json={'file_id': fid, 'target_folder_id': folder})
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.get_json()['moved'])
+        self.assertIsNone(server.load_db()[fid]['folder_id'])
+
+    def test_delete_folder_returns_deleted_folder_ids(self):
+        self.login()
+        parent = self.client.post('/api/create_folder', json={'name': 'P'}).get_json()['folder_id']
+        child = self.client.post('/api/create_folder', json={'name': 'C', 'parent_id': parent}).get_json()['folder_id']
+        response = self.client.post('/api/delete_folder', json={'folder_id': parent})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(sorted(response.get_json()['deleted_folder_ids']), sorted([parent, child]))
+
+    def test_update_file_alias_error_leaves_disk_and_db_untouched(self):
+        """Регресс: ошибка алиаса не должна оставлять файл переименованным на диске."""
+        self.login()
+        self.client.post('/upload', data={'count': '1', 'file_0': (io.BytesIO(b'keep'), 'before.txt')},
+                         content_type='multipart/form-data')
+        fid, rec = next(iter(server.load_db().items()))
+        old_path = server.safe_upload_path(rec.get('physical_path', rec['current_filename']))
+        self.assertTrue(os.path.exists(old_path))
+
+        # 'settings' — зарезервированный системный путь, 'bad alias!' — недопустимые символы.
+        for bad_alias in ('bad alias!', 'settings'):
+            response = self.client.post('/api/update_file', json={
+                'internal_id': fid, 'display_name': 'After', 'physical_filename': 'after.txt',
+                'custom_alias': bad_alias, 'folder_id': None,
+            })
+            self.assertEqual(response.status_code, 400, bad_alias)
+
+        self.assertTrue(os.path.exists(old_path), 'исходный файл не должен исчезнуть')
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(old_path), 'after.txt')),
+                         'файл не должен быть переименован при ошибке алиаса')
+        self.assertEqual(server.load_db()[fid]['current_filename'], 'before.txt')
+
     def test_redis_budget_branch(self):
         class FakeRedis:
             def __init__(self):

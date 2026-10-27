@@ -1170,7 +1170,7 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="card card-files">
-            <h2>📂 {{ 'Корень' if not current_folder else current_folder.name }} <span style="color:#64748b; font-weight:400; font-size:13px;">({{ total_files }} файлов, {{ subfolders|length }} папок)</span>
+            <h2>📂 {{ 'Корень' if not current_folder else current_folder.name }} <span style="color:#64748b; font-weight:400; font-size:13px;">(<span id="titleFileCount">{{ total_files }}</span> файлов, <span id="titleFolderCount">{{ subfolders|length }}</span> папок)</span>
                 {% if current_folder %}
                 <button class="btn btn-sm" style="margin:0 0 0 8px; vertical-align:middle;" onclick='copyToClipboard("{{ base_url }}/d/{{ current_folder_slug or current_folder_id }}")' title="Скопировать публичную ссылку на эту папку">🔗 Ссылка на папку</button>
                 {% endif %}
@@ -1209,7 +1209,7 @@ HTML_TEMPLATE = """
                 <input type="hidden" name="view" value="{{ view }}">
                 <button class="btn btn-sm" type="submit">Применить</button>
                 <a class="btn btn-sm btn-secondary" href="{{ reset_url }}">Сбросить</a>
-                <span class="filter-result">Найдено: <strong>{{ total_files }}</strong>{% if files|length < total_files %} · показано {{ files|length }}{% endif %}</span>
+                <span class="filter-result">Найдено: <strong id="foundCount">{{ total_files }}</strong>{% if files|length < total_files %} · показано <span id="shownCount">{{ files|length }}</span>{% endif %}</span>
             </form>
 
             <div class="batch-actions" id="batchActions">
@@ -1415,12 +1415,12 @@ HTML_TEMPLATE = """
     <footer class="status-bar">
         <div class="status-item">
             <span class="label">📁 Файлов:</span>
-            <span class="value">{{ total_files }}</span>
+            <span class="value" id="footerFileCount">{{ total_files }}</span>
         </div>
         <span class="separator">│</span>
         <div class="status-item">
             <span class="label">📂 Папок:</span>
-            <span class="value">{{ subfolders|length }}</span>
+            <span class="value" id="footerFolderCount">{{ subfolders|length }}</span>
         </div>
         <span class="separator">│</span>
         <div class="status-item">
@@ -1672,7 +1672,6 @@ HTML_TEMPLATE = """
                 showToast('Файл уже в этой папке');
                 return;
             }
-            if (!queueGuard('перемещение файла')) return;
             const actionKey = `drop:${fileId}`;
             if (!lockAction(actionKey)) return;
             try {
@@ -1681,7 +1680,10 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ file_id: fileId, target_folder_id: targetFolderId })
                 });
                 const result = await parseResponseJson(response);
-                if (response.ok) { showToast('✅ Файл перемещён'); reloadPreservingScroll(800); }
+                if (response.ok) {
+                    showToast('✅ Файл перемещён');
+                    if (result.moved) removeRows([fileId]);
+                }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка сети', true); }
             finally { unlockAction(actionKey); }
@@ -1697,6 +1699,59 @@ HTML_TEMPLATE = """
                 files: document.querySelectorAll('.file-checkbox').length,
                 folders: document.querySelectorAll('.folder-checkbox').length,
             };
+        }
+
+        // Счётчики «Файлов/Папок», «Найдено» и футер обновляются без перезагрузки,
+        // когда строки удаляются или уходят из папки (удаление/перемещение).
+        function adjustCounters(fileDelta, folderDelta) {
+            const bump = (id, delta) => {
+                if (!delta) return;
+                const el = document.getElementById(id);
+                if (!el) return;
+                const current = parseInt(el.textContent, 10);
+                el.textContent = String(Math.max(0, (isNaN(current) ? 0 : current) + delta));
+            };
+            bump('titleFileCount', fileDelta);
+            bump('titleFolderCount', folderDelta);
+            bump('foundCount', fileDelta);
+            bump('footerFileCount', fileDelta);
+            bump('footerFolderCount', folderDelta);
+            const shown = document.getElementById('shownCount');
+            if (shown) shown.textContent = String(document.querySelectorAll(lazyFileSelector()).length);
+            const foundBtn = document.getElementById('selectAllFoundBtn');
+            const foundCount = document.getElementById('foundCount');
+            if (foundBtn && foundCount) {
+                foundBtn.textContent = `🔎 Выбрать все найденные (${foundCount.textContent})`;
+                foundBtn.dataset.idleLabel = foundBtn.textContent;
+            }
+        }
+
+        // Точечное удаление строк после удаления/перемещения — вместо полной
+        // перезагрузки страницы. Убираем только те id, что подтвердил сервер;
+        // счётчики и выделение приводим в согласованное состояние.
+        function removeRows(fileIds, folderIds) {
+            const files = Array.from(fileIds || []);
+            const folders = Array.from(folderIds || []);
+            if (!files.length && !folders.length) return;
+            const esc = (value) => (window.CSS && CSS.escape) ? CSS.escape(String(value)) : String(value);
+            let folderRowsRemoved = 0;
+            files.forEach(id => {
+                selectedFiles.delete(id);
+                document.querySelectorAll(
+                    `.file-row[data-file-id="${esc(id)}"], .tile[data-file-id="${esc(id)}"], .list-item[data-file-id="${esc(id)}"]`
+                ).forEach(el => el.remove());
+            });
+            folders.forEach(id => {
+                selectedFolders.delete(id);
+                const rows = document.querySelectorAll(
+                    `.folder-row[data-folder-id="${esc(id)}"], .tile[data-folder-id="${esc(id)}"], .list-item.folder-item[data-folder-id="${esc(id)}"]`
+                );
+                folderRowsRemoved += rows.length;
+                rows.forEach(el => el.remove());
+            });
+            adjustCounters(-files.length, -folderRowsRemoved);
+            refreshDomTotals();
+            updateSelection();
         }
 
         // Выделение переживает перезагрузку страницы: применение фильтра и смена
@@ -1893,7 +1948,6 @@ HTML_TEMPLATE = """
 
         async function batchDelete() {
             if (selectedFiles.size === 0) return;
-            if (!queueGuard('удаление выбранных')) return;
             if (!lockAction('batch-delete')) return;
             if (!confirm(`Удалить ${selectedFiles.size} файл(ов)?`)) { unlockAction('batch-delete'); return; }
             const btn = document.getElementById('batchDeleteBtn');
@@ -1904,7 +1958,11 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ file_ids: Array.from(selectedFiles) })
                 });
                 const result = await parseResponseJson(response);
-                if (response.ok) { showToast(`✅ Удалено: ${result.count}`); reloadPreservingScroll(800); }
+                if (response.ok) {
+                    showToast(`✅ Удалено: ${result.count}`);
+                    if (Array.isArray(result.deleted_ids)) removeRows(result.deleted_ids);
+                    else reloadPreservingScroll(800);
+                }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
             finally {
@@ -1948,7 +2006,6 @@ HTML_TEMPLATE = """
         function closeBatchMoveModal() { closeModal('batchMoveModal'); }
 
         async function executeBatchMove() {
-            if (!queueGuard('перемещение выбранных')) return;
             if (!lockAction('batch-move')) return;
             const btn = document.getElementById('batchMoveBtn');
             const targetFolderId = document.getElementById('batchMoveFolderId').value || null;
@@ -1959,7 +2016,12 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ file_ids: Array.from(selectedFiles), target_folder_id: targetFolderId })
                 });
                 const result = await parseResponseJson(response);
-                if (response.ok) { showToast(`✅ Перемещено: ${result.count}`); closeBatchMoveModal(); reloadPreservingScroll(800); }
+                if (response.ok) {
+                    showToast(`✅ Перемещено: ${result.count}`);
+                    closeBatchMoveModal();
+                    if (Array.isArray(result.moved_ids)) removeRows(result.moved_ids);
+                    else reloadPreservingScroll(800);
+                }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
             finally {
@@ -1969,7 +2031,6 @@ HTML_TEMPLATE = """
         }
 
         async function moveFileUp(fileId) {
-            if (!queueGuard('перемещение файла')) return;
             const actionKey = `move:${fileId}`;
             if (!lockAction(actionKey)) return;
             try {
@@ -1978,7 +2039,10 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({ file_id: fileId, target_folder_id: parentFolderId || null })
                 });
                 const result = await parseResponseJson(response);
-                if (response.ok) { showToast('✅ Перемещён выше'); reloadPreservingScroll(800); }
+                if (response.ok) {
+                    showToast('✅ Перемещён выше');
+                    if (result.moved) removeRows([fileId]);
+                }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
             finally { unlockAction(actionKey); }
@@ -2102,7 +2166,6 @@ HTML_TEMPLATE = """
         }
         function closeDeleteModal() { closeModal('deleteModal'); }
         async function executeDelete() {
-            if (!queueGuard('удаление файла')) return;
             const internalId = document.getElementById('deleteFileId').value;
             const btn = document.getElementById('deleteFileBtn');
             if (btn) { setIdleLabel(btn, 'Удаление…'); btn.disabled = true; }
@@ -2111,7 +2174,11 @@ HTML_TEMPLATE = """
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ internal_id: internalId })
                 });
-                if (response.ok) { showToast('✅ Удалено'); closeDeleteModal(); reloadPreservingScroll(800); }
+                if (response.ok) {
+                    showToast('✅ Удалено');
+                    closeDeleteModal();
+                    removeRows([internalId]);
+                }
                 else { const data = await parseResponseJson(response); showToast('❌ ' + (data.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
             finally {
@@ -2126,7 +2193,6 @@ HTML_TEMPLATE = """
         }
         function closeDeleteFolderModal() { closeModal('deleteFolderModal'); }
         async function executeDeleteFolder() {
-            if (!queueGuard('удаление папки')) return;
             const folderId = document.getElementById('deleteFolderId').value;
             const btn = document.getElementById('deleteFolderBtn');
             if (btn) { setIdleLabel(btn, 'Удаление…'); btn.disabled = true; }
@@ -2135,7 +2201,11 @@ HTML_TEMPLATE = """
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ folder_id: folderId })
                 });
-                if (response.ok) { showToast('✅ Папка удалена'); closeDeleteFolderModal(); reloadPreservingScroll(800); }
+                if (response.ok) {
+                    showToast('✅ Папка удалена');
+                    closeDeleteFolderModal();
+                    removeRows([], [folderId]);
+                }
                 else { const data = await parseResponseJson(response); showToast('❌ ' + (data.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Ошибка', true); }
             finally {
@@ -2840,6 +2910,10 @@ TOKENS_TEMPLATE = """
                     </select>
                 </div>
                 <div class="group">
+                    <label style="font-weight:400"><input type="checkbox" name="simple" value="1" {% if form.simple %}checked{% endif %}> Простой токен из 8 кириллических букв</label>
+                    <div class="hint">Регистр не важен. Удобно для бригад: токен можно записать в папку бригады.</div>
+                </div>
+                <div class="group">
                     <label for="tokenExpires">Срок действия, дней</label>
                     <input id="tokenExpires" type="number" name="expires_days" min="1" max="3650" step="1" value="{{ form.expires_days }}">
                     <label style="font-weight:400;margin-top:8px"><input type="checkbox" name="no_expiry" value="1" {% if form.no_expiry %}checked{% endif %}> Бессрочный токен</label>
@@ -2944,16 +3018,30 @@ def _token_is_expired(value):
     return token_store.token_expired(value)
 
 def check_api_key(provided):
-    """Метаданные ключа + его hash-id, либо None."""
+    """Метаданные ключа + его hash-id, либо None.
+
+    Поддерживаются оба формата:
+    * legacy-ключ `alb_...` (регистрозависимый);
+    * простой токен из 8 кириллических букв (регистронезависимый,
+      передаётся в percent-encoding, например `%D0%9F%D0%A0...`).
+    """
     if not provided:
         return None
-    key_hash = hashlib.sha256(provided.encode('utf-8')).hexdigest()
     try:
-        meta = load_tokens().get(key_hash)
+        tokens = load_tokens()
     except token_store.TokenStoreError:
         app.logger.exception('Не удалось прочитать tokens.json')
         return None
-    if not meta or not isinstance(meta, dict):
+
+    key_hash = None
+    meta = None
+    for candidate in token_store.api_key_hash_candidates(provided):
+        found = tokens.get(candidate)
+        if isinstance(found, dict):
+            key_hash, meta = candidate, found
+            break
+
+    if not meta:
         return None
     scopes = _token_scopes(meta)
     expired = _token_is_expired(meta.get('expires_at'))
@@ -3870,6 +3958,7 @@ def _render_tokens_page(error=None, form=None, new_token=None,
         'folder_id': '',
         'expires_days': token_store.DEFAULT_TTL_DAYS,
         'no_expiry': False,
+        'simple': False,
     }
     folder_options = []
     for folder_id in folders:
@@ -3942,12 +4031,19 @@ def token_create():
         'folder_id': request.form.get('folder_id', '').strip(),
         'expires_days': request.form.get('expires_days', '').strip(),
         'no_expiry': request.form.get('no_expiry') == '1',
+        'simple': request.form.get('simple') == '1',
     }
     folders = load_folders()
-    raw_token, token_id = token_store.generate_token()
+    if form['simple']:
+        raw_token = token_store.generate_simple_token()
+        token_id = token_store.simple_token_hash(raw_token)
+    else:
+        raw_token, token_id = token_store.generate_token()
     created = {}
 
     def add_token(tokens):
+        if token_id in tokens:
+            raise ValueError('Сгенерированный токен уже существует, попробуйте ещё раз.')
         name, scopes, folder_id, expires_at = token_store.validate_issuance(
             form['name'], form['scopes'], form['folder_id'], folders,
             form['expires_days'], no_expiry=form['no_expiry'],
@@ -3956,7 +4052,9 @@ def token_create():
                 if isinstance(meta, dict)
             ],
         )
-        record = token_store.build_record(name, scopes, folder_id, expires_at)
+        record = token_store.build_record(
+            name, scopes, folder_id, expires_at,
+            kind='simple' if form['simple'] else None)
         tokens[token_id] = record
         created['record'] = record
 
@@ -4480,6 +4578,17 @@ def public_folder(folder_ref):
 INTEGRATION_TTL_MAX_DAYS = 3650
 INTEGRATION_UPLOAD_RATE = '60 per minute'
 
+# Для интеграции разрешены ещё и файлы базы данных; веб-загрузка их по-прежнему
+# не принимает (ALLOWED_EXTENSIONS не меняем).
+INTEGRATION_EXTRA_EXTENSIONS = {'db', 'sqlite', 'sqlite3'}
+
+
+def allowed_integration_file(filename):
+    if not filename or '.' not in filename:
+        return False
+    ext = filename.rsplit('.', 1)[1].lower()
+    return ext in ALLOWED_EXTENSIONS or ext in INTEGRATION_EXTRA_EXTENSIONS
+
 def _integration_ttl_days():
     """TTL по умолчанию из ALBION_INTEGRATION_TTL_DAYS, всегда в диапазоне 1..3650."""
     raw = os.environ.get('ALBION_INTEGRATION_TTL_DAYS', '90')
@@ -4542,7 +4651,7 @@ def integration_upload():
         return jsonify({'error': 'Недопустимое имя файла'}), 400
     if not is_valid_filename(original_name):
         return jsonify({'error': 'Недопустимое имя файла'}), 400
-    if not allowed_file(original_name):
+    if not allowed_integration_file(original_name):
         return jsonify({'error': 'Недопустимое расширение файла'}), 400
 
     display_name = (request.form.get('display_name') or '').strip() or original_name
@@ -4650,6 +4759,79 @@ def integration_upload():
         'folder_id': folder_id,
         'expires_at': expires_at,
     })
+
+@app.route('/api/v1/integration/files', methods=['GET'])
+@limiter.limit(INTEGRATION_UPLOAD_RATE, key_func=_integration_rate_limit_key)
+def integration_list_files():
+    """Список файлов папки, к которой привязан токен (право download)."""
+    meta, error = require_api_scope('download')
+    if error:
+        return error
+
+    folder_id = meta.get('folder_id')
+    if not folder_id:
+        return jsonify({'error': 'Токен не привязан к папке'}), 403
+
+    folders = load_folders()
+    if folder_id not in folders:
+        return jsonify({'error': 'Папка не найдена'}), 404
+
+    db = load_db()
+    files = []
+    for internal_id, record in db.items():
+        if record.get('folder_id') != folder_id:
+            continue
+        physical_path = record.get('physical_path', record.get('current_filename'))
+        safe_path = safe_upload_path(physical_path)
+        if not safe_path or not os.path.isfile(safe_path):
+            continue
+        if record.get('deleted_at'):
+            continue
+        files.append({
+            'file_id': internal_id,
+            'name': record.get('current_filename'),
+            'display_name': record.get('display_name'),
+            'ext': record.get('ext'),
+            'size': os.path.getsize(safe_path),
+            'mtime': os.path.getmtime(safe_path),
+            'url': f"{BASE_URL}/{url_path(physical_path)}",
+        })
+
+    files.sort(key=lambda item: item['mtime'], reverse=True)
+    return jsonify({'folder_id': folder_id, 'files': files})
+
+
+@app.route('/api/v1/integration/files/<file_id>/download', methods=['GET'])
+@limiter.limit(INTEGRATION_UPLOAD_RATE, key_func=_integration_rate_limit_key)
+def integration_download_file(file_id):
+    """Скачивание файла из папки токена (право download)."""
+    meta, error = require_api_scope('download')
+    if error:
+        return error
+
+    folder_id = meta.get('folder_id')
+    if not folder_id:
+        return jsonify({'error': 'Токен не привязан к папке'}), 403
+
+    db = load_db()
+    record = db.get(file_id)
+    if not record or record.get('deleted_at'):
+        return jsonify({'error': 'Файл не найден'}), 404
+    if record.get('folder_id') != folder_id:
+        return jsonify({'error': 'Файл находится в другой папке'}), 403
+
+    physical_path = record.get('physical_path', record.get('current_filename'))
+    safe_path = safe_upload_path(physical_path)
+    if not safe_path or not os.path.isfile(safe_path):
+        return jsonify({'error': 'Файл не найден на диске'}), 404
+
+    return send_file(
+        safe_path,
+        as_attachment=True,
+        download_name=record.get('current_filename') or os.path.basename(safe_path),
+        max_age=0,
+    )
+
 
 @app.route('/api/v1/integration/files/<file_id>', methods=['DELETE'])
 @limiter.limit(INTEGRATION_UPLOAD_RATE, key_func=_integration_rate_limit_key)
@@ -5022,6 +5204,18 @@ def update_file():
                 and other.get('current_filename') == physical_filename:
             return jsonify({'error': 'Файл с таким именем уже есть в этой папке'}), 400
 
+    # Алиас проверяем ДО переименования на диске: иначе ошибка алиаса
+    # оставила бы файл переименованным, а запись в БД — со старым путём.
+    if custom_alias:
+        if not re.match(r'^[a-zA-Z0-9_-]+$', custom_alias):
+            return jsonify({'error': 'Алиас: только латиница, цифры, дефис'}), 400
+        # Алиас не может маскироваться под системный маршрут
+        if custom_alias.lower() in RESERVED_PATHS:
+            return jsonify({'error': 'Этот алиас зарезервирован системой'}), 400
+        for fid, rec in db.items():
+            if fid != internal_id and rec.get('custom_alias') == custom_alias:
+                return jsonify({'error': 'Алиас уже занят'}), 400
+
     new_folder_candidate = get_folder_physical_path(new_folder_id, folders)
     new_folder_rel = os.path.relpath(new_folder_candidate, UPLOAD_FOLDER)
     new_folder_physical = safe_upload_path(new_folder_rel, allow_root=True)
@@ -5061,14 +5255,6 @@ def update_file():
         record['display_name'] = display_name
 
     if custom_alias:
-        if not re.match(r'^[a-zA-Z0-9_-]+$', custom_alias):
-            return jsonify({'error': 'Алиас: только латиница, цифры, дефис'}), 400
-        # Алиас не может маскироваться под системный маршрут
-        if custom_alias.lower() in RESERVED_PATHS:
-            return jsonify({'error': 'Этот алиас зарезервирован системой'}), 400
-        for fid, rec in db.items():
-            if fid != internal_id and rec.get('custom_alias') == custom_alias:
-                return jsonify({'error': 'Алиас уже занят'}), 400
         record['custom_alias'] = custom_alias
 
     save_db(db)
@@ -5132,22 +5318,24 @@ def move_file():
         new_physical_path = os.path.join(new_folder_physical, final_filename)
         new_rel_path = os.path.relpath(new_physical_path, UPLOAD_FOLDER)
 
+    moved = False
     if os.path.exists(old_full_path):
         try:
             os.rename(old_full_path, new_physical_path)
             record['physical_path'] = new_rel_path
             record['current_filename'] = final_filename
             record['folder_id'] = target_folder_id
-            
+
             if old_physical_path != new_rel_path:
                 record['access_id'] = str(uuid.uuid4())
                 record['custom_alias'] = ''
                 record['link_rotated'] = True
+            moved = True
         except Exception as e:
             return jsonify({'error': f'Ошибка: {str(e)}'}), 500
 
     save_db(db)
-    return jsonify({'success': True})
+    return jsonify({'success': True, 'moved': moved})
 
 @app.route('/api/move_files_batch', methods=['POST'])
 @login_required
@@ -5169,6 +5357,7 @@ def move_files_batch():
         return jsonify({'error': 'Целевая папка не найдена'}), 404
 
     moved_count = 0
+    moved_ids = []
     new_folder_candidate = get_folder_physical_path(target_folder_id, folders)
     new_folder_rel = os.path.relpath(new_folder_candidate, UPLOAD_FOLDER)
     new_folder_physical = safe_upload_path(new_folder_rel, allow_root=True)
@@ -5226,11 +5415,12 @@ def move_files_batch():
                     record['link_rotated'] = True
                 
                 moved_count += 1
+                moved_ids.append(file_id)
             except Exception as e:
                 continue
 
     save_db(db)
-    return jsonify({'success': True, 'count': moved_count})
+    return jsonify({'success': True, 'count': moved_count, 'moved_ids': moved_ids})
 
 @app.route('/api/delete_files_batch', methods=['POST'])
 @login_required
@@ -5246,6 +5436,7 @@ def delete_files_batch():
 
     db = load_db()
     deleted_count = 0
+    deleted_ids = []
 
     for file_id in file_ids:
         if file_id not in db:
@@ -5263,11 +5454,12 @@ def delete_files_batch():
                 os.remove(filepath)
                 del db[file_id]
                 deleted_count += 1
+                deleted_ids.append(file_id)
             except Exception as e:
                 continue
 
     save_db(db)
-    return jsonify({'success': True, 'count': deleted_count})
+    return jsonify({'success': True, 'count': deleted_count, 'deleted_ids': deleted_ids})
 
 @app.route('/api/create_folder', methods=['POST'])
 @login_required
@@ -5370,8 +5562,8 @@ def delete_folder():
     delete_recursive(folder_id)
     save_db(db)
     save_folders(folders)
-    
-    return jsonify({'success': True})
+
+    return jsonify({'success': True, 'deleted_folder_ids': sorted(subtree)})
 
 @app.route('/api/delete_file', methods=['POST'])
 @login_required
@@ -5400,7 +5592,7 @@ def delete_file():
 
     del db[internal_id]
     save_db(db)
-    return jsonify({'success': True})
+    return jsonify({'success': True, 'deleted_ids': [internal_id]})
 
 @app.route('/api/get_all_folders')
 @login_required

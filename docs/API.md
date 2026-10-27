@@ -70,15 +70,17 @@
 | `POST /upload_folder` | multipart: `count`, `file_i`, `path_i` (относительный путь), `folder_id` | `{"count": N, "folders_created": N}` |
 | `POST /api/create_folder` | JSON: `{"name": str, "parent_id": UUID|null}` | `{"success": true, "folder_id": UUID}` |
 | `POST /api/update_file` | JSON: `internal_id`, `display_name`, `physical_filename`, `custom_alias`, `folder_id` | `{"success": true}` |
-| `POST /api/move_file` | JSON: `{"file_id": UUID, "target_folder_id": UUID|null}` | `{"success": true}` |
-| `POST /api/move_files_batch` | JSON: `{"file_ids": [UUID], "target_folder_id": UUID|null}` | `{"success": true, "count": N}` |
-| `POST /api/delete_file` | JSON: `{"internal_id": UUID}` | `{"success": true}` |
-| `POST /api/delete_files_batch` | JSON: `{"file_ids": [UUID]}` | `{"success": true, "count": N}` |
-| `POST /api/delete_folder` | JSON: `{"folder_id": UUID}` | `{"success": true}` |
+| `POST /api/move_file` | JSON: `{"file_id": UUID, "target_folder_id": UUID|null}` | `{"success": true, "moved": bool}` |
+| `POST /api/move_files_batch` | JSON: `{"file_ids": [UUID], "target_folder_id": UUID|null}` | `{"success": true, "count": N, "moved_ids": [UUID]}` |
+| `POST /api/delete_file` | JSON: `{"internal_id": UUID}` | `{"success": true, "deleted_ids": [UUID]}` |
+| `POST /api/delete_files_batch` | JSON: `{"file_ids": [UUID]}` | `{"success": true, "count": N, "deleted_ids": [UUID]}` |
+| `POST /api/delete_folder` | JSON: `{"folder_id": UUID}` | `{"success": true, "deleted_folder_ids": [UUID]}` |
 | `GET /api/get_all_folders` | — | `[{"id": UUID, "name": str, "depth": N}]` |
 | `POST /api/export_zip` | JSON: `{"file_ids": [UUID], "folder_ids": [UUID]}` | `{"url": "https://.../z/<uuid>", "count": N, "size": str}` |
 
 Ошибки API возвращаются JSON вида `{"error": "..."}` (валидация — 400, не найдено — 404, rate/budget — 429). `Retry-After` задаёт задержку перед повтором.
+
+Поля `moved`/`moved_ids`/`deleted_ids`/`deleted_folder_ids` перечисляют только фактически изменённые объекты: пакетные операции пропускают неизвестные или неудачные id, и `count` может быть меньше запрошенного. Клиентский интерфейс использует эти поля, чтобы убирать строки из списка без полной перезагрузки страницы.
 
 ## API-ключи и автоматическое скачивание
 

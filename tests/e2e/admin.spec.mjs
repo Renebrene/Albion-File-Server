@@ -22,6 +22,7 @@ const allSteps = [
   '9 short link icon sits between checkbox and preview',
   '10 select all found across lazy pages, selection survives filter',
   '11 upload queue guard and filter auto-apply',
+  '12 delete and move update rows without reload',
 ];
 
 async function runStep(name, fn) {
@@ -351,7 +352,8 @@ await runStep('11 upload queue guard and filter auto-apply', async () => {
   await page.goto(FOLDER_URL);
   await page.waitForSelector('#view-table .file-row');
 
-  // Очередь загрузки не должна теряться молча: сначала предупреждение
+  // Очередь загрузки не должна теряться молча. Проверяем на действии, которое
+  // всё ещё перезагружает страницу — создание папки (удаление больше не перезагружает).
   await page.setInputFiles('#fileInput', { name: 'guard.txt', mimeType: 'text/plain', buffer: Buffer.from('guard') });
   assert.equal(await page.locator('#fileList .file-item').count(), 1, 'файл в очереди');
 
@@ -359,15 +361,16 @@ await runStep('11 upload queue guard and filter auto-apply', async () => {
   const dismiss = async (dialog) => { messages.push(dialog.message()); await dialog.dismiss(); };
   page.on('dialog', dismiss);
   try {
-    await page.locator('#view-table .file-row .actions-cell button[title="Удалить"]').first().click();
-    await page.locator('#deleteModal .btn-danger').click();
+    await page.click('button:has-text("➕ Новая папка")');
+    await page.fill('#newFolderName', 'GuardCheck');
+    await page.click('#createFolderBtn');
     await page.waitForTimeout(500);
     assert.ok(messages.some((text) => /очереди загрузки/.test(text)), 'показано предупреждение об очереди');
     assert.equal(await page.locator('#fileList .file-item').count(), 1, 'очередь сохранена после отказа');
-    assert.equal(await page.locator('#view-table .file-row').count(), 50, 'файл не удалён');
+    assert.equal(await page.locator('#view-table .file-row').count(), 50, 'папка не создана: страница не перезагрузилась');
   } finally {
     page.off('dialog', dismiss);
-    await page.locator('#deleteModal .btn-secondary').click().catch(() => {});
+    await page.locator('#createFolderModal .btn-secondary').click().catch(() => {});
   }
 
   // Селект фильтра применяется сразу, без кнопки «Применить»
@@ -376,6 +379,59 @@ await runStep('11 upload queue guard and filter auto-apply', async () => {
     page.selectOption('.file-filters select[name="sort"]', 'name_asc'),
   ]);
   await page.waitForSelector('#view-table .file-row');
+});
+
+await runStep('12 delete and move update rows without reload', async () => {
+  await page.goto(FOLDER_URL);
+  await page.waitForSelector('#view-table .file-row');
+
+  // Папку-приёмник создаём заранее: само создание папки пока перезагружает страницу.
+  await page.click('button:has-text("➕ Новая папка")');
+  await page.fill('#newFolderName', 'MoveTarget');
+  await Promise.all([
+    page.waitForNavigation({ timeout: 15000 }),
+    page.click('#createFolderBtn'),
+  ]);
+  await page.waitForSelector('#view-table .file-row');
+
+  // Маркер документа: переживает правки DOM, но исчезает при перезагрузке.
+  await page.evaluate(() => { window.__noReload = 'kept'; });
+
+  // --- Удаление одного файла через модалку: строка исчезает без перезагрузки ---
+  const rowsBeforeDelete = await page.locator('#view-table .file-row').count();
+  const totalBeforeDelete = Number(await page.locator('#foundCount').innerText());
+  await page.locator('#view-table .file-row .actions-cell button[title="Удалить"]').first().click();
+  await page.locator('#deleteModal .btn-danger').click();
+  await page.waitForFunction(
+    (n) => document.querySelectorAll('#view-table .file-row').length === n - 1,
+    rowsBeforeDelete, { timeout: 10000 });
+  assert.equal(await page.evaluate(() => window.__noReload), 'kept', 'удаление не перезагружает страницу');
+  assert.equal(await page.locator('#view-table .file-row').count(), rowsBeforeDelete - 1, 'строка удалена');
+  assert.equal(Number(await page.locator('#foundCount').innerText()), totalBeforeDelete - 1,
+    'счётчик «Найдено» уменьшился');
+
+  // --- Перемещение выбранного файла в созданную папку: тоже без перезагрузки ---
+  const rowsBeforeMove = await page.locator('#view-table .file-row').count();
+  await page.locator('#view-table .file-row .checkbox-cell input').first().check();
+  await page.locator('#batchActions button', { hasText: 'Переместить' }).click();
+  await page.waitForFunction(() => {
+    const select = document.getElementById('batchMoveFolderId');
+    return !!select && Array.from(select.options).some((option) => option.textContent.includes('MoveTarget'));
+  }, null, { timeout: 10000 });
+  const targetFolderValue = await page.evaluate(() => {
+    const select = document.getElementById('batchMoveFolderId');
+    const option = Array.from(select.options).find((item) => item.textContent.includes('MoveTarget'));
+    return option ? option.value : '';
+  });
+  assert.ok(targetFolderValue, 'папка MoveTarget есть в списке перемещения');
+  await page.selectOption('#batchMoveFolderId', targetFolderValue);
+  await page.click('#batchMoveBtn');
+  await page.waitForFunction(
+    (n) => document.querySelectorAll('#view-table .file-row').length === n - 1,
+    rowsBeforeMove, { timeout: 10000 });
+  assert.equal(await page.evaluate(() => window.__noReload), 'kept', 'перемещение не перезагружает страницу');
+  assert.equal(await page.locator('#view-table .file-row').count(), rowsBeforeMove - 1,
+    'перемещённая строка исчезла из текущей папки');
 });
 
 } catch (error) {

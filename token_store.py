@@ -7,7 +7,10 @@ these helpers so scopes, expiry and folder binding cannot drift apart.
 import hashlib
 import json
 import os
+import re
 import secrets
+import unicodedata
+import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -129,9 +132,99 @@ def generate_token():
     return raw, hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 
-def build_record(name, scopes, folder_id, expires_at, now=None):
+# ===== ПРОСТЫЕ 8-БУКВЕННЫЕ КИРИЛЛИЧЕСКИЕ ТОКЕНЫ =====
+# Для бригад используется короткий токен из 8 кириллических букв. Регистр не
+# важен: «Пролонг1» и «ПРОЛОНГ1» — один и тот же токен (цифры не допускаются).
+# В БД по-прежнему хранится только SHA-256, но с отдельным пространством имён,
+# чтобы хеш простого токена не совпал с хешем legacy-ключа alb_....
+SIMPLE_TOKEN_NAMESPACE = 'albion-simple-v1:'
+SIMPLE_TOKEN_LENGTH = 8
+# Для генерации исключаем редко используемые/похожие буквы; при проверке
+# принимаются все буквы а-я и ё.
+SIMPLE_TOKEN_ALPHABET = 'абвгдежзиклмнопрстуфхцчшщэюя'
+_SIMPLE_TOKEN_RE = re.compile(r'^[а-яё]{8}$')
+
+
+def normalize_simple_token(value):
+    """NFC + trim + casefold. Возвращает '' для не-строк."""
+    if not isinstance(value, str):
+        return ''
+    return unicodedata.normalize('NFC', value).strip().casefold()
+
+
+def is_simple_token(value):
+    return bool(_SIMPLE_TOKEN_RE.fullmatch(normalize_simple_token(value)))
+
+
+def simple_token_hash(value):
+    normalized = normalize_simple_token(value)
+    if not _SIMPLE_TOKEN_RE.fullmatch(normalized):
+        raise ValueError('Простой токен должен состоять ровно из 8 кириллических букв.')
+    return hashlib.sha256((SIMPLE_TOKEN_NAMESPACE + normalized).encode('utf-8')).hexdigest()
+
+
+def generate_simple_token():
+    return ''.join(secrets.choice(SIMPLE_TOKEN_ALPHABET) for _ in range(SIMPLE_TOKEN_LENGTH))
+
+
+def decode_simple_token(value):
+    """Декодирует значение заголовка в нормализованный простой токен.
+
+    Клиенты передают токен в percent-encoding (UTF-8), потому что HTTP-заголовки
+    не допускают не-ASCII. На случай прямого UTF-8 в WSGI-строке восстанавливаем
+    «кракозябры» latin-1 → UTF-8.
+    """
+    if not isinstance(value, str):
+        return ''
+    text = value.strip()
+
+    if text and all(ord(char) <= 255 for char in text):
+        try:
+            repaired = text.encode('latin-1').decode('utf-8')
+            if '�' not in repaired:
+                text = repaired
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+
+    if '%' in text:
+        try:
+            text = urllib.parse.unquote(text, errors='strict')
+        except (UnicodeDecodeError, ValueError):
+            pass
+
+    return normalize_simple_token(text)
+
+
+def api_key_hash_candidates(provided):
+    """Все варианты хеша, по которым ищем ключ: legacy и простой токен."""
+    if not isinstance(provided, str) or not provided:
+        return []
+
+    candidates = []
+
+    def add(value):
+        if not value:
+            return
+        digest = hashlib.sha256(value.encode('utf-8')).hexdigest()
+        if digest not in candidates:
+            candidates.append(digest)
+
+    add(provided)
+
+    decoded = decode_simple_token(provided)
+    if decoded:
+        add(decoded)
+        if is_simple_token(decoded):
+            digest = hashlib.sha256((SIMPLE_TOKEN_NAMESPACE + decoded).encode('utf-8')).hexdigest()
+            if digest not in candidates:
+                candidates.append(digest)
+
+    return candidates
+
+
+def build_record(name, scopes, folder_id, expires_at, now=None, kind=None):
     now = now or datetime.now(timezone.utc)
-    return {
+    record = {
         'name': name,
         'created': now.astimezone().strftime('%d.%m.%Y %H:%M'),
         'created_at': now.isoformat(),
@@ -139,6 +232,9 @@ def build_record(name, scopes, folder_id, expires_at, now=None):
         'folder_id': folder_id or None,
         'expires_at': expires_at,
     }
+    if kind:
+        record['kind'] = kind
+    return record
 
 
 def load_tokens_file(path):

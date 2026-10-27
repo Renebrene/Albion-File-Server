@@ -6,6 +6,7 @@
     python3 manage_tokens.py add "Photobase" --scopes upload,download --folder <uuid>
     python3 manage_tokens.py add "Демо" --scopes upload,delete --folder <uuid> --expires-days 30
     python3 manage_tokens.py add "Сервис" --scopes download --no-expiry
+    python3 manage_tokens.py add-simple "бригада1" --folder <uuid> --token ПРОЛОНГА
     python3 manage_tokens.py list                # список ключей, прав, папок и срока
     python3 manage_tokens.py revoke "Отчёты 1С"  # отозвать по имени или уникальному префиксу hash
 
@@ -69,13 +70,14 @@ def folder_label(folder_id, folders):
     return folder.get('name') or folder_id
 
 
-def command_add(args):
-    scopes = parse_scopes(args.scopes)
+def _create_token(args, scopes, raw_key, key_hash, kind=None):
+    """Регистрирует токен и возвращает (record, folders)."""
     folders = load_folders()
-    raw_key, key_hash = token_store.generate_token()
     created = {}
 
     def add_token(tokens):
+        if key_hash in tokens:
+            raise ValueError('Токен с таким значением уже существует.')
         name, normalized_scopes, folder_id, expires_at = token_store.validate_issuance(
             args.name, scopes, args.folder, folders, args.expires_days,
             no_expiry=args.no_expiry,
@@ -84,17 +86,52 @@ def command_add(args):
                 if isinstance(meta, dict)
             ],
         )
-        record = token_store.build_record(name, normalized_scopes, folder_id, expires_at)
+        record = token_store.build_record(
+            name, normalized_scopes, folder_id, expires_at, kind=kind)
         tokens[key_hash] = record
         created['record'] = record
 
     token_store.mutate_tokens(TOKENS_FILE, add_token)
-    record = created['record']
+    return created['record'], folders
+
+
+def _print_created(raw_key, record, folders):
     print('✅ Ключ создан. Показывается ОДИН раз — сохраните его:')
     print(f'   {raw_key}')
     print(f'   Права: {", ".join(record["scopes"])}; папка: {folder_label(record["folder_id"], folders)}')
     print(f'   Срок: {format_expiry(record.get("expires_at"))}')
     print('   Использование: curl -H "X-API-Key: <ключ>" '
+          'https://ваш-домен/api/v1/integration/verify')
+
+
+def command_add(args):
+    scopes = parse_scopes(args.scopes)
+    raw_key, key_hash = token_store.generate_token()
+    record, folders = _create_token(args, scopes, raw_key, key_hash)
+    _print_created(raw_key, record, folders)
+
+
+def command_add_simple(args):
+    """Простой токен из 8 кириллических букв, регистронезависимый."""
+    raw_key = args.token
+    if raw_key is None:
+        raw_key = token_store.generate_simple_token()
+    else:
+        raw_key = token_store.normalize_simple_token(raw_key)
+        if not token_store.is_simple_token(raw_key):
+            raise ValueError('Токен должен состоять ровно из 8 кириллических букв (без цифр и пробелов).')
+
+    key_hash = token_store.simple_token_hash(raw_key)
+    scopes = parse_scopes(args.scopes)
+    record, folders = _create_token(args, scopes, raw_key, key_hash, kind='simple')
+
+    print('✅ Простой токен создан. Показывается ОДИН раз — сохраните его:')
+    print(f'   {raw_key}')
+    print('   Регистр не важен. Скопируйте этот токен в папку бригады.')
+    print(f'   Права: {", ".join(record["scopes"])}; папка: {folder_label(record["folder_id"], folders)}')
+    print(f'   Срок: {format_expiry(record.get("expires_at"))}')
+    print('   В заголовке X-API-Key токен передаётся в percent-encoding UTF-8.')
+    print('   Проверка: curl -H "X-API-Key: <percent-encoded токен>" '
           'https://ваш-домен/api/v1/integration/verify')
 
 
@@ -104,10 +141,12 @@ def command_list(_args):
         print('Ключей нет. Создайте: manage_tokens.py add "Имя"')
         return
     folders = load_folders()
-    print(f'{"Имя":<22} {"Права":<18} {"Папка":<24} {"Срок":<22} {"Статус":<12} Hash')
+    print(f'{"Имя":<22} {"Тип":<7} {"Права":<18} {"Папка":<24} '
+          f'{"Срок":<22} {"Статус":<12} Hash')
     for key_hash, meta in sorted(tokens.items(), key=lambda item: item[1].get('name', '')):
         if not isinstance(meta, dict):
             continue
+        kind = 'простой' if meta.get('kind') == 'simple' else 'alb_'
         scopes = token_store.scopes_of(meta)
         expired = token_store.token_expired(meta.get('expires_at'))
         unbound_write = any(scope in token_store.FOLDER_REQUIRED_SCOPES for scope in scopes) \
@@ -122,7 +161,7 @@ def command_list(_args):
             status = 'бессрочный'
         else:
             status = 'активен'
-        print(f'{meta.get("name", "?"):<22} {",".join(scopes):<18} '
+        print(f'{meta.get("name", "?"):<22} {kind:<7} {",".join(scopes):<18} '
               f'{folder_label(meta.get("folder_id"), folders):<24} '
               f'{format_expiry(meta.get("expires_at")):<22} {status:<12} {key_hash[:12]}…')
 
@@ -166,6 +205,18 @@ def build_parser():
     add.add_argument('--no-expiry', action='store_true', help='создать бессрочный токен')
     add.set_defaults(func=command_add)
 
+    simple = subparsers.add_parser(
+        'add-simple', help='создать простой токен из 8 кириллических букв')
+    simple.add_argument('name', help='имя интеграции / бригады')
+    simple.add_argument('--folder', required=True, help='UUID папки бригады')
+    simple.add_argument('--token', help='явный токен из 8 кириллических букв (иначе будет сгенерирован)')
+    simple.add_argument('--scopes', default='upload,delete',
+                        help='по умолчанию upload,delete; можно upload,delete,download')
+    simple.add_argument('--expires-days', type=int, default=None,
+                        help='срок действия в днях (по умолчанию 90)')
+    simple.add_argument('--no-expiry', action='store_true', help='создать бессрочный токен')
+    simple.set_defaults(func=command_add_simple)
+
     listing = subparsers.add_parser('list', help='показать токены')
     listing.set_defaults(func=command_list)
 
@@ -178,7 +229,8 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    if args.command == 'add' and args.no_expiry and args.expires_days is not None:
+    if (hasattr(args, 'no_expiry') and args.no_expiry
+            and getattr(args, 'expires_days', None) is not None):
         parser.error('--expires-days и --no-expiry нельзя использовать вместе')
     try:
         args.func(args)
