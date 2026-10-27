@@ -10,13 +10,13 @@ Browser / curl / integration
           │ private network or loopback :5000
           ▼
  Flask app ─ Waitress (8 threads)
-    ├── authenticated admin UI (Jinja template string + inline JS)
+    ├── authenticated admin UI (Jinja template string + static/js/admin.js)
     ├── public file/view/folder/archive routes
     ├── Flask-Limiter (memory://)
     └── JSON files + filesystem under ALBION_DATA_DIR
 ```
 
-`server.py` содержит Flask-приложение, HTML/CSS/JS админки, маршруты и запуск Waitress. Это небольшой одно-процессный файловый сервер, а не multi-worker application. Для production за пределами текущего масштаба рекомендуется вынести метаданные в SQLite/PostgreSQL и rate-limit state в Redis.
+`server.py` содержит Flask-приложение, HTML/CSS админки, маршруты и запуск Waitress; клиентский код проводника вынесен в `static/js/admin.js` и получает параметры страницы из `window.ALBION_CONFIG` (ссылка с версией по mtime файла). Это небольшой одно-процессный файловый сервер, а не multi-worker application. Для production за пределами текущего масштаба рекомендуется вынести метаданные в SQLite/PostgreSQL и rate-limit state в Redis.
 
 ## Каталог данных
 

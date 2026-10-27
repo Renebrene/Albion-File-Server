@@ -497,7 +497,21 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertIn('td[data-label]::before', body)
         self.assertIn('is-busy', body)
         self.assertIn('id="toastStack" role="status" aria-live="polite"', body)
-        self.assertIn('setBackgroundInert', body)
+        self.assertIn('window.ALBION_CONFIG', body)
+        self.assertIn('static/js/admin.js', body)
+
+    def test_admin_js_is_served_and_page_keeps_only_config(self):
+        """Клиентский код вынесен в статический файл, в разметке остаётся только конфиг."""
+        asset = self.anon.get('/static/js/admin.js')
+        self.assertEqual(asset.status_code, 200)
+        script = asset.get_data(as_text=True)
+        self.assertIn('function showToast', script)
+        self.assertIn('function insertRowsHtml', script)
+        self.assertNotIn('{{', script, 'в вынесенном JS не должно остаться Jinja')
+
+        self.login()
+        body = self.client.get('/f/').get_data(as_text=True)
+        self.assertNotIn('function showToast', body, 'JS больше не встраивается в страницу')
 
     def test_public_page_accessibility_markup(self):
         self.login()
