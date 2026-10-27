@@ -10,8 +10,8 @@ import token_store
 class SimpleTokenTests(unittest.TestCase):
     def test_normalize_is_case_insensitive_and_trims(self):
         self.assertEqual(
-            token_store.normalize_simple_token('  ПРОЛОНГА '),
-            token_store.normalize_simple_token('пролонга'))
+            token_store.normalize_simple_token('  ПРИМЕРТК '),
+            token_store.normalize_simple_token('примертк'))
 
     def test_normalize_uses_nfc(self):
         decomposed = 'й' + 'абвгдеж'   # й разложенная + 7 букв
@@ -20,7 +20,7 @@ class SimpleTokenTests(unittest.TestCase):
 
     def test_is_simple_token_accepts_exactly_eight_cyrillic_letters(self):
         self.assertTrue(token_store.is_simple_token('абвгдеёж'))
-        self.assertTrue(token_store.is_simple_token('ПРОЛОНГА'))
+        self.assertTrue(token_store.is_simple_token('ПРИМЕРТК'))
         self.assertFalse(token_store.is_simple_token('абвгдеж'))
         self.assertFalse(token_store.is_simple_token('абвгдежзи'))
         self.assertFalse(token_store.is_simple_token('abcdefgh'))
@@ -29,10 +29,10 @@ class SimpleTokenTests(unittest.TestCase):
         self.assertFalse(token_store.is_simple_token(None))
 
     def test_hash_is_case_insensitive_and_namespaced(self):
-        lower = token_store.simple_token_hash('пролонга')
-        upper = token_store.simple_token_hash('ПРОЛОНГА')
+        lower = token_store.simple_token_hash('примертк')
+        upper = token_store.simple_token_hash('ПРИМЕРТК')
         self.assertEqual(lower, upper)
-        self.assertNotEqual(lower, hashlib.sha256('пролонга'.encode('utf-8')).hexdigest())
+        self.assertNotEqual(lower, hashlib.sha256('примертк'.encode('utf-8')).hexdigest())
         self.assertEqual(len(lower), 64)
 
     def test_hash_rejects_wrong_length(self):
@@ -48,12 +48,12 @@ class SimpleTokenTests(unittest.TestCase):
             self.assertTrue(token_store.is_simple_token(token))
 
     def test_decode_percent_encoded_header(self):
-        encoded = urllib.parse.quote('ПРОЛОНГА')
-        self.assertEqual(token_store.decode_simple_token(encoded), 'пролонга')
+        encoded = urllib.parse.quote('ПРИМЕРТК')
+        self.assertEqual(token_store.decode_simple_token(encoded), 'примертк')
 
     def test_decode_recovers_utf8_mojibake(self):
-        mojibake = 'ПРОЛОНГА'.encode('utf-8').decode('latin-1')
-        self.assertEqual(token_store.decode_simple_token(mojibake), 'пролонга')
+        mojibake = 'ПРИМЕРТК'.encode('utf-8').decode('latin-1')
+        self.assertEqual(token_store.decode_simple_token(mojibake), 'примертк')
 
     def test_decode_leaves_legacy_keys_untouched(self):
         legacy = 'alb_' + 'a1' * 24
@@ -62,8 +62,8 @@ class SimpleTokenTests(unittest.TestCase):
     def test_hash_candidates_include_simple_and_decoded(self):
         encoded = urllib.parse.quote('Пролонга')
         candidates = token_store.api_key_hash_candidates(encoded)
-        self.assertIn(token_store.simple_token_hash('пролонга'), candidates)
-        self.assertIn(hashlib.sha256('пролонга'.encode('utf-8')).hexdigest(), candidates)
+        self.assertIn(token_store.simple_token_hash('примертк'), candidates)
+        self.assertIn(hashlib.sha256('примертк'.encode('utf-8')).hexdigest(), candidates)
         # Исходное percent-encoded значение тоже проверяется (legacy-совместимость).
         self.assertIn(hashlib.sha256(encoded.encode('utf-8')).hexdigest(), candidates)
 

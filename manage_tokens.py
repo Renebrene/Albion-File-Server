@@ -6,7 +6,7 @@
     python3 manage_tokens.py add "Photobase" --scopes upload,download --folder <uuid>
     python3 manage_tokens.py add "Демо" --scopes upload,delete --folder <uuid> --expires-days 30
     python3 manage_tokens.py add "Сервис" --scopes download --no-expiry
-    python3 manage_tokens.py add-simple "бригада1" --folder <uuid> --token ПРОЛОНГА
+    python3 manage_tokens.py add-simple "бригада1" --folder <uuid> --token ПРИМЕРТК
     python3 manage_tokens.py list                # список ключей, прав, папок и срока
     python3 manage_tokens.py revoke "Отчёты 1С"  # отозвать по имени или уникальному префиксу hash
 
