@@ -513,6 +513,27 @@ class ServerSmokeTests(unittest.TestCase):
         body = self.client.get('/f/').get_data(as_text=True)
         self.assertNotIn('function showToast', body, 'JS больше не встраивается в страницу')
 
+    def test_public_and_tokens_pages_use_static_js(self):
+        """Публичная страница и страница токенов тоже подключают вынесенные файлы."""
+        self.login()
+        folder = self.client.post('/api/create_folder', json={'name': 'Pub'}).get_json()['folder_id']
+        self.client.post('/upload', data={'count': '1', 'folder_id': folder,
+                                          'file_0': (io.BytesIO(b'x'), 'pub.txt')},
+                         content_type='multipart/form-data')
+
+        public_body = self.anon.get(f'/d/{folder}').get_data(as_text=True)
+        self.assertIn('static/js/public.js', public_body)
+        self.assertNotIn('function publicLoadNextPage', public_body, 'JS публичной страницы вынесен')
+
+        tokens_body = self.client.get('/settings/tokens').get_data(as_text=True)
+        self.assertIn('static/js/tokens.js', tokens_body)
+        self.assertNotIn("getElementById('newToken').addEventListener", tokens_body)
+
+        for asset in ('public.js', 'tokens.js'):
+            response = self.anon.get(f'/static/js/{asset}')
+            self.assertEqual(response.status_code, 200, asset)
+            self.assertNotIn('{{', response.get_data(as_text=True), asset)
+
     def test_public_page_accessibility_markup(self):
         self.login()
         folder = self.client.post('/api/create_folder', json={'name': 'Pub'}).get_json()['folder_id']

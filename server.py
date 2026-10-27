@@ -1978,51 +1978,7 @@ PUBLIC_FOLDER_TEMPLATE = """
         </div>
         <div class="footer">Файлов: {{ total_files }}</div>
     </div>
-    <script>
-        const publicLoader = document.getElementById('publicLazyLoader');
-        const publicStatus = document.getElementById('publicLazyStatus');
-        const publicButton = document.getElementById('publicLoadMore');
-        let publicNextUrl = publicLoader ? (publicLoader.dataset.nextUrl || '') : '';
-        let publicLoading = false;
-        async function publicLoadNextPage() {
-            if (!publicNextUrl || publicLoading) return;
-            publicLoading = true;
-            publicButton.disabled = true;
-            publicStatus.textContent = 'Загрузка…';
-            try {
-                const response = await fetch(publicNextUrl);
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
-                const target = document.getElementById('publicItems');
-                doc.querySelectorAll('#publicItems .item').forEach(node => {
-                    target.appendChild(document.importNode(node, true));
-                });
-                const nextLoader = doc.getElementById('publicLazyLoader');
-                publicNextUrl = nextLoader ? (nextLoader.dataset.nextUrl || '') : '';
-                publicLoader.dataset.nextUrl = publicNextUrl;
-                if (!publicNextUrl) {
-                    publicLoader.hidden = true;
-                    publicStatus.textContent = '';
-                } else {
-                    publicStatus.textContent = '';
-                }
-            } catch (err) {
-                console.error('Ошибка публичной lazy-загрузки:', err);
-                publicStatus.textContent = 'Не удалось загрузить ещё файлы';
-            } finally {
-                publicLoading = false;
-                publicButton.disabled = false;
-            }
-        }
-        if (publicNextUrl && 'IntersectionObserver' in window) {
-            const observer = new IntersectionObserver(entries => {
-                if (entries.some(entry => entry.isIntersecting)) publicLoadNextPage();
-            }, { rootMargin: '400px' });
-            observer.observe(publicLoader);
-        } else if (publicNextUrl) {
-            publicStatus.textContent = 'Прокрутите вниз или нажмите кнопку';
-        }
-    </script>
+    <script src="{{ url_for('static', filename='js/public.js') }}?v={{ asset_version }}" defer></script>
 </body>
 </html>
 """
@@ -2286,18 +2242,7 @@ TOKENS_TEMPLATE = """
             {% endif %}
         </div>
     </div>
-    <script>
-        {% if new_token %}
-        document.getElementById('newToken').addEventListener('click', () => {
-            const text = document.getElementById('newToken').textContent;
-            const selection = window.getSelection();
-            const range = document.createRange();
-            range.selectNodeContents(document.getElementById('newToken'));
-            selection.removeAllRanges(); selection.addRange(range);
-            navigator.clipboard?.writeText(text).catch(() => {});
-        });
-        {% endif %}
-    </script>
+    <script src="{{ url_for('static', filename='js/tokens.js') }}?v={{ asset_version }}" defer></script>
 </body>
 </html>
 """
@@ -3341,6 +3286,7 @@ def _render_tokens_page(error=None, form=None, new_token=None,
         revoked=request.args.get('revoked') == '1',
         new_token=new_token,
         new_token_name=new_token_name,
+        asset_version=ASSET_VERSION,
         csrf_token=session.setdefault('_csrf_token', secrets.token_urlsafe(32)),
     )
     return body, status, {'Cache-Control': 'no-store', 'Pragma': 'no-cache'}
@@ -4090,6 +4036,7 @@ def public_folder(folder_ref):
         total_files=total_files,
         total_pages=total_pages,
         page=page,
+        asset_version=ASSET_VERSION,
         next_url=next_url)
 
 # ===== ИНТЕГРАЦИЯ: МАШИННЫЕ ТОКЕНЫ (без сессии и CSRF) =====
