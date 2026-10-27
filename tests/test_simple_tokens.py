@@ -60,7 +60,7 @@ class SimpleTokenTests(unittest.TestCase):
         self.assertEqual(token_store.decode_simple_token(legacy), legacy)
 
     def test_hash_candidates_include_simple_and_decoded(self):
-        encoded = urllib.parse.quote('Пролонга')
+        encoded = urllib.parse.quote('Примертк')
         candidates = token_store.api_key_hash_candidates(encoded)
         self.assertIn(token_store.simple_token_hash('примертк'), candidates)
         self.assertIn(hashlib.sha256('примертк'.encode('utf-8')).hexdigest(), candidates)
