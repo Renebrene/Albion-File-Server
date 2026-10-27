@@ -66,21 +66,31 @@
 
 | Метод/путь | Тело/параметры | Успешный ответ |
 |---|---|---|
-| `POST /upload` | `multipart/form-data`: `count`, `file_0...file_N`, `folder_id` (необязательный) | `{"count": N}` |
-| `POST /upload_folder` | multipart: `count`, `file_i`, `path_i` (относительный путь), `folder_id` | `{"count": N, "folders_created": N}` |
-| `POST /api/create_folder` | JSON: `{"name": str, "parent_id": UUID|null}` | `{"success": true, "folder_id": UUID}` |
-| `POST /api/update_file` | JSON: `internal_id`, `display_name`, `physical_filename`, `custom_alias`, `folder_id` | `{"success": true}` |
+| `POST /upload` | `multipart/form-data`: `count`, `file_0...file_N`, `folder_id` (необязательный), `view` (`table`/`grid`/`list`) | `{"count": N, "rows_html": str, "view": str}` |
+| `POST /upload_folder` | multipart: `count`, `file_i`, `path_i` (относительный путь), `folder_id`, `view` | `{"count": N, "folders_created": N, "rows_html": str, "view": str}` |
+| `POST /api/create_folder` | JSON: `{"name": str, "parent_id": UUID|null, "view": str}` | `{"success": true, "folder_id": UUID, "row_html": str, "view": str}` |
+| `POST /api/update_file` | JSON: `internal_id`, `display_name`, `physical_filename`, `custom_alias`, `folder_id`, `view` | `{"success": true, "row_html": str, "folder_id": UUID|null, "view": str}` |
 | `POST /api/move_file` | JSON: `{"file_id": UUID, "target_folder_id": UUID|null}` | `{"success": true, "moved": bool}` |
 | `POST /api/move_files_batch` | JSON: `{"file_ids": [UUID], "target_folder_id": UUID|null}` | `{"success": true, "count": N, "moved_ids": [UUID]}` |
-| `POST /api/delete_file` | JSON: `{"internal_id": UUID}` | `{"success": true, "deleted_ids": [UUID]}` |
-| `POST /api/delete_files_batch` | JSON: `{"file_ids": [UUID]}` | `{"success": true, "count": N, "deleted_ids": [UUID]}` |
+| `POST /api/delete_file` | JSON: `{"internal_id": UUID}` | `{"success": true, "deleted_ids": [UUID], "trash_ids": [UUID]}` |
+| `POST /api/delete_files_batch` | JSON: `{"file_ids": [UUID]}` | `{"success": true, "count": N, "deleted_ids": [UUID], "trash_ids": [UUID]}` |
 | `POST /api/delete_folder` | JSON: `{"folder_id": UUID}` | `{"success": true, "deleted_folder_ids": [UUID]}` |
-| `GET /api/get_all_folders` | — | `[{"id": UUID, "name": str, "depth": N}]` |
+| `POST /api/delete_folders_batch` | JSON: `{"folder_ids": [UUID]}` | `{"success": true, "count": N, "deleted_folder_ids": [UUID]}` |
+| `POST /api/trash/restore` | JSON: `{"entry_ids": [UUID], "folder_id": UUID\|null, "view": str}` | `{"success": true, "count": N, "restored_ids": [UUID], "rows_html": str, "view": str}` |
+| `POST /api/trash/purge` | JSON: `{"entry_ids": [UUID]}` или `{}` (всё) | `{"success": true, "count": N}` |
+| `POST /api/move_folders_batch` | JSON: `{"folder_ids": [UUID], "target_folder_id": UUID|null}` | `{"success": true, "count": N, "moved_ids": [UUID]}` |
+| `GET /api/get_all_folders` | — | `[{"id": UUID, "name": str, "depth": N, "parent_id": UUID|null}]` |
 | `POST /api/export_zip` | JSON: `{"file_ids": [UUID], "folder_ids": [UUID]}` | `{"url": "https://.../z/<uuid>", "count": N, "size": str}` |
 
 Ошибки API возвращаются JSON вида `{"error": "..."}` (валидация — 400, не найдено — 404, rate/budget — 429). `Retry-After` задаёт задержку перед повтором.
 
 Поля `moved`/`moved_ids`/`deleted_ids`/`deleted_folder_ids` перечисляют только фактически изменённые объекты: пакетные операции пропускают неизвестные или неудачные id, и `count` может быть меньше запрошенного. Клиентский интерфейс использует эти поля, чтобы убирать строки из списка без полной перезагрузки страницы.
+
+Поля `row_html`/`rows_html` содержат готовую HTML-строку (или несколько) для активного представления `view`; разметка рендерится теми же шаблонами, что и страница. Благодаря этому загрузка, переименование и создание папки обновляют список на месте — без `location.reload()`.
+
+`POST /api/move_folders_batch` перемещает каталог поддерева на диске и переписывает `physical_path` всех файлов внутри; запрещены перемещение папки в саму себя/своего потомка и коллизия имён на целевом уровне. При пакетном удалении вложенные выделенные папки схлопываются в родителя (удаляется только корень).
+
+**Корзина.** Удаление файлов (`/api/delete_file`, `/api/delete_files_batch`, интеграционное удаление) не уничтожает данные: файл переносится в `trash/`, а ответ содержит `trash_ids`. Восстановление — `POST /api/trash/restore` (возвращает в исходную папку, а если её уже нет — в корень; при совпадении имён добавляется суффикс `_1`); окончательное удаление — `POST /api/trash/purge`. Записи старше `ALBION_TRASH_DAYS` (по умолчанию 30) удаляются автоматически. **Папки в корзину не попадают** — они удаляются сразу вместе с содержимым.
 
 ## API-ключи и автоматическое скачивание
 

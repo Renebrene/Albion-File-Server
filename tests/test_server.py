@@ -45,6 +45,12 @@ class ServerSmokeTests(unittest.TestCase):
                 shutil.rmtree(path)
         for entry in os.listdir(server.ZIPLINKS_DIR):
             os.remove(os.path.join(server.ZIPLINKS_DIR, entry))
+        # Корзину между тестами очищаем полностью: и индекс, и каталоги.
+        server.save_trash({})
+        os.makedirs(server.TRASH_DIR, exist_ok=True)
+        import shutil as _shutil
+        for entry in os.listdir(server.TRASH_DIR):
+            _shutil.rmtree(os.path.join(server.TRASH_DIR, entry), ignore_errors=True)
         if os.path.exists(server.SETTINGS_FILE):
             os.remove(server.SETTINGS_FILE)
         if metadata_store.sqlite_enabled():
@@ -359,6 +365,94 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(sorted(response.get_json()['deleted_folder_ids']), sorted([parent, child]))
 
+    def test_delete_folders_batch_handles_nested_selection(self):
+        self.login()
+        parent = self.client.post('/api/create_folder', json={'name': 'P'}).get_json()['folder_id']
+        child = self.client.post('/api/create_folder', json={'name': 'C', 'parent_id': parent}).get_json()['folder_id']
+        self.client.post('/upload', data={'count': '1', 'folder_id': child,
+                                          'file_0': (io.BytesIO(b'x'), 'deep.txt')},
+                         content_type='multipart/form-data')
+        response = self.client.post('/api/delete_folders_batch', json={'folder_ids': [parent, child]})
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload['deleted_folder_ids'], [parent], 'вложенная папка уходит с родителем')
+        self.assertEqual(payload['count'], 1)
+        self.assertFalse(server.load_folders())
+        self.assertFalse(server.load_db())
+
+    def test_move_folders_batch_updates_parent_and_physical_path(self):
+        self.login()
+        source = self.client.post('/api/create_folder', json={'name': 'Source'}).get_json()['folder_id']
+        inner = self.client.post('/api/create_folder', json={'name': 'Inner', 'parent_id': source}).get_json()['folder_id']
+        target = self.client.post('/api/create_folder', json={'name': 'Target'}).get_json()['folder_id']
+        self.client.post('/upload', data={'count': '1', 'folder_id': inner,
+                                          'file_0': (io.BytesIO(b'payload'), 'deep.txt')},
+                         content_type='multipart/form-data')
+        file_id = next(iter(server.load_db()))
+
+        response = self.client.post('/api/move_folders_batch',
+                                    json={'folder_ids': [source], 'target_folder_id': target})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['moved_ids'], [source])
+        self.assertEqual(server.load_folders()[source]['parent_id'], target)
+        self.assertEqual(server.load_folders()[inner]['parent_id'], source, 'потомок сохраняет родителя')
+
+        record = server.load_db()[file_id]
+        self.assertEqual(record['physical_path'], os.path.join('Target', 'Source', 'Inner', 'deep.txt'))
+        self.assertTrue(os.path.exists(server.safe_upload_path(record['physical_path'])),
+                        'файл доступен по новому пути')
+
+    def test_move_folder_into_its_descendant_is_rejected(self):
+        self.login()
+        parent = self.client.post('/api/create_folder', json={'name': 'P'}).get_json()['folder_id']
+        child = self.client.post('/api/create_folder', json={'name': 'C', 'parent_id': parent}).get_json()['folder_id']
+        response = self.client.post('/api/move_folders_batch',
+                                    json={'folder_ids': [parent], 'target_folder_id': child})
+        self.assertEqual(response.status_code, 400)
+        self.assertIsNone(server.load_folders()[parent]['parent_id'])
+
+    def test_move_folder_name_collision_is_rejected(self):
+        self.login()
+        target = self.client.post('/api/create_folder', json={'name': 'T'}).get_json()['folder_id']
+        self.client.post('/api/create_folder', json={'name': 'Dup', 'parent_id': target})
+        source = self.client.post('/api/create_folder', json={'name': 'Dup'}).get_json()['folder_id']
+        response = self.client.post('/api/move_folders_batch',
+                                    json={'folder_ids': [source], 'target_folder_id': target})
+        self.assertEqual(response.status_code, 400)
+        self.assertIsNone(server.load_folders()[source]['parent_id'])
+
+    def test_mutations_return_row_html_fragments(self):
+        """Загрузка/переименование/создание папки возвращают готовые HTML-строки."""
+        self.login()
+
+        uploaded = self.client.post('/upload', data={'count': '1', 'view': 'table',
+                                                     'file_0': (io.BytesIO(b'x'), 'frag.txt')},
+                                    content_type='multipart/form-data')
+        self.assertEqual(uploaded.status_code, 200)
+        rows_html = uploaded.get_json()['rows_html']
+        file_id = next(iter(server.load_db()))
+        self.assertIn(f'data-file-id="{file_id}"', rows_html)
+        self.assertIn('frag.txt', rows_html)
+
+        folder = self.client.post('/api/create_folder', json={'name': 'Frag', 'view': 'table'}).get_json()
+        self.assertIn(f'data-folder-id="{folder["folder_id"]}"', folder['row_html'])
+        self.assertIn('Frag', folder['row_html'])
+
+        updated = self.client.post('/api/update_file', json={
+            'internal_id': file_id, 'display_name': 'renamed.txt', 'physical_filename': 'renamed.txt',
+            'custom_alias': '', 'folder_id': None, 'view': 'table'}).get_json()
+        self.assertIn('renamed.txt', updated['row_html'])
+        self.assertIsNone(updated['folder_id'])
+
+    def test_get_all_folders_exposes_parent_id(self):
+        self.login()
+        parent = self.client.post('/api/create_folder', json={'name': 'Root1'}).get_json()['folder_id']
+        child = self.client.post('/api/create_folder', json={'name': 'Kid', 'parent_id': parent}).get_json()['folder_id']
+        listing = self.client.get('/api/get_all_folders').get_json()
+        by_id = {item['id']: item for item in listing}
+        self.assertIsNone(by_id[parent]['parent_id'])
+        self.assertEqual(by_id[child]['parent_id'], parent)
+
     def test_update_file_alias_error_leaves_disk_and_db_untouched(self):
         """Регресс: ошибка алиаса не должна оставлять файл переименованным на диске."""
         self.login()
@@ -402,6 +496,8 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertIn('@keyframes albion-spin', body)
         self.assertIn('td[data-label]::before', body)
         self.assertIn('is-busy', body)
+        self.assertIn('id="toastStack" role="status" aria-live="polite"', body)
+        self.assertIn('setBackgroundInert', body)
 
     def test_public_page_accessibility_markup(self):
         self.login()
@@ -413,6 +509,91 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertIn('aria-label="Показать ещё файлы"', body)
         self.assertIn('id="publicLazyStatus" role="status" aria-live="polite"', body)
         self.assertIn('lazy-more:focus-visible', body)
+
+    def test_delete_moves_file_to_trash_and_restore_returns_it(self):
+        self.login()
+        self.client.post('/upload', data={'count': '1', 'file_0': (io.BytesIO(b'trash-me'), 't.txt')},
+                         content_type='multipart/form-data')
+        file_id, record = next(iter(server.load_db().items()))
+        original = server.safe_upload_path(record['physical_path'])
+
+        deleted = self.client.post('/api/delete_file', json={'internal_id': file_id}).get_json()
+        self.assertEqual(deleted['deleted_ids'], [file_id])
+        self.assertEqual(len(deleted['trash_ids']), 1)
+        self.assertFalse(server.load_db(), 'запись ушла из files')
+        self.assertFalse(os.path.exists(original), 'файл покинул исходное место')
+        self.assertIn(deleted['trash_ids'][0], server.load_trash())
+
+        restored = self.client.post('/api/trash/restore',
+                                    json={'entry_ids': deleted['trash_ids']}).get_json()
+        self.assertEqual(restored['count'], 1)
+        db = server.load_db()
+        self.assertEqual(len(db), 1)
+        path = server.safe_upload_path(db[next(iter(db))]['physical_path'])
+        self.assertTrue(os.path.exists(path))
+        with open(path, 'rb') as handle:
+            self.assertEqual(handle.read(), b'trash-me')
+        self.assertEqual(server.load_trash(), {}, 'корзина опустела после восстановления')
+
+    def test_restore_falls_back_to_root_when_source_folder_gone(self):
+        self.login()
+        folder = self.client.post('/api/create_folder', json={'name': 'Gone'}).get_json()['folder_id']
+        self.client.post('/upload', data={'count': '1', 'folder_id': folder,
+                                          'file_0': (io.BytesIO(b'x'), 'in-folder.txt')},
+                         content_type='multipart/form-data')
+        file_id = next(iter(server.load_db()))
+        entry = self.client.post('/api/delete_file', json={'internal_id': file_id}).get_json()['trash_ids']
+        self.client.post('/api/delete_folder', json={'folder_id': folder})
+
+        restored = self.client.post('/api/trash/restore', json={'entry_ids': entry}).get_json()
+        self.assertEqual(restored['count'], 1)
+        record = server.load_db()[next(iter(server.load_db()))]
+        self.assertIsNone(record['folder_id'], 'восстановлено в корень')
+        self.assertTrue(os.path.exists(server.safe_upload_path(record['physical_path'])))
+
+    def test_restore_renames_on_name_collision(self):
+        self.login()
+        self.client.post('/upload', data={'count': '1', 'file_0': (io.BytesIO(b'one'), 'dup.txt')},
+                         content_type='multipart/form-data')
+        file_id = next(iter(server.load_db()))
+        entry = self.client.post('/api/delete_file', json={'internal_id': file_id}).get_json()['trash_ids']
+        # Занимаем то же имя новым файлом
+        self.client.post('/upload', data={'count': '1', 'file_0': (io.BytesIO(b'two'), 'dup.txt')},
+                         content_type='multipart/form-data')
+
+        self.client.post('/api/trash/restore', json={'entry_ids': entry})
+        names = sorted(rec['current_filename'] for rec in server.load_db().values())
+        self.assertEqual(names, ['dup.txt', 'dup_1.txt'])
+
+    def test_trash_purge_removes_entry_and_files(self):
+        self.login()
+        self.client.post('/upload', data={'count': '1', 'file_0': (io.BytesIO(b'x'), 'p.txt')},
+                         content_type='multipart/form-data')
+        file_id = next(iter(server.load_db()))
+        entry = self.client.post('/api/delete_file',
+                                 json={'internal_id': file_id}).get_json()['trash_ids'][0]
+        entry_dir = os.path.join(server.TRASH_DIR, entry)
+        self.assertTrue(os.path.isdir(entry_dir))
+
+        purged = self.client.post('/api/trash/purge', json={'entry_ids': [entry]}).get_json()
+        self.assertEqual(purged['count'], 1)
+        self.assertEqual(server.load_trash(), {})
+        self.assertFalse(os.path.exists(entry_dir), 'каталог корзины удалён')
+
+    def test_purge_expired_trash_drops_old_entries(self):
+        server.save_trash({'old-entry': {
+            'id': 'old-entry', 'deleted_at': '2020-01-01T00:00:00+00:00',
+            'name': 'x', 'size': 1, 'trash_path': 'trash/old-entry/x',
+            'folder_id': None, 'record': {}}})
+        self.assertEqual(server.purge_expired_trash(), 1)
+        self.assertEqual(server.load_trash(), {})
+
+    def test_trash_page_requires_admin(self):
+        self.assertEqual(self.anon.get('/trash').status_code, 302)
+        self.login()
+        page = self.client.get('/trash')
+        self.assertEqual(page.status_code, 200)
+        self.assertIn('Корзина', page.get_data(as_text=True))
 
     def test_redis_budget_branch(self):
         class FakeRedis:

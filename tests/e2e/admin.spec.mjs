@@ -24,6 +24,8 @@ const allSteps = [
   '11 upload queue guard and filter auto-apply',
   '12 delete and move update rows without reload',
   '13 keyboard focus and user chip',
+  '14 batch delete and move folders',
+  '15 delete undo and trash page',
 ];
 
 async function runStep(name, fn) {
@@ -260,13 +262,12 @@ try {
     await page.waitForFunction(() => !document.getElementById('uploadBtn').disabled, null, { timeout: 5000 });
     assert.match(await page.locator('#fileList').innerText(), new RegExp(uploadName));
 
-    const navigation = page.waitForNavigation({ waitUntil: 'load', timeout: 20000 });
+    await page.evaluate(() => { window.__noReload = 'kept'; });
     await page.click('#uploadBtn');
-    const toastText = await page.waitForSelector('#toast.show', { timeout: 5000 })
+    const toastText = await page.waitForSelector('#toastStack .toast.show', { timeout: 5000 })
       .then((el) => el.innerText()).catch(() => '');
-    await navigation;
-    await page.waitForLoadState('load');
     assert.match(toastText, /Загружено/, `success toast (${toastText})`);
+    assert.equal(await page.evaluate(() => window.__noReload), 'kept', 'загрузка без перезагрузки');
 
     const uploadedRow = page.locator('#view-table .file-row', { hasText: uploadName });
     await uploadedRow.waitFor({ timeout: 10000 });
@@ -362,16 +363,14 @@ await runStep('11 upload queue guard and filter auto-apply', async () => {
   const dismiss = async (dialog) => { messages.push(dialog.message()); await dialog.dismiss(); };
   page.on('dialog', dismiss);
   try {
-    await page.click('button:has-text("➕ Новая папка")');
-    await page.fill('#newFolderName', 'GuardCheck');
-    await page.click('#createFolderBtn');
+    // Смена вида всё ещё перезагружает страницу, поэтому защищена предупреждением.
+    await page.click('.view-switcher button[data-view="grid"]');
     await page.waitForTimeout(500);
     assert.ok(messages.some((text) => /очереди загрузки/.test(text)), 'показано предупреждение об очереди');
     assert.equal(await page.locator('#fileList .file-item').count(), 1, 'очередь сохранена после отказа');
-    assert.equal(await page.locator('#view-table .file-row').count(), 50, 'папка не создана: страница не перезагрузилась');
+    assert.equal(await page.locator('#view-table .file-row').count(), 50, 'вид не сменился: страница не перезагрузилась');
   } finally {
     page.off('dialog', dismiss);
-    await page.locator('#createFolderModal .btn-secondary').click().catch(() => {});
   }
 
   // Селект фильтра применяется сразу, без кнопки «Применить»
@@ -389,11 +388,8 @@ await runStep('12 delete and move update rows without reload', async () => {
   // Папку-приёмник создаём заранее: само создание папки пока перезагружает страницу.
   await page.click('button:has-text("➕ Новая папка")');
   await page.fill('#newFolderName', 'MoveTarget');
-  await Promise.all([
-    page.waitForNavigation({ timeout: 15000 }),
-    page.click('#createFolderBtn'),
-  ]);
-  await page.waitForSelector('#view-table .file-row');
+  await page.click('#createFolderBtn');
+  await page.locator('#view-table .folder-row', { hasText: 'MoveTarget' }).first().waitFor({ timeout: 10000 });
 
   // Маркер документа: переживает правки DOM, но исчезает при перезагрузке.
   await page.evaluate(() => { window.__noReload = 'kept'; });
@@ -458,6 +454,97 @@ await runStep('13 keyboard focus and user chip', async () => {
   const editButton = row.locator('button[title="Редактировать"]');
   const editLabel = await editButton.getAttribute('aria-label');
   assert.ok(editLabel && editLabel.startsWith('Редактировать'), 'aria-label у кнопки редактирования');
+});
+
+await runStep('14 batch delete and move folders', async () => {
+  await page.goto(FOLDER_URL);
+  await page.waitForSelector('#view-table .file-row');
+
+  const makeFolder = async (name) => {
+    await page.click('button:has-text("➕ Новая папка")');
+    await page.fill('#newFolderName', name);
+    await page.click('#createFolderBtn');
+    await page.locator('#view-table .folder-row', { hasText: name }).first().waitFor({ timeout: 10000 });
+  };
+  const folderRow = (name) => page.locator('#view-table .folder-row', { hasText: name });
+
+  await makeFolder('BatchA');
+  await makeFolder('BatchB');
+  await makeFolder('MoveMe');
+  await makeFolder('Dest');
+
+  await page.evaluate(() => { window.__noReload = 'kept'; });
+
+  // Пакетное удаление двух папок: строки исчезают без перезагрузки.
+  const acceptDialog = async (dialog) => dialog.accept();
+  page.on('dialog', acceptDialog);
+  try {
+    await folderRow('BatchA').locator('input.folder-checkbox').check();
+    await folderRow('BatchB').locator('input.folder-checkbox').check();
+    const before = await page.locator('#view-table .folder-row').count();
+    await page.click('#batchDeleteBtn');
+    await page.waitForFunction(
+      (n) => document.querySelectorAll('#view-table .folder-row').length === n - 2,
+      before, { timeout: 10000 });
+  } finally {
+    page.off('dialog', acceptDialog);
+  }
+  assert.equal(await page.evaluate(() => window.__noReload), 'kept', 'удаление папок без перезагрузки');
+  assert.equal(await folderRow('BatchA').count(), 0, 'папка BatchA удалена');
+  assert.equal(await folderRow('BatchB').count(), 0, 'папка BatchB удалена');
+
+  // Пакетное перемещение папки в другую папку: тоже без перезагрузки.
+  const beforeMove = await page.locator('#view-table .folder-row').count();
+  await folderRow('MoveMe').locator('input.folder-checkbox').check();
+  await page.locator('#batchActions button', { hasText: 'Переместить' }).click();
+  await page.waitForFunction(() => {
+    const select = document.getElementById('batchMoveFolderId');
+    return !!select && Array.from(select.options).some((option) => option.textContent.includes('Dest'));
+  }, null, { timeout: 10000 });
+  const destValue = await page.evaluate(() => {
+    const select = document.getElementById('batchMoveFolderId');
+    const option = Array.from(select.options).find((item) => item.textContent.includes('Dest'));
+    return option ? option.value : '';
+  });
+  assert.ok(destValue, 'целевая папка Dest есть в списке');
+  await page.selectOption('#batchMoveFolderId', destValue);
+  await page.click('#batchMoveBtn');
+  await page.waitForFunction(
+    (n) => document.querySelectorAll('#view-table .folder-row').length === n - 1,
+    beforeMove, { timeout: 10000 });
+  assert.equal(await page.evaluate(() => window.__noReload), 'kept', 'перемещение папки без перезагрузки');
+  assert.equal(await folderRow('MoveMe').count(), 0, 'MoveMe ушла из текущей папки');
+});
+
+await runStep('15 delete undo and trash page', async () => {
+  await page.goto(FOLDER_URL);
+  await page.waitForSelector('#view-table .file-row');
+  await page.evaluate(() => { window.__noReload = 'kept'; });
+
+  const before = await page.locator('#view-table .file-row').count();
+  const rowId = await page.locator('#view-table .file-row').first().getAttribute('data-file-id');
+  await page.locator('#view-table .file-row .actions-cell button[title="Удалить"]').first().click();
+  await page.locator('#deleteModal .btn-danger').click();
+  await page.waitForFunction(
+    (n) => document.querySelectorAll('#view-table .file-row').length === n - 1,
+    before, { timeout: 10000 });
+  assert.equal(await page.evaluate(() => window.__noReload), 'kept', 'удаление без перезагрузки');
+
+  // В плашке есть кнопка «Восстановить» — возвращает файл без перезагрузки.
+  const undoButton = page.locator('#toastStack .toast button.toast-action', { hasText: 'Восстановить' });
+  await undoButton.waitFor({ timeout: 10000 });
+  await undoButton.click();
+  await page.waitForFunction(
+    (n) => document.querySelectorAll('#view-table .file-row').length === n,
+    before, { timeout: 10000 });
+  assert.equal(await page.evaluate(() => window.__noReload), 'kept', 'восстановление без перезагрузки');
+  assert.equal(await page.locator(`#view-table .file-row[data-file-id="${rowId}"]`).count(), 1,
+    'файл вернулся в список');
+
+  // Страница корзины доступна администратору.
+  await page.goto(`${BASE}/trash`);
+  await page.waitForSelector('h1');
+  assert.match(await page.locator('body').innerText(), /Корзина/, 'страница корзины открылась');
 });
 
 } catch (error) {

@@ -26,6 +26,7 @@ import zipfile
 from collections import deque
 from logging.handlers import RotatingFileHandler
 from flask import Flask, request, send_from_directory, render_template_string, send_file, jsonify, abort, redirect, url_for, g
+from markupsafe import Markup
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import token_store
@@ -289,8 +290,15 @@ STATS_FILE = os.path.join(DATA_DIR, 'stats.json')
 DB_FILE = os.path.join(DATA_DIR, 'files_db.json')
 FOLDERS_DB_FILE = os.path.join(DATA_DIR, 'folders_db.json')
 TOKENS_FILE = os.path.join(DATA_DIR, 'tokens.json')
+TRASH_FILE = os.path.join(DATA_DIR, 'trash.json')
 ZIPLINKS_DIR = os.path.join(DATA_DIR, 'ziplinks')
 THUMBNAIL_DIR = os.path.join(DATA_DIR, 'thumbnails')
+# Корзина: удалённые файлы хранятся отдельно от uploads и живут TRASH_RETENTION_DAYS.
+TRASH_DIR = os.path.join(DATA_DIR, 'trash')
+try:
+    TRASH_RETENTION_DAYS = max(1, int(os.environ.get('ALBION_TRASH_DAYS', '30')))
+except (TypeError, ValueError):
+    TRASH_RETENTION_DAYS = 30
 # Размеры превью подобраны по фактической вёрстке (замер в браузере):
 # mini рисуется 24–32 px (список, публичная страница) — 96 px покрывает DPR3;
 # medium рисуется ~180 px в плитке десктопа и до 320 px на телефоне — 384 px
@@ -314,6 +322,7 @@ app.config['MAX_FORM_PARTS'] = 50000
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 os.makedirs(THUMBNAIL_DIR, exist_ok=True)
+os.makedirs(TRASH_DIR, exist_ok=True)
 
 # ===== ПРОВЕРКА ИМЕНИ =====
 # Имя файла: белый список (расширен реальным миром: запятые, '!', '+', '&', '#', '@', ';', '=', '№')
@@ -424,6 +433,7 @@ def _sqlite_target(path):
         os.path.normpath(TOKENS_FILE): ('tokens', None),
         os.path.normpath(STATS_FILE): ('document', 'stats'),
         os.path.normpath(SETTINGS_FILE): ('document', 'settings'),
+        os.path.normpath(TRASH_FILE): ('document', 'trash'),
     }
     return mapping.get(normalized)
 
@@ -510,8 +520,11 @@ def get_folder_path(folder_id, folders):
     if not folder_id or folder_id not in folders:
         return []
     path = []
+    seen = set()
     current = folder_id
-    while current and current in folders:
+    # seen защищает от цикла в parent_id (испорченные данные не должны вешать сервер)
+    while current and current in folders and current not in seen:
+        seen.add(current)
         path.insert(0, folders[current]['name'])
         current = folders[current].get('parent_id')
     return path
@@ -519,6 +532,69 @@ def get_folder_path(folder_id, folders):
 def get_folder_physical_path(folder_id, folders):
     path_parts = get_folder_path(folder_id, folders)
     return os.path.join(UPLOAD_FOLDER, *path_parts) if path_parts else UPLOAD_FOLDER
+
+def folder_subtree_ids(folder_id, folders):
+    """Id папки и всех потомков. Цикл в parent_id не приводит к зацикливанию."""
+    subtree = set()
+    stack = [folder_id]
+    while stack:
+        current = stack.pop()
+        if current in subtree or current not in folders:
+            continue
+        subtree.add(current)
+        stack.extend(fid for fid, rec in folders.items() if rec.get('parent_id') == current)
+    return subtree
+
+
+def folder_subtree_unsafe(subtree, folders, db):
+    """True, если в поддереве есть небезопасный путь файла или папки."""
+    for rec in db.values():
+        if rec.get('folder_id') in subtree:
+            phys = rec.get('physical_path', rec['current_filename'])
+            if safe_upload_path(phys) is None:
+                return True
+    for current_id in subtree:
+        candidate = get_folder_physical_path(current_id, folders)
+        rel = os.path.relpath(candidate, UPLOAD_FOLDER)
+        if safe_upload_path(rel) is None:
+            return True
+    return False
+
+
+def delete_folder_tree(folder_id, folders, db):
+    """Удаляет поддерево папки: файлы (диск и БД) и каталоги. Меняет folders и db на месте."""
+    files_to_delete = [internal_id for internal_id, record in db.items()
+                       if record.get('folder_id') == folder_id]
+    for internal_id in files_to_delete:
+        physical_path = db[internal_id].get('physical_path', db[internal_id]['current_filename'])
+        full_path = safe_upload_path(physical_path)
+        if full_path is None:
+            raise ValueError(f'Небезопасный путь файла: {physical_path!r}')
+        if os.path.exists(full_path):
+            os.remove(full_path)
+        del db[internal_id]
+
+    for subfolder_id in [fid for fid, f in folders.items() if f.get('parent_id') == folder_id]:
+        delete_folder_tree(subfolder_id, folders, db)
+
+    folder_candidate = get_folder_physical_path(folder_id, folders)
+    folder_rel = os.path.relpath(folder_candidate, UPLOAD_FOLDER)
+    physical_path = safe_upload_path(folder_rel)
+    if physical_path is None:
+        raise ValueError(f'Небезопасный путь папки: {folder_rel!r}')
+    if os.path.exists(physical_path):
+        shutil.rmtree(physical_path)
+    folders.pop(folder_id, None)
+
+
+def selected_folder_roots(folder_ids, folders):
+    """Из запрошенных id оставляет только «корни»: вложенная папка уходит с родителем."""
+    requested = [fid for fid in dict.fromkeys(folder_ids) if fid in folders]
+    subtrees = {fid: folder_subtree_ids(fid, folders) for fid in requested}
+    roots = [fid for fid in requested
+             if not any(other != fid and fid in subtrees[other] for other in requested)]
+    return roots, subtrees
+
 
 def safe_upload_path(relative_path, allow_root=False):
     """Return a real path inside uploads, or None for unsafe DB paths/symlinks."""
@@ -714,6 +790,172 @@ def save_stats(stats):
     with DB_LOCK:
         _save_json(STATS_FILE, stats)
 
+# ===== КОРЗИНА =====
+# Файлы лежат в отдельном каталоге TRASH_DIR, индекс — документ trash
+# (в sqlite — таблица documents). Удалённые записи уходят из files, поэтому
+# листинги, статистика, ZIP и квоты их не видят.
+
+def load_trash():
+    data = _load_json(TRASH_FILE)
+    return data if isinstance(data, dict) else {}
+
+def save_trash(entries):
+    with DB_LOCK:
+        _save_json(TRASH_FILE, entries)
+
+def trash_entry_path(entry_id):
+    """Каталог записи корзины (создаётся при первом обращении)."""
+    path = os.path.join(TRASH_DIR, str(entry_id))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def move_file_to_trash(internal_id, record, db, trash):
+    """Переносит файл в корзину и убирает запись из db.
+
+    Возвращает id записи корзины или None, если переносить было нечего
+    (файла нет на диске либо безопасность пути не подтверждена).
+    """
+    physical_path = record.get('physical_path', record.get('current_filename'))
+    filepath = safe_upload_path(physical_path) if physical_path else None
+    entry_id = str(uuid.uuid4())
+    if filepath and os.path.exists(filepath):
+        target_dir = trash_entry_path(entry_id)
+        target_path = os.path.join(target_dir, os.path.basename(filepath))
+        try:
+            os.replace(filepath, target_path)
+        except OSError as exc:
+            # Другая ФС или гонка: откатываемся к жёсткому удалению.
+            app.logger.warning('Корзина недоступна для %s (%s); удаляю безвозвратно', physical_path, exc)
+            try:
+                shutil.rmtree(target_dir, ignore_errors=True)
+            except OSError:
+                pass
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+            db.pop(internal_id, None)
+            return None
+        trash[entry_id] = {
+            'id': entry_id,
+            'internal_id': internal_id,
+            'deleted_at': datetime.now(timezone.utc).isoformat(),
+            'name': record.get('display_name') or record.get('original_filename') or record.get('current_filename'),
+            'folder_id': record.get('folder_id'),
+            'size': record.get('size', 0),
+            'trash_path': os.path.relpath(target_path, DATA_DIR),
+            'record': record,
+        }
+    db.pop(internal_id, None)
+    return entry_id if entry_id in trash else None
+
+def purge_expired_trash(trash=None):
+    """Удаляет из корзины записи старше TRASH_RETENTION_DAYS. Возвращает число удалённых."""
+    owns_trash = trash is None
+    trash = load_trash() if owns_trash else trash
+    cutoff = datetime.now(timezone.utc) - timedelta(days=TRASH_RETENTION_DAYS)
+    expired = []
+    for entry_id, entry in trash.items():
+        try:
+            deleted = datetime.fromisoformat(str(entry.get('deleted_at')))
+        except (TypeError, ValueError):
+            expired.append(entry_id)
+            continue
+        if deleted.tzinfo is None:
+            deleted = deleted.replace(tzinfo=timezone.utc)
+        if deleted < cutoff:
+            expired.append(entry_id)
+    for entry_id in expired:
+        purge_trash_entry(entry_id, trash)
+    if owns_trash and expired:
+        save_trash(trash)
+    return len(expired)
+
+def purge_trash_entry(entry_id, trash):
+    """Окончательно удаляет одну запись корзины (файл и индекс)."""
+    entry = trash.pop(entry_id, None)
+    if not entry:
+        return False
+    target_dir = os.path.join(TRASH_DIR, str(entry_id))
+    shutil.rmtree(target_dir, ignore_errors=True)
+    return True
+
+def restore_trash_entries(entry_ids, folders, db, trash, view=None, client_folder=None):
+    """Возвращает файлы из корзины (в исходную папку или в корень).
+
+    Возвращает (restored_ids, rows_html): rows_html — строки для файлов,
+    попавших в папку client_folder (для точечной вставки в интерфейсе).
+    """
+    restored_ids = []
+    rows_html = ''
+    for entry_id in entry_ids:
+        entry = trash.get(entry_id)
+        if not isinstance(entry, dict):
+            continue
+        record = entry.get('record') or {}
+        target_folder = entry.get('folder_id')
+        if target_folder and target_folder not in folders:
+            target_folder = None   # исходной папки уже нет — кладём в корень
+        target_dir = get_folder_physical_path(target_folder, folders)
+        os.makedirs(target_dir, exist_ok=True)
+
+        filename = record.get('current_filename') or entry.get('name') or 'file'
+        existing = {r.get('current_filename') for r in db.values()
+                    if r.get('folder_id') == target_folder}
+        for name in os.listdir(target_dir):
+            if os.path.isfile(os.path.join(target_dir, name)):
+                existing.add(name)
+        final_name = filename
+        if final_name in existing:
+            base, dot, ext = filename.rpartition('.')
+            base = base if dot else filename
+            counter = 1
+            while True:
+                candidate = f'{base}_{counter}.{ext}' if dot else f'{base}_{counter}'
+                if candidate not in existing:
+                    final_name = candidate
+                    break
+                counter += 1
+
+        source = os.path.join(DATA_DIR, entry['trash_path']) if entry.get('trash_path') else None
+        if not source or not os.path.isfile(source):
+            purge_trash_entry(entry_id, trash)   # файл потерян — запись лишняя
+            continue
+        destination = os.path.join(target_dir, final_name)
+        try:
+            os.replace(source, destination)
+        except OSError as exc:
+            app.logger.error('Восстановление из корзины: %s -> %s: %s', source, destination, exc)
+            continue
+
+        used_slugs = {r.get('slug') for r in db.values()}
+        used_slugs |= {r.get('custom_alias') for r in db.values()}
+        used_slugs |= {f.get('slug') for f in folders.values()}
+        slug = record.get('slug')
+        if not slug or slug in used_slugs:
+            slug = make_short_slug(final_name, db, folders=folders)
+
+        # Исходный id сохраняем, если он свободен: строка в интерфейсе остаётся той же.
+        new_id = entry.get('internal_id')
+        if not new_id or new_id in db:
+            new_id = str(uuid.uuid4())
+        new_record = dict(record)
+        new_record.update({
+            'access_id': new_id,
+            'current_filename': final_name,
+            'physical_path': os.path.relpath(destination, UPLOAD_FOLDER),
+            'folder_id': target_folder,
+            'slug': slug,
+            'size': os.path.getsize(destination),
+            'mtime': datetime.fromtimestamp(os.path.getmtime(destination)).strftime('%d.%m.%Y %H:%M'),
+        })
+        db[new_id] = new_record
+        purge_trash_entry(entry_id, trash)
+        restored_ids.append(new_id)
+        if view and target_folder == client_folder:
+            rows_html += str(render_file_row(file_view_record(new_id, new_record), view))
+    return restored_ids, rows_html
+
 def bump_counter(match_fn, counter_field):
     """Атомарно увеличивает счётчик у записи БД (под блокировкой).
     Возвращает запись или None, если совпадений нет."""
@@ -772,6 +1014,50 @@ def get_disk_info():
         'percent': round(usage.used / usage.total * 100, 1)
     }
 
+def file_view_record(internal_id, record):
+    """Данные файла для шаблона (форма, которую ждёт разметка строки)."""
+    physical_path = record.get('physical_path', record['current_filename'])
+    return {
+        'internal_id': internal_id,
+        'name': record['display_name'],
+        'current_filename': record['current_filename'],
+        'physical_path': physical_path,
+        'ext': record['ext'],
+        'size': format_size(record['size']),
+        'size_raw': record['size'],
+        'mtime': record['mtime'],
+        'is_image': record.get('is_image', False),
+        'icon': get_file_icon(record['ext']),
+        'custom_alias': record['custom_alias'],
+        'link_rotated': record.get('link_rotated', False),
+        'download_count': record.get('download_count', 0),
+        'view_count': record.get('view_count', 0),
+        'folder_id': record.get('folder_id'),
+        # Ссылки с нормальной кириллицей (без URL-кодирования)
+        'download_url': f"{BASE_URL}/{url_path(physical_path)}",
+        'view_url': f"{BASE_URL}/v/{url_path(physical_path)}",
+        # Thumbnail requests must not inflate view_count.
+        'thumb_url': f"/thumb/mini/{internal_id}",
+        'thumb_medium_url': f"/thumb/medium/{internal_id}",
+        'slug': record.get('slug', ''),
+        # Короткая латинизированная ссылка (переживает переименование)
+        'short_url': f"{BASE_URL}/{record['slug']}" if record.get('slug') else f"{BASE_URL}/{url_path(physical_path)}",
+    }
+
+def folder_view_record(fid, folders, stats_map):
+    """Данные папки для шаблона (форма разметки строки папки)."""
+    folder = folders[fid]
+    f_count, f_size, f_subdirs = stats_map.get(fid, (0, 0, 0))
+    return {
+        'id': fid,
+        'name': folder['name'],
+        'created': folder.get('created', ''),
+        'slug': folder.get('slug', ''),
+        'file_count': f_count,
+        'subdir_count': f_subdirs,
+        'size': format_size(f_size),
+    }
+
 def get_files_in_folder(folder_id):
     db = load_db()
     files = []
@@ -780,32 +1066,7 @@ def get_files_in_folder(folder_id):
             physical_path = record.get('physical_path', record['current_filename'])
             filepath = safe_upload_path(physical_path)
             if filepath and os.path.isfile(filepath):
-                files.append({
-                    'internal_id': internal_id,
-                    'name': record['display_name'],
-                    'current_filename': record['current_filename'],
-                    'physical_path': physical_path,
-                    'ext': record['ext'],
-                    'size': format_size(record['size']),
-                    'size_raw': record['size'],
-                    'mtime': record['mtime'],
-                    'is_image': record.get('is_image', False),
-                    'icon': get_file_icon(record['ext']),
-                    'custom_alias': record['custom_alias'],
-                    'link_rotated': record.get('link_rotated', False),
-                    'download_count': record.get('download_count', 0),
-                    'view_count': record.get('view_count', 0),
-                    'folder_id': folder_id,
-                    # Ссылки с нормальной кириллицей (без URL-кодирования)
-                    'download_url': f"{BASE_URL}/{url_path(physical_path)}",
-                    'view_url': f"{BASE_URL}/v/{url_path(physical_path)}",
-                    # Thumbnail requests must not inflate view_count.
-                    'thumb_url': f"/thumb/mini/{internal_id}",
-                    'thumb_medium_url': f"/thumb/medium/{internal_id}",
-                    'slug': record.get('slug', ''),
-                    # Короткая латинизированная ссылка (переживает переименование)
-                    'short_url': f"{BASE_URL}/{record['slug']}" if record.get('slug') else f"{BASE_URL}/{url_path(physical_path)}",
-                })
+                files.append(file_view_record(internal_id, record))
     return sorted(files, key=lambda x: x['mtime'], reverse=True)
 
 def get_all_files():
@@ -884,9 +1145,13 @@ def get_folder_stats_map(folders, db):
         children.setdefault(f.get('parent_id'), []).append(fid)
 
     memo = {}
+    visiting = set()
     def stats(fid):
         if fid in memo:
             return memo[fid]
+        if fid in visiting:   # цикл в parent_id: не уходим в бесконечную рекурсию
+            return (0, 0, 0)
+        visiting.add(fid)
         count, size = files_agg.get(fid, (0, 0))
         subdirs = 0
         for ch in children.get(fid, []):
@@ -894,12 +1159,156 @@ def get_folder_stats_map(folders, db):
             count += c
             size += s
             subdirs += 1 + sd
+        visiting.discard(fid)
         memo[fid] = (count, size, subdirs)
         return memo[fid]
 
     for fid in folders:
         stats(fid)
     return memo
+
+# ===== РАЗМЕТКА СТРОК (единый источник для страницы и фрагментов) =====
+# Одни и те же шаблоны используются и при полной отрисовке страницы (через
+# Jinja-глобалы folder_row_html/file_row_html), и при точечных обновлениях:
+# после загрузки/переименования/создания папки сервер возвращает готовый HTML строки.
+_ROW_TEMPLATES = {
+    'folder_table': """<tr class="folder-row" tabindex="0" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
+    <td class="checkbox-cell"><input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)"></td>
+    <td class="link-cell"><button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку" aria-label="Копировать ссылку на папку">🔗</button></td>
+    <td class="icon-cell"><span class="folder-icon">📁</span></td>
+    <td data-label="Имя"><a href="/f/{{ folder.id }}" style="font-weight: 600;">{{ folder.name }}</a></td>
+    <td class="size-col" data-label="Размер">{% if folder.file_count %}{{ folder.size }}{% else %}—{% endif %}</td>
+    <td class="date-col" data-label="Изменён">{{ folder.created }}</td>
+    <td class="type-col" data-label="Тип">Папка · 📄 {{ folder.file_count }} · 📁 {{ folder.subdir_count }}</td>
+    <td class="dl-col" data-label="Скачивания">—</td>
+    <td class="actions-cell" data-label="Действия">
+        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить папку" aria-label="Удалить папку {{ folder.name }}">🗑️</button>
+    </td>
+</tr>""",
+    'file_table': """<tr class="file-row" tabindex="0" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
+    <td class="checkbox-cell"><input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)"></td>
+    <td class="link-cell"><button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку" aria-label="Копировать короткую ссылку">🔗</button></td>
+    <td class="icon-cell">
+        {% if f.is_image %}
+            <img src="{{ f.thumb_url }}" class="thumb-sm" loading="lazy" decoding="async" alt="">
+        {% else %}
+            <span class="emoji-icon">{{ f.icon }}</span>
+        {% endif %}
+    </td>
+    <td data-label="Имя">
+        <span style="display: flex; align-items: center; flex-wrap: wrap; gap: 4px;">
+            {% if f.is_image %}
+                <a href="{{ f.view_url }}" target="_blank">{{ f.name }}</a>
+            {% else %}
+                <a href="{{ f.download_url }}">{{ f.name }}</a>
+            {% endif %}
+            {% if f.link_rotated %}
+                <span class="rotated-badge" title="Старые ссылки не работают">⚠️</span>
+            {% endif %}
+        </span>
+    </td>
+    <td class="size-col" data-label="Размер">{{ f.size }}</td>
+    <td class="date-col" data-label="Изменён">{{ f.mtime }}</td>
+    <td class="type-col" data-label="Тип">{{ f.ext }}</td>
+    <td class="dl-col" data-label="Скачивания"><span class="dl-badge">⬇ {{ f.download_count }} | 👁 {{ f.view_count }}</span></td>
+    <td class="actions-cell" data-label="Действия">
+        {% if can_move_up %}
+        <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить на уровень выше" aria-label="Переместить на уровень выше">⬆️</button>
+        {% endif %}
+        <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать" aria-label="Редактировать {{ f.name }}">✏️</button>
+        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить" aria-label="Удалить {{ f.name }}">🗑️</button>
+    </td>
+</tr>""",
+    'folder_grid': """<div class="tile" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
+    <div class="tile-checkbox"><input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)"></div>
+    <a href="/f/{{ folder.id }}" class="tile-folder">
+        <div class="tile-folder-icon">📁</div>
+        <div class="tile-folder-name">{{ folder.name }}</div>
+    </a>
+    <div class="tile-name row-actions">
+        <button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку" aria-label="Копировать ссылку на папку">🔗</button>
+        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить" aria-label="Удалить папку {{ folder.name }}">🗑️</button>
+    </div>
+</div>""",
+    'file_grid': """<div class="tile" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
+    <div class="tile-checkbox"><input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)"></div>
+    <div class="tile-actions">
+        {% if can_move_up %}
+        <button onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше" aria-label="Переместить {{ f.name }} на уровень выше">⬆️</button>
+        {% endif %}
+        <button onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать" aria-label="Редактировать {{ f.name }}">✏️</button>
+        <button onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку" aria-label="Копировать короткую ссылку">🔗</button>
+        <button class="del-btn" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить" aria-label="Удалить {{ f.name }}">🗑️</button>
+    </div>
+    {% if f.is_image %}
+        <a href="{{ f.view_url }}" target="_blank" class="tile-preview-wrap">
+            <img src="{{ f.thumb_medium_url }}" class="tile-preview" loading="lazy" decoding="async" alt="">
+        </a>
+    {% else %}
+        <a href="{{ f.download_url }}" class="tile-icon-wrap">
+            <div class="tile-icon">{{ f.icon }}</div>
+            <div class="tile-ext">{{ f.ext }}</div>
+        </a>
+    {% endif %}
+    <div class="tile-name">
+        <a href="{{ f.download_url }}" title="{{ f.name }}">{{ f.name }}</a>
+        <span class="tile-dl">⬇ {{ f.download_count }}</span>
+    </div>
+</div>""",
+    'folder_list': """<div class="list-item folder-item" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
+    <input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)">
+    <button class="btn btn-sm btn-icon list-link" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку" aria-label="Копировать ссылку на папку">🔗</button>
+    <span class="emoji-icon-sm">📁</span>
+    <div class="list-name-wrap">
+        <a href="/f/{{ folder.id }}" class="list-name" style="font-weight: 600;">{{ folder.name }}</a>
+    </div>
+    <span class="list-date">{{ folder.created }}</span>
+    <div class="list-actions">
+        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить" aria-label="Удалить папку {{ folder.name }}">🗑️</button>
+    </div>
+</div>""",
+    'file_list': """<div class="list-item" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
+    <input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)">
+    <button class="btn btn-sm btn-icon list-link" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку" aria-label="Копировать короткую ссылку">🔗</button>
+    {% if f.is_image %}
+        <img src="{{ f.thumb_url }}" class="thumb-xs" loading="lazy" decoding="async" alt="">
+    {% else %}
+        <span class="emoji-icon-sm">{{ f.icon }}</span>
+    {% endif %}
+    <div class="list-name-wrap">
+        <a href="{{ f.download_url }}" class="list-name">{{ f.name }}</a>
+        {% if f.link_rotated %}<span class="rotated-badge">⚠️</span>{% endif %}
+    </div>
+    <span class="dl-badge">⬇ {{ f.download_count }}</span>
+    <span class="list-size">{{ f.size }}</span>
+    <span class="list-date">{{ f.mtime }}</span>
+    <div class="list-actions">
+        {% if can_move_up %}
+        <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше" aria-label="Переместить {{ f.name }} на уровень выше">⬆️</button>
+        {% endif %}
+        <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать" aria-label="Редактировать {{ f.name }}">✏️</button>
+        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить" aria-label="Удалить {{ f.name }}">🗑️</button>
+    </div>
+</div>""",
+}
+
+BROWSE_VIEWS = ('table', 'grid', 'list')
+
+
+def render_file_row(record, view='table'):
+    """HTML одной строки файла для нужного представления."""
+    template = _ROW_TEMPLATES.get(f'file_{view}') or _ROW_TEMPLATES['file_table']
+    html = render_template_string(template, f=record, base_url=BASE_URL,
+                                  can_move_up=bool(record.get('folder_id')))
+    return Markup(html)
+
+
+def render_folder_row(folder, view='table'):
+    """HTML одной строки папки для нужного представления."""
+    template = _ROW_TEMPLATES.get(f'folder_{view}') or _ROW_TEMPLATES['folder_table']
+    html = render_template_string(template, folder=folder, base_url=BASE_URL)
+    return Markup(html)
+
 
 # ===== HTML ШАБЛОН =====
 HTML_TEMPLATE = """
@@ -1074,8 +1483,12 @@ HTML_TEMPLATE = """
         .disk-bar { width: 80px; height: 8px; background: #475569; border-radius: 4px; overflow: hidden; }
         .disk-bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
 
-        .toast { position: fixed; top: 80px; right: 20px; padding: 12px 20px; background: #28a745; color: white; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); opacity: 0; transition: opacity 0.3s; z-index: 1000; font-size: 13px; font-weight: 500; }
-        .toast.show { opacity: 1; }
+        .toast-stack { position: fixed; top: 80px; right: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 1000; max-width: min(420px, calc(100vw - 40px)); }
+        .toast { display: flex; align-items: center; gap: 10px; padding: 12px 20px; background: #28a745; color: white; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); opacity: 0; transform: translateY(-6px); transition: opacity 0.3s, transform 0.3s; font-size: 13px; font-weight: 500; }
+        .toast-action { background: rgba(255,255,255,.28); color: inherit; border: none; border-radius: 4px; padding: 3px 10px; cursor: pointer; font-weight: 600; font-size: 12px; white-space: nowrap; }
+        .toast-action:hover { background: rgba(255,255,255,.45); }
+        .toast-action:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }
+        .toast.show { opacity: 1; transform: none; }
         .toast.error { background: #dc3545; }
 
         .empty-state { text-align: center; padding: 40px 20px; color: #94a3b8; font-size: 14px; }
@@ -1156,6 +1569,7 @@ HTML_TEMPLATE = """
             <a href="/password" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Сменить свой пароль" aria-label="Сменить свой пароль">🔒 Пароль</a>
             {% if is_admin() %}
             <a href="/settings/tokens" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="API-токены" aria-label="API-токены">🔑 Токены</a>
+            <a href="/trash" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Корзина" aria-label="Корзина">🗑️ Корзина</a>
             <a href="/settings/users" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Пользователи" aria-label="Пользователи">👥 Пользователи</a>
             <a href="/settings" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Настройки квот" aria-label="Настройки">⚙️ Настройки</a>
             {% endif %}
@@ -1278,55 +1692,10 @@ HTML_TEMPLATE = """
                             </thead>
                             <tbody>
                                 {% for folder in subfolders %}
-                                <tr class="folder-row" tabindex="0" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
-                                    <td class="checkbox-cell"><input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)"></td>
-                                    <td class="link-cell"><button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку" aria-label="Копировать ссылку на папку">🔗</button></td>
-                                    <td class="icon-cell"><span class="folder-icon">📁</span></td>
-                                    <td data-label="Имя"><a href="/f/{{ folder.id }}" style="font-weight: 600;">{{ folder.name }}</a></td>
-                                    <td class="size-col" data-label="Размер">{% if folder.file_count %}{{ folder.size }}{% else %}—{% endif %}</td>
-                                    <td class="date-col" data-label="Изменён">{{ folder.created }}</td>
-                                    <td class="type-col" data-label="Тип">Папка · 📄 {{ folder.file_count }} · 📁 {{ folder.subdir_count }}</td>
-                                    <td class="dl-col" data-label="Скачивания">—</td>
-                                    <td class="actions-cell" data-label="Действия">
-                                        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить папку" aria-label="Удалить папку {{ folder.name }}">🗑️</button>
-                                    </td>
-                                </tr>
+                                {{ folder_row_html(folder, view) }}
                                 {% endfor %}
                                 {% for f in files %}
-                                <tr class="file-row" tabindex="0" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
-                                    <td class="checkbox-cell"><input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)"></td>
-                                    <td class="link-cell"><button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку" aria-label="Копировать короткую ссылку">🔗</button></td>
-                                    <td class="icon-cell">
-                                        {% if f.is_image %}
-                                            <img src="{{ f.thumb_url }}" class="thumb-sm" loading="lazy" decoding="async" alt="">
-                                        {% else %}
-                                            <span class="emoji-icon">{{ f.icon }}</span>
-                                        {% endif %}
-                                    </td>
-                                    <td data-label="Имя">
-                                        <span style="display: flex; align-items: center; flex-wrap: wrap; gap: 4px;">
-                                            {% if f.is_image %}
-                                                <a href="{{ f.view_url }}" target="_blank">{{ f.name }}</a>
-                                            {% else %}
-                                                <a href="{{ f.download_url }}">{{ f.name }}</a>
-                                            {% endif %}
-                                            {% if f.link_rotated %}
-                                                <span class="rotated-badge" title="Старые ссылки не работают">⚠️</span>
-                                            {% endif %}
-                                        </span>
-                                    </td>
-                                    <td class="size-col" data-label="Размер">{{ f.size }}</td>
-                                    <td class="date-col" data-label="Изменён">{{ f.mtime }}</td>
-                                    <td class="type-col" data-label="Тип">{{ f.ext }}</td>
-                                    <td class="dl-col" data-label="Скачивания"><span class="dl-badge">⬇ {{ f.download_count }} | 👁 {{ f.view_count }}</span></td>
-                                    <td class="actions-cell" data-label="Действия">
-                                        {% if current_folder %}
-                                        <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить на уровень выше" aria-label="Переместить на уровень выше">⬆️</button>
-                                        {% endif %}
-                                        <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать" aria-label="Редактировать {{ f.name }}">✏️</button>
-                                        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить" aria-label="Удалить {{ f.name }}">🗑️</button>
-                                    </td>
-                                </tr>
+                                {{ file_row_html(f, view) }}
                                 {% endfor %}
                             </tbody>
                         </table>
@@ -1335,44 +1704,10 @@ HTML_TEMPLATE = """
                     <div id="view-grid" class="view-container">
                         <div class="files-grid">
                             {% for folder in subfolders %}
-                            <div class="tile" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
-                                <div class="tile-checkbox"><input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)"></div>
-                                <a href="/f/{{ folder.id }}" class="tile-folder">
-                                    <div class="tile-folder-icon">📁</div>
-                                    <div class="tile-folder-name">{{ folder.name }}</div>
-                                </a>
-                                <div class="tile-name row-actions">
-                                    <button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку" aria-label="Копировать ссылку на папку">🔗</button>
-                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить" aria-label="Удалить папку {{ folder.name }}">🗑️</button>
-                                </div>
-                            </div>
+                            {{ folder_row_html(folder, view) }}
                             {% endfor %}
                             {% for f in files %}
-                            <div class="tile" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
-                                <div class="tile-checkbox"><input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)"></div>
-                                <div class="tile-actions">
-                                    {% if current_folder %}
-                                    <button onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше" aria-label="Переместить {{ f.name }} на уровень выше">⬆️</button>
-                                    {% endif %}
-                                    <button onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать" aria-label="Редактировать {{ f.name }}">✏️</button>
-                                    <button onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку" aria-label="Копировать короткую ссылку">🔗</button>
-                                    <button class="del-btn" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить" aria-label="Удалить {{ f.name }}">🗑️</button>
-                                </div>
-                                {% if f.is_image %}
-                                    <a href="{{ f.view_url }}" target="_blank" class="tile-preview-wrap">
-                                        <img src="{{ f.thumb_medium_url }}" class="tile-preview" loading="lazy" decoding="async" alt="">
-                                    </a>
-                                {% else %}
-                                    <a href="{{ f.download_url }}" class="tile-icon-wrap">
-                                        <div class="tile-icon">{{ f.icon }}</div>
-                                        <div class="tile-ext">{{ f.ext }}</div>
-                                    </a>
-                                {% endif %}
-                                <div class="tile-name">
-                                    <a href="{{ f.download_url }}" title="{{ f.name }}">{{ f.name }}</a>
-                                    <span class="tile-dl">⬇ {{ f.download_count }}</span>
-                                </div>
-                            </div>
+                            {{ file_row_html(f, view) }}
                             {% endfor %}
                         </div>
                     </div>
@@ -1380,43 +1715,10 @@ HTML_TEMPLATE = """
                     <div id="view-list" class="view-container">
                         <div class="files-list">
                             {% for folder in subfolders %}
-                            <div class="list-item folder-item" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
-                                <input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)">
-                                <button class="btn btn-sm btn-icon list-link" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку" aria-label="Копировать ссылку на папку">🔗</button>
-                                <span class="emoji-icon-sm">📁</span>
-                                <div class="list-name-wrap">
-                                    <a href="/f/{{ folder.id }}" class="list-name" style="font-weight: 600;">{{ folder.name }}</a>
-                                </div>
-                                <span class="list-date">{{ folder.created }}</span>
-                                <div class="list-actions">
-                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить" aria-label="Удалить папку {{ folder.name }}">🗑️</button>
-                                </div>
-                            </div>
+                            {{ folder_row_html(folder, view) }}
                             {% endfor %}
                             {% for f in files %}
-                            <div class="list-item" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
-                                <input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)">
-                                <button class="btn btn-sm btn-icon list-link" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку" aria-label="Копировать короткую ссылку">🔗</button>
-                                {% if f.is_image %}
-                                    <img src="{{ f.thumb_url }}" class="thumb-xs" loading="lazy" decoding="async" alt="">
-                                {% else %}
-                                    <span class="emoji-icon-sm">{{ f.icon }}</span>
-                                {% endif %}
-                                <div class="list-name-wrap">
-                                    <a href="{{ f.download_url }}" class="list-name">{{ f.name }}</a>
-                                    {% if f.link_rotated %}<span class="rotated-badge">⚠️</span>{% endif %}
-                                </div>
-                                <span class="dl-badge">⬇ {{ f.download_count }}</span>
-                                <span class="list-size">{{ f.size }}</span>
-                                <span class="list-date">{{ f.mtime }}</span>
-                                <div class="list-actions">
-                                    {% if current_folder %}
-                                    <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше" aria-label="Переместить {{ f.name }} на уровень выше">⬆️</button>
-                                    {% endif %}
-                                    <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать" aria-label="Редактировать {{ f.name }}">✏️</button>
-                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить" aria-label="Удалить {{ f.name }}">🗑️</button>
-                                </div>
-                            </div>
+                            {{ file_row_html(f, view) }}
                             {% endfor %}
                         </div>
                     </div>
@@ -1507,7 +1809,7 @@ HTML_TEMPLATE = """
 
     <div class="modal-overlay" id="batchMoveModal" role="dialog" aria-modal="true" aria-labelledby="batchMoveModalTitle" aria-hidden="true">
         <div class="modal">
-            <h3 id="batchMoveModalTitle">📁 Переместить файлы</h3>
+            <h3 id="batchMoveModalTitle">📁 Переместить выбранное</h3>
             <div class="form-group">
                 <label>Выберите папку</label>
                 <select id="batchMoveFolderId"></select>
@@ -1545,7 +1847,7 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <div class="toast-stack" id="toastStack" role="status" aria-live="polite"></div>
 
     <script>
         const currentFolderId = '{{ current_folder_id or "" }}';
@@ -1602,6 +1904,7 @@ HTML_TEMPLATE = """
             activeModal = modal;
             modal.classList.add('active');
             modal.setAttribute('aria-hidden', 'false');
+            setBackgroundInert(true);
             const target = modalFocusable(modal)[0];
             setTimeout(() => target?.focus(), 0);
         }
@@ -1612,11 +1915,26 @@ HTML_TEMPLATE = """
             modal.setAttribute('aria-hidden', 'true');
             if (activeModal === modal) {
                 activeModal = null;
+                setBackgroundInert(false);
                 if (modalReturnFocus && document.contains(modalReturnFocus)) {
                     modalReturnFocus.focus();
                 }
                 modalReturnFocus = null;
             }
+        }
+        // Пока открыта модалка, фон (шапка, контент, футер) делаем инертным,
+        // чтобы скринридер и Tab не уходили за пределы диалога. Плашки toast
+        // остаются доступными. `inert` поддерживается, но подстрахуемся aria-hidden.
+        function setBackgroundInert(on) {
+            document.querySelectorAll('body > header, .main, body > footer').forEach(el => {
+                if (on) {
+                    el.setAttribute('inert', '');
+                    el.setAttribute('aria-hidden', 'true');
+                } else {
+                    el.removeAttribute('inert');
+                    el.removeAttribute('aria-hidden');
+                }
+            });
         }
         document.addEventListener('keydown', (event) => {
             if (!activeModal) return;
@@ -1877,7 +2195,7 @@ HTML_TEMPLATE = """
                 selectedCount.textContent = '0';
             }
             document.querySelectorAll('.file-selection-action').forEach(btn => {
-                btn.hidden = selectedFiles.size === 0;
+                btn.hidden = total === 0;
             });
 
             const selectAll = document.getElementById('selectAll');
@@ -2000,23 +2318,44 @@ HTML_TEMPLATE = """
         }
 
         async function batchDelete() {
-            if (selectedFiles.size === 0) return;
+            const fileCount = selectedFiles.size;
+            const folderCount = selectedFolders.size;
+            if (fileCount === 0 && folderCount === 0) return;
             if (!lockAction('batch-delete')) return;
-            if (!confirm(`Удалить ${selectedFiles.size} файл(ов)?`)) { unlockAction('batch-delete'); return; }
+            let question = `Удалить ${fileCount} файл(ов)`;
+            if (folderCount) question += ` и ${folderCount} папок(и)`;
+            question += folderCount ? '? Подпапки внутри будут удалены безвозвратно.' : '?';
+            if (!confirm(question)) { unlockAction('batch-delete'); return; }
             const btn = document.getElementById('batchDeleteBtn');
             if (btn) { setIdleLabel(btn, '⏳ Удаление…'); btn.disabled = true; }
             try {
-                const response = await fetch('/api/delete_files_batch', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ file_ids: Array.from(selectedFiles) })
-                });
-                const result = await parseResponseJson(response);
-                if (response.ok) {
-                    showToast(`✅ Удалено: ${result.count}`);
-                    if (Array.isArray(result.deleted_ids)) removeRows(result.deleted_ids);
-                    else reloadPreservingScroll(800);
+                const deletedFiles = [];
+                const deletedFolders = [];
+                const trashIds = [];
+                if (fileCount) {
+                    const response = await fetch('/api/delete_files_batch', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ file_ids: Array.from(selectedFiles) })
+                    });
+                    const result = await parseResponseJson(response);
+                    if (!response.ok) { showToast('❌ ' + (result.error || 'Ошибка'), true); return; }
+                    deletedFiles.push(...(result.deleted_ids || []));
+                    trashIds.push(...(result.trash_ids || []));
                 }
-                else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
+                if (folderCount) {
+                    const response = await fetch('/api/delete_folders_batch', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ folder_ids: Array.from(selectedFolders) })
+                    });
+                    const result = await parseResponseJson(response);
+                    if (!response.ok) { showToast('❌ ' + (result.error || 'Ошибка'), true); return; }
+                    deletedFolders.push(...(result.deleted_folder_ids || []));
+                }
+                const total = deletedFiles.length + deletedFolders.length;
+                if (deletedFiles.length || deletedFolders.length) removeRows(deletedFiles, deletedFolders);
+                else reloadPreservingScroll(800);
+                showToast(`✅ Удалено: ${total}`, false,
+                    trashIds.length ? { label: 'Восстановить', onClick: () => undoDelete(trashIds) } : null);
             } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally {
                 if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
@@ -2059,8 +2398,8 @@ HTML_TEMPLATE = """
         }
 
         async function openBatchMoveModal() {
-            if (selectedFiles.size === 0) return;
-            const loaded = await loadFolderSelect('batchMoveFolderId');
+            if (selectedFiles.size === 0 && selectedFolders.size === 0) return;
+            const loaded = await loadFolderSelect('batchMoveFolderId', '', Array.from(selectedFolders));
             if (loaded) openModal('batchMoveModal');
         }
 
@@ -2072,18 +2411,32 @@ HTML_TEMPLATE = """
             const targetFolderId = document.getElementById('batchMoveFolderId').value || null;
             if (btn) { setIdleLabel(btn, 'Перемещение…'); btn.disabled = true; }
             try {
-                const response = await fetch('/api/move_files_batch', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ file_ids: Array.from(selectedFiles), target_folder_id: targetFolderId })
-                });
-                const result = await parseResponseJson(response);
-                if (response.ok) {
-                    showToast(`✅ Перемещено: ${result.count}`);
-                    closeBatchMoveModal();
-                    if (Array.isArray(result.moved_ids)) removeRows(result.moved_ids);
-                    else reloadPreservingScroll(800);
+                const fileIds = Array.from(selectedFiles);
+                const folderIds = Array.from(selectedFolders);
+                const movedFiles = [];
+                const movedFolders = [];
+                if (fileIds.length) {
+                    const response = await fetch('/api/move_files_batch', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ file_ids: fileIds, target_folder_id: targetFolderId })
+                    });
+                    const result = await parseResponseJson(response);
+                    if (!response.ok) { showToast('❌ ' + (result.error || 'Ошибка'), true); return; }
+                    movedFiles.push(...(result.moved_ids || []));
                 }
-                else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
+                if (folderIds.length) {
+                    const response = await fetch('/api/move_folders_batch', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ folder_ids: folderIds, target_folder_id: targetFolderId })
+                    });
+                    const result = await parseResponseJson(response);
+                    if (!response.ok) { showToast('❌ ' + (result.error || 'Ошибка'), true); return; }
+                    movedFolders.push(...(result.moved_ids || []));
+                }
+                showToast(`✅ Перемещено: ${movedFiles.length + movedFolders.length}`);
+                closeBatchMoveModal();
+                if (movedFiles.length || movedFolders.length) removeRows(movedFiles, movedFolders);
+                else reloadPreservingScroll(800);
             } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally {
                 if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
@@ -2133,7 +2486,27 @@ HTML_TEMPLATE = """
         }
         document.getElementById('editPhysicalFilename').addEventListener('input', updateFilenameWarning);
 
-        async function loadFolderSelect(selectId, selectedValue = '') {
+        // Папки, которые нельзя выбрать целью перемещения: сами перемещаемые
+        // и все их потомки (иначе получилось бы перемещение папки внутрь себя).
+        function excludedFolderIds(folders, folderIds) {
+            const byParent = new Map();
+            folders.forEach(f => {
+                const key = f.parent_id || '';
+                if (!byParent.has(key)) byParent.set(key, []);
+                byParent.get(key).push(f.id);
+            });
+            const excluded = new Set();
+            const queue = Array.from(folderIds || []);
+            while (queue.length) {
+                const id = queue.shift();
+                if (excluded.has(id)) continue;
+                excluded.add(id);
+                (byParent.get(id) || []).forEach(child => queue.push(child));
+            }
+            return excluded;
+        }
+
+        async function loadFolderSelect(selectId, selectedValue = '', excludeIds = []) {
             const requestId = ++folderSelectRequestId;
             try {
                 const response = await fetch('/api/get_all_folders');
@@ -2143,7 +2516,9 @@ HTML_TEMPLATE = """
                 if (requestId !== folderSelectRequestId) return false;
                 const select = document.getElementById(selectId);
                 select.innerHTML = '<option value="">🏠 Корень</option>';
+                const excluded = excludedFolderIds(folders, excludeIds);
                 folders.forEach(f => {
+                    if (excluded.has(f.id)) return;
                     const option = document.createElement('option');
                     option.value = f.id;
                     option.textContent = `${'—'.repeat(f.depth)} 📁 ${f.name}`;
@@ -2173,10 +2548,10 @@ HTML_TEMPLATE = """
                 display_name: document.getElementById('editDisplayName').value.trim(),
                 physical_filename: document.getElementById('editPhysicalFilename').value.trim(),
                 custom_alias: document.getElementById('editCustomAlias').value.trim(),
-                folder_id: document.getElementById('editFolderId').value || null
+                folder_id: document.getElementById('editFolderId').value || null,
+                view: currentView
             };
             if (!data.display_name || !data.physical_filename) { showToast('❌ Имена не могут быть пустыми', true); return; }
-            if (!queueGuard('сохранение изменений')) return;
             const btn = document.getElementById('editSaveBtn');
             if (btn) { setIdleLabel(btn, 'Сохранение…'); btn.disabled = true; }
             try {
@@ -2185,7 +2560,26 @@ HTML_TEMPLATE = """
                     body: JSON.stringify(data)
                 });
                 const result = await parseResponseJson(response);
-                if (response.ok) { showToast('✅ Сохранено'); closeEditModal(); reloadPreservingScroll(800); }
+                if (response.ok) {
+                    showToast('✅ Сохранено');
+                    closeEditModal();
+                    // Файл остался в этой папке — заменяем строку на месте; уехал — убираем.
+                    const escaped = (window.CSS && CSS.escape) ? CSS.escape(data.internal_id) : data.internal_id;
+                    const row = document.querySelector(`[data-file-id="${escaped}"]`);
+                    const stayed = (result.folder_id || '') === (currentFolderId || '');
+                    const template = document.createElement('template');
+                    if (stayed && result.row_html && row) {
+                        template.innerHTML = result.row_html.trim();
+                        const node = template.content.firstElementChild;
+                        if (node) row.replaceWith(node);
+                        refreshDomTotals();
+                        updateSelection();
+                    } else if (row) {
+                        removeRows([data.internal_id]);
+                    } else {
+                        reloadPreservingScroll(800);
+                    }
+                }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally {
@@ -2203,16 +2597,26 @@ HTML_TEMPLATE = """
         async function createFolder() {
             const name = document.getElementById('newFolderName').value.trim();
             if (!name) { showToast('❌ Введите имя папки', true); return; }
-            if (!queueGuard('создание папки')) return;
             const btn = document.getElementById('createFolderBtn');
             if (btn) { setIdleLabel(btn, 'Создание…'); btn.disabled = true; }
             try {
                 const response = await fetch('/api/create_folder', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name, parent_id: currentFolderId || null })
+                    body: JSON.stringify({ name, parent_id: currentFolderId || null, view: currentView })
                 });
                 const result = await parseResponseJson(response);
-                if (response.ok) { showToast('✅ Папка создана'); closeCreateFolderModal(); reloadPreservingScroll(800); }
+                if (response.ok) {
+                    showToast('✅ Папка создана');
+                    closeCreateFolderModal();
+                    const added = insertRowsHtml(result.row_html, 'folder');
+                    if (added) {
+                        adjustCounters(0, added);
+                        refreshDomTotals();
+                        updateSelection();
+                    } else {
+                        reloadPreservingScroll(800);
+                    }
+                }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally {
@@ -2235,12 +2639,15 @@ HTML_TEMPLATE = """
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ internal_id: internalId })
                 });
+                const data = await parseResponseJson(response);
                 if (response.ok) {
-                    showToast('✅ Удалено');
                     closeDeleteModal();
                     removeRows([internalId]);
+                    const trashIds = data.trash_ids || [];
+                    showToast('✅ Удалено', false,
+                        trashIds.length ? { label: 'Восстановить', onClick: () => undoDelete(trashIds) } : null);
                 }
-                else { const data = await parseResponseJson(response); showToast('❌ ' + (data.error || 'Ошибка'), true); }
+                else { showToast('❌ ' + (data.error || 'Ошибка'), true); }
             } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally {
                 if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
@@ -2281,7 +2688,7 @@ HTML_TEMPLATE = """
         const uploadBtn = document.getElementById('uploadBtn');
         const progressContainer = document.getElementById('progressContainer');
         const progressFill = document.getElementById('progressFill');
-        const toast = document.getElementById('toast');
+        const toastStack = document.getElementById('toastStack');
         // Each queued item carries its own mode/path. This keeps ordinary files
         // and folder uploads from being reinterpreted by a single global flag.
         let selectedUploadFiles = [];  // {file, path, mode, key}
@@ -2340,12 +2747,58 @@ HTML_TEMPLATE = """
             return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' ГБ';
         }
         function escapeHtml(str) { const div = document.createElement('div'); div.textContent = str; return div.innerHTML; }
-        let toastTimer = null;
-        function showToast(msg, isError = false) {
-            clearTimeout(toastTimer);
-            toast.textContent = msg;
-            toast.className = 'toast show' + (isError ? ' error' : '');
-            toastTimer = setTimeout(() => toast.classList.remove('show'), 3500);
+        // Сообщения не вытесняют друг друга: каждое висит своей плашкой,
+        // показываем до 4 одновременно (старейшее уходит первым).
+        const TOAST_LIMIT = 4;
+        function showToast(msg, isError = false, action = null) {
+            if (!toastStack) return;
+            while (toastStack.children.length >= TOAST_LIMIT) {
+                toastStack.removeChild(toastStack.firstChild);
+            }
+            const item = document.createElement('div');
+            item.className = 'toast' + (isError ? ' error' : '');
+            const text = document.createElement('span');
+            text.textContent = msg;
+            item.appendChild(text);
+            if (action && action.label) {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'toast-action';
+                button.textContent = action.label;
+                button.addEventListener('click', () => { item.remove(); action.onClick(); });
+                item.appendChild(button);
+            }
+            toastStack.appendChild(item);
+            requestAnimationFrame(() => item.classList.add('show'));
+            // С действием плашка живёт дольше — чтобы успеть нажать.
+            const lifetime = action ? 10000 : 3500;
+            setTimeout(() => {
+                item.classList.remove('show');
+                setTimeout(() => item.remove(), 300);
+            }, lifetime);
+        }
+        // Возврат удалённых файлов из корзины (undo).
+        async function undoDelete(trashIds) {
+            if (!trashIds || !trashIds.length) return;
+            try {
+                const response = await fetch('/api/trash/restore', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        entry_ids: trashIds, folder_id: currentFolderId || null, view: currentView
+                    })
+                });
+                const result = await parseResponseJson(response);
+                if (!response.ok) { showToast('❌ ' + (result.error || 'Не удалось восстановить'), true); return; }
+                const added = insertRowsHtml(result.rows_html, 'file');
+                if (added) {
+                    adjustCounters(added, 0);
+                    refreshDomTotals();
+                    updateSelection();
+                    showToast(`✅ Восстановлено: ${result.count}`);
+                } else {
+                    reloadPreservingScroll(800);
+                }
+            } catch (err) { showToast('❌ Нет связи с сервером', true); }
         }
         async function parseResponseJson(response) {
             const text = await response.text();
@@ -2420,6 +2873,23 @@ HTML_TEMPLATE = """
             if (currentView === 'table') return '#view-table .file-row';
             if (currentView === 'grid') return '#view-grid .tile[data-file-id]';
             return '#view-list .list-item[data-file-id]';
+        }
+        // Вставка готовых строк (HTML от сервера) в активное представление.
+        // Папки идут перед файлами, файлы — в конец списка.
+        function insertRowsHtml(html, kind) {
+            const target = lazyTarget();
+            if (!target || !html) return 0;
+            const template = document.createElement('template');
+            template.innerHTML = html.trim();
+            const nodes = Array.from(template.content.children);
+            if (!nodes.length) return 0;
+            if (kind === 'folder') {
+                const firstFile = target.querySelector(lazyFileSelector());
+                nodes.forEach(node => firstFile ? target.insertBefore(node, firstFile) : target.appendChild(node));
+            } else {
+                nodes.forEach(node => target.appendChild(node));
+            }
+            return nodes.length;
         }
         async function loadNextPage() {
             if (!lazyNextUrl || lazyLoading) return;
@@ -2503,6 +2973,7 @@ HTML_TEMPLATE = """
             const loadedByBatch = new Map();
             const completedKeys = new Set();
             let savedTotal = 0, failedTotal = 0, lastError = '';
+            let uploadedRowsHtml = '';
 
             const updateProgress = () => {
                 let loaded = 0;
@@ -2519,6 +2990,7 @@ HTML_TEMPLATE = """
                     if (batch.mode === 'folder') fd.append(`path_${i}`, item.path);
                 });
                 fd.append('count', String(batch.items.length));
+                fd.append('view', currentView);
 
                 const xhr = new XMLHttpRequest();
                 xhr.open('POST', batch.mode === 'folder' ? '/upload_folder' : '/upload');
@@ -2536,6 +3008,7 @@ HTML_TEMPLATE = """
                         try {
                             const payload = JSON.parse(xhr.responseText);
                             saved = Number(payload.count);
+                            if (typeof payload.rows_html === 'string') uploadedRowsHtml += payload.rows_html;
                         } catch (err) {
                             saved = 0;
                         }
@@ -2577,7 +3050,16 @@ HTML_TEMPLATE = """
                     showToast(`✅ Загружено: ${savedTotal}`);
                     selectedUploadFiles = [];
                     renderFileList();
-                    reloadAtTop(800);
+                    // Строки вставляются на месте — без перезагрузки страницы.
+                    const added = insertRowsHtml(uploadedRowsHtml, 'file');
+                    if (added) {
+                        adjustCounters(added, 0);
+                        refreshDomTotals();
+                        updateSelection();
+                        progressContainer.style.display = 'none';
+                    } else {
+                        reloadAtTop(800);
+                    }
                 } else {
                     selectedUploadFiles = selectedUploadFiles.filter(item => !completedKeys.has(item.key));
                     renderFileList();
@@ -2862,6 +3344,7 @@ SETTINGS_TEMPLATE = """
                     <button class="btn" type="submit">Сохранить</button>
                     {% if multi_user %}<a class="btn btn-secondary" href="/settings/users">👥 Пользователи</a>{% endif %}
                     <a class="btn btn-secondary" href="/settings/tokens">🔑 API-токены</a>
+                    <a class="btn btn-secondary" href="/trash">🗑️ Корзина</a>
                     <a class="btn btn-secondary" href="/f/">← К файлам</a>
                     <a class="btn btn-secondary" href="/logout">Выйти</a>
                 </div>
@@ -3419,6 +3902,9 @@ def admin_required(f):
 # «что видно» и «что разрешено» становится невозможным.
 app.jinja_env.globals['is_admin'] = is_admin
 app.jinja_env.globals['current_user'] = current_user
+# Строки файлов и папок рисуются общей функцией — и на странице, и во фрагментах.
+app.jinja_env.globals['file_row_html'] = render_file_row
+app.jinja_env.globals['folder_row_html'] = render_folder_row
 
 
 def _session_valid():
@@ -3850,16 +4336,7 @@ def browse_folder(folder_id=None):
     subfolders_data = []
     for fid, f in folders.items():
         if f.get('parent_id') == folder_id:
-            f_count, f_size, f_subdirs = stats_map.get(fid, (0, 0, 0))
-            subfolders_data.append({
-                'id': fid,
-                'name': f['name'],
-                'created': f.get('created', ''),
-                'slug': f.get('slug', ''),
-                'file_count': f_count,
-                'subdir_count': f_subdirs,
-                'size': format_size(f_size),
-            })
+            subfolders_data.append(folder_view_record(fid, folders, stats_map))
 
     if q:
         needle = q.casefold()
@@ -4160,6 +4637,194 @@ def token_revoke():
     app.logger.info('Отозван API-токен: имя=%s, hash=%s…',
                     removed['meta'].get('name', 'без имени'), token_id[:12])
     return redirect('/settings/tokens?revoked=1')
+
+
+# ===== КОРЗИНА: СТРАНИЦА (только администратор) =====
+
+TRASH_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Корзина — АЛЬБИОН</title>
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png') }}">
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Arial, sans-serif; background: #f4f4f9; margin: 0; color: #1e293b; }
+        .header { background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%); color: white; padding: 15px 30px; display: flex; align-items: center; gap: 15px; flex-wrap: wrap; }
+        .header img { height: 42px; background: white; padding: 4px 7px; border-radius: 6px; }
+        .header h1 { margin: 0; font-size: 19px; font-weight: 700; }
+        .header .spacer { margin-left: auto; }
+        .main { max-width: 1000px; margin: 0 auto; padding: 20px 15px; }
+        .card { background: white; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); padding: 18px 20px; margin-bottom: 16px; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th { text-align: left; padding: 8px 10px; color: #1e3a8a; font-size: 12px; text-transform: uppercase; border-bottom: 2px solid #e2e8f0; }
+        td { padding: 8px 10px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
+        .muted { color: #64748b; }
+        .btn { display: inline-block; background: #2563eb; color: white; padding: 7px 14px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; font-size: 13px; }
+        .btn:hover { background: #1e3a8a; }
+        .btn-secondary { background: #e2e8f0; color: #1e293b; }
+        .btn-secondary:hover { background: #cbd5e1; }
+        .btn-danger { background: #dc3545; }
+        .btn-danger:hover { background: #b02a37; }
+        .btn:focus-visible, a:focus-visible { outline: 2px solid #f59e0b; outline-offset: 2px; }
+        .toast { background: #dcfce7; color: #166534; padding: 10px 14px; border-radius: 6px; margin-bottom: 15px; font-size: 13px; }
+        .empty { text-align: center; padding: 40px 20px; color: #94a3b8; }
+        form.inline { display: inline; }
+        h2 { color: #1e3a8a; font-size: 16px; margin: 0 0 12px; }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <img src="{{ url_for('static', filename='logo.png') }}" alt="АЛЬБИОН">
+        <div>
+            <h1>🗑️ Корзина</h1>
+        </div>
+        <div class="spacer"></div>
+        <a href="/f/" class="btn btn-secondary">← К файлам</a>
+        <a href="/settings" class="btn btn-secondary">⚙️ Настройки</a>
+    </header>
+    <div class="main">
+        {% if restored %}<div class="toast">Файлы восстановлены.</div>{% endif %}
+        {% if purged %}<div class="toast">Корзина очищена ({{ purged }}).</div>{% endif %}
+        <div class="card">
+            <h2>Удалённые файлы хранятся {{ retention_days }} дней и затем удаляются автоматически</h2>
+            {% if entries %}
+            <p class="muted">Занято в корзине: {{ total_size }}. Такие файлы не входят в квоты.</p>
+            <form method="post" action="/trash/empty" onsubmit="return confirm('Удалить всё из корзины безвозвратно?');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="btn btn-danger" type="submit">Очистить корзину</button>
+            </form>
+            <table>
+                <thead><tr><th>Имя</th><th>Исходная папка</th><th>Размер</th><th>Удалён</th><th>Осталось</th><th></th></tr></thead>
+                <tbody>
+                {% for entry in entries %}
+                <tr>
+                    <td>{{ entry.name }}</td>
+                    <td class="muted">{{ entry.folder_label }}</td>
+                    <td>{{ entry.size }}</td>
+                    <td class="muted">{{ entry.deleted_at }}</td>
+                    <td>{{ entry.days_left }}</td>
+                    <td>
+                        <form class="inline" method="post" action="/trash/restore">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <input type="hidden" name="entry_id" value="{{ entry.id }}">
+                            <button class="btn" type="submit">Восстановить</button>
+                        </form>
+                        <form class="inline" method="post" action="/trash/purge">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <input type="hidden" name="entry_id" value="{{ entry.id }}">
+                            <button class="btn btn-secondary" type="submit">Удалить навсегда</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <div class="empty">Корзина пуста.</div>
+            {% endif %}
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
+def _trash_entry_rows(trash, folders):
+    """Строки корзины для страницы, отсортированные по дате удаления."""
+    rows = []
+    now = datetime.now(timezone.utc)
+    for entry_id, entry in trash.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            deleted = datetime.fromisoformat(str(entry.get('deleted_at')))
+        except (TypeError, ValueError):
+            deleted = None
+        if deleted is not None and deleted.tzinfo is None:
+            deleted = deleted.replace(tzinfo=timezone.utc)
+        days_left = ''
+        if deleted is not None:
+            remaining = TRASH_RETENTION_DAYS - (now - deleted).days
+            days_left = f'{max(0, remaining)} дн.'
+        folder_id = entry.get('folder_id')
+        rows.append({
+            'id': entry_id,
+            'name': entry.get('name') or '—',
+            'folder_label': ' / '.join(get_folder_path(folder_id, folders)) if folder_id in folders else 'Корень',
+            'size': format_size(entry.get('size', 0)),
+            'deleted_at': deleted.astimezone(timezone.utc).strftime('%d.%m.%Y %H:%M') if deleted else '—',
+            'days_left': days_left,
+            'sort_key': str(entry.get('deleted_at') or ''),
+        })
+    rows.sort(key=lambda item: item['sort_key'], reverse=True)
+    return rows
+
+
+def _render_trash_page(restored=None, purged=None):
+    purge_expired_trash()
+    trash = load_trash()
+    folders = load_folders()
+    entries = _trash_entry_rows(trash, folders)
+    total_size = sum(entry.get('size', 0) for entry in trash.values() if isinstance(entry, dict))
+    body = render_template_string(
+        TRASH_TEMPLATE,
+        entries=entries,
+        total_size=format_size(total_size),
+        retention_days=TRASH_RETENTION_DAYS,
+        restored=restored,
+        purged=purged,
+        csrf_token=session.setdefault('_csrf_token', secrets.token_urlsafe(32)),
+    )
+    return body, 200, {'Cache-Control': 'no-store', 'Pragma': 'no-cache'}
+
+
+@app.route('/trash')
+@admin_required
+def trash_page():
+    return _render_trash_page(restored=request.args.get('restored') == '1')
+
+
+@app.route('/trash/restore', methods=['POST'])
+@admin_required
+@serialized_mutation
+def trash_page_restore():
+    entry_id = request.form.get('entry_id', '').strip()
+    if entry_id:
+        trash = load_trash()
+        if entry_id in trash:
+            db = load_db()
+            folders = load_folders()
+            restore_trash_entries([entry_id], folders, db, trash)
+            save_db(db)
+            save_trash(trash)
+    return redirect('/trash?restored=1')
+
+
+@app.route('/trash/purge', methods=['POST'])
+@admin_required
+@serialized_mutation
+def trash_page_purge():
+    entry_id = request.form.get('entry_id', '').strip()
+    if entry_id:
+        trash = load_trash()
+        if purge_trash_entry(entry_id, trash):
+            save_trash(trash)
+    return redirect('/trash')
+
+
+@app.route('/trash/empty', methods=['POST'])
+@admin_required
+@serialized_mutation
+def trash_page_empty():
+    trash = load_trash()
+    purged = len(trash)
+    for entry_id in list(trash):
+        purge_trash_entry(entry_id, trash)
+    save_trash(trash)
+    return redirect(f'/trash?purged={purged}')
 
 
 # ===== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ (только администратор) =====
@@ -4919,24 +5584,18 @@ def integration_delete_file(file_id):
         return jsonify({'error': 'Файл находится в другой папке'}), 403
 
     physical_path = record.get('physical_path') or record.get('current_filename')
-    filepath = safe_upload_path(physical_path)
-    if filepath is None:
+    if safe_upload_path(physical_path) is None:
         app.logger.error('Интеграционное удаление: небезопасный путь %r', physical_path)
         return jsonify({'error': 'Небезопасный путь файла'}), 400
 
-    if os.path.exists(filepath):
-        try:
-            os.remove(filepath)
-        except OSError as exc:
-            app.logger.error('Интеграционное удаление: не удалось удалить %s: %s',
-                             physical_path, exc)
-            return jsonify({'error': 'Не удалось удалить файл'}), 500
-
-    db.pop(file_id, None)
+    trash = load_trash()
+    entry_id = move_file_to_trash(file_id, record, db, trash)
     save_db(db)
+    if entry_id:
+        save_trash(trash)
     app.logger.info('Интеграционное удаление: токен=%s, файл=%s',
                     meta.get('name'), physical_path)
-    return jsonify({'deleted': True, 'file_id': file_id})
+    return jsonify({'deleted': True, 'file_id': file_id, 'trash_id': entry_id})
 
 @app.route('/upload', methods=['POST'])
 @login_required
@@ -4966,6 +5625,7 @@ def upload_file():
 
     with UPLOAD_LOCK:
         saved_count = 0
+        created_ids = []
         db = load_db()
 
         capacity_error = upload_capacity_error(request.content_length, db)
@@ -5034,6 +5694,7 @@ def upload_file():
                 'is_image': ext in IMAGE_EXTENSIONS
             }
             saved_count += 1
+            created_ids.append(internal_id)
             app.logger.info('Загружен файл: %s (%s), короткая ссылка: /%s',
                             physical_path, format_size(os.path.getsize(save_path)), db[internal_id]['slug'])
 
@@ -5042,7 +5703,10 @@ def upload_file():
             update_last_upload()
             app.logger.info('Загрузка завершена: %d файл(ов) в папку %s', saved_count, folder_id or 'корень')
 
-    return jsonify({'count': saved_count})
+    view = request.form.get('view') if request.form.get('view') in BROWSE_VIEWS else 'table'
+    rows_html = ''.join(str(render_file_row(file_view_record(fid, db[fid]), view))
+                        for fid in created_ids if fid in db)
+    return jsonify({'count': saved_count, 'rows_html': rows_html, 'view': view})
 
 @app.route('/upload_folder', methods=['POST'])
 @login_required
@@ -5062,6 +5726,7 @@ def upload_folder():
 
     saved_count = 0
     created_folders = set()
+    created_ids = []
 
     file_data = []
     for i in range(count):
@@ -5162,6 +5827,7 @@ def upload_folder():
                 'is_image': ext in IMAGE_EXTENSIONS
             }
             saved_count += 1
+            created_ids.append(internal_id)
             app.logger.info('Загружен файл из папки: %s (%s), короткая ссылка: /%s',
                             physical_path, format_size(os.path.getsize(save_path)), db[internal_id]['slug'])
 
@@ -5171,7 +5837,17 @@ def upload_folder():
 
     app.logger.info('Загрузка папки завершена: %d файл(ов), %d папок создано (принято в запросе: %d)',
                     saved_count, len(created_folders), count)
-    return jsonify({'count': saved_count, 'folders_created': len(created_folders)})
+    view = request.form.get('view') if request.form.get('view') in BROWSE_VIEWS else 'table'
+    stats_map = get_folder_stats_map(folders, db)
+    rows_html = ''.join(str(render_file_row(file_view_record(fid, db[fid]), view))
+                        for fid in created_ids if fid in db)
+    # В текущем списке видны только папки — прямые потомки открытой папки.
+    rows_html += ''.join(
+        str(render_folder_row(folder_view_record(fid, folders, stats_map), view))
+        for fid in created_folders
+        if fid in folders and folders[fid].get('parent_id') == folder_id)
+    return jsonify({'count': saved_count, 'folders_created': len(created_folders),
+                    'rows_html': rows_html, 'view': view})
 
 @app.route('/thumb/<size>/<file_id>', methods=['GET', 'HEAD'])
 @limiter.exempt
@@ -5325,7 +6001,10 @@ def update_file():
         record['custom_alias'] = custom_alias
 
     save_db(db)
-    return jsonify({'success': True})
+    view = data.get('view') if data.get('view') in BROWSE_VIEWS else 'table'
+    row_html = str(render_file_row(file_view_record(internal_id, record), view))
+    return jsonify({'success': True, 'row_html': row_html, 'view': view,
+                    'folder_id': record.get('folder_id')})
 
 @app.route('/api/move_file', methods=['POST'])
 @login_required
@@ -5502,8 +6181,9 @@ def delete_files_batch():
         return jsonify({'error': 'Не выбраны файлы'}), 400
 
     db = load_db()
-    deleted_count = 0
+    trash = load_trash()
     deleted_ids = []
+    trash_ids = []
 
     for file_id in file_ids:
         if file_id not in db:
@@ -5511,22 +6191,20 @@ def delete_files_batch():
 
         record = db[file_id]
         physical_path = record.get('physical_path', record['current_filename'])
-        filepath = safe_upload_path(physical_path)
-        if filepath is None:
+        if safe_upload_path(physical_path) is None:
             app.logger.error('Удаление отклонено: небезопасный путь %r', physical_path)
             continue
 
-        if os.path.exists(filepath):
-            try:
-                os.remove(filepath)
-                del db[file_id]
-                deleted_count += 1
-                deleted_ids.append(file_id)
-            except Exception as e:
-                continue
+        entry_id = move_file_to_trash(file_id, record, db, trash)
+        deleted_ids.append(file_id)
+        if entry_id:
+            trash_ids.append(entry_id)
 
     save_db(db)
-    return jsonify({'success': True, 'count': deleted_count, 'deleted_ids': deleted_ids})
+    if trash_ids:
+        save_trash(trash)
+    return jsonify({'success': True, 'count': len(deleted_ids),
+                    'deleted_ids': deleted_ids, 'trash_ids': trash_ids})
 
 @app.route('/api/create_folder', methods=['POST'])
 @login_required
@@ -5566,7 +6244,10 @@ def create_folder():
     os.makedirs(physical_path, exist_ok=True)
 
     save_folders(folders)
-    return jsonify({'success': True, 'folder_id': folder_id})
+    view = data.get('view') if data.get('view') in BROWSE_VIEWS else 'table'
+    stats_map = get_folder_stats_map(folders, load_db())
+    row_html = str(render_folder_row(folder_view_record(folder_id, folders, stats_map), view))
+    return jsonify({'success': True, 'folder_id': folder_id, 'row_html': row_html, 'view': view})
 
 @app.route('/api/delete_folder', methods=['POST'])
 @login_required
@@ -5583,54 +6264,132 @@ def delete_folder():
     if folder_id not in folders:
         return jsonify({'error': 'Папка не найдена'}), 404
 
-    subtree = set()
-    stack = [folder_id]
-    while stack:
-        current_id = stack.pop()
-        if current_id in subtree or current_id not in folders:
-            continue
-        subtree.add(current_id)
-        stack.extend(fid for fid, rec in folders.items() if rec.get('parent_id') == current_id)
-    for rec in db.values():
-        if rec.get('folder_id') in subtree:
-            phys = rec.get('physical_path', rec['current_filename'])
-            if safe_upload_path(phys) is None:
-                return jsonify({'error': 'В БД найден небезопасный путь; удаление отменено'}), 400
-    for current_id in subtree:
-        candidate = get_folder_physical_path(current_id, folders)
-        rel = os.path.relpath(candidate, UPLOAD_FOLDER)
-        if safe_upload_path(rel) is None:
-            return jsonify({'error': 'В БД найден небезопасный путь папки; удаление отменено'}), 400
+    subtree = folder_subtree_ids(folder_id, folders)
+    if folder_subtree_unsafe(subtree, folders, db):
+        return jsonify({'error': 'В БД найден небезопасный путь; удаление отменено'}), 400
 
-    def delete_recursive(fid):
-        files_to_delete = [internal_id for internal_id, record in db.items() if record.get('folder_id') == fid]
-        for internal_id in files_to_delete:
-            physical_path = db[internal_id].get('physical_path', db[internal_id]['current_filename'])
-            full_path = safe_upload_path(physical_path)
-            if full_path is None:
-                raise ValueError(f'Небезопасный путь файла: {physical_path!r}')
-            if os.path.exists(full_path):
-                os.remove(full_path)
-            del db[internal_id]
-
-        subfolders = [fid2 for fid2, f in folders.items() if f.get('parent_id') == fid]
-        for subfolder_id in subfolders:
-            delete_recursive(subfolder_id)
-
-        folder_candidate = get_folder_physical_path(fid, folders)
-        folder_rel = os.path.relpath(folder_candidate, UPLOAD_FOLDER)
-        physical_path = safe_upload_path(folder_rel)
-        if physical_path is None:
-            raise ValueError(f'Небезопасный путь папки: {folder_rel!r}')
-        if os.path.exists(physical_path):
-            shutil.rmtree(physical_path)
-        del folders[fid]
-
-    delete_recursive(folder_id)
+    delete_folder_tree(folder_id, folders, db)
     save_db(db)
     save_folders(folders)
 
     return jsonify({'success': True, 'deleted_folder_ids': sorted(subtree)})
+
+@app.route('/api/delete_folders_batch', methods=['POST'])
+@login_required
+@serialized_mutation
+def delete_folders_batch():
+    """Удаление нескольких выбранных папок (вместе с поддеревьями)."""
+    data = get_json_object()
+    if data is None:
+        return jsonify({'error': 'Ожидается JSON-объект'}), 400
+    raw_ids = data.get('folder_ids', [])
+    if not raw_ids:
+        return jsonify({'error': 'Не выбраны папки'}), 400
+
+    folders = load_folders()
+    db = load_db()
+
+    roots, subtrees = selected_folder_roots(raw_ids, folders)
+    if not roots:
+        return jsonify({'success': True, 'count': 0, 'deleted_folder_ids': []})
+
+    union = set()
+    for fid in roots:
+        union |= subtrees[fid]
+    if folder_subtree_unsafe(union, folders, db):
+        return jsonify({'error': 'В БД найден небезопасный путь; удаление отменено'}), 400
+
+    for fid in roots:
+        delete_folder_tree(fid, folders, db)
+
+    save_db(db)
+    save_folders(folders)
+    return jsonify({'success': True, 'count': len(roots), 'deleted_folder_ids': sorted(roots)})
+
+@app.route('/api/move_folders_batch', methods=['POST'])
+@login_required
+@serialized_mutation
+def move_folders_batch():
+    """Перемещение выбранных папок в другую папку (или в корень)."""
+    data = get_json_object()
+    if data is None:
+        return jsonify({'error': 'Ожидается JSON-объект'}), 400
+    raw_ids = data.get('folder_ids', [])
+    target_folder_id = data.get('target_folder_id') or None
+    if not raw_ids:
+        return jsonify({'error': 'Не выбраны папки'}), 400
+
+    folders = load_folders()
+    db = load_db()
+
+    if target_folder_id and target_folder_id not in folders:
+        return jsonify({'error': 'Целевая папка не найдена'}), 404
+
+    roots, subtrees = selected_folder_roots(raw_ids, folders)
+    if not roots:
+        return jsonify({'success': True, 'count': 0, 'moved_ids': []})
+
+    # Цикл: цель не может быть внутри перемещаемого поддерева (иначе папка исчезнет).
+    if target_folder_id:
+        for fid in roots:
+            if target_folder_id == fid or target_folder_id in subtrees[fid]:
+                return jsonify({'error': 'Нельзя переместить папку внутрь себя'}), 400
+
+    to_move = [fid for fid in roots if folders[fid].get('parent_id') != target_folder_id]
+    if not to_move:
+        return jsonify({'success': True, 'count': 0, 'moved_ids': []})
+
+    # Коллизия имён на целевом уровне: и с существующими, и между перемещаемыми.
+    moving = set(to_move)
+    taken = {f['name'] for fid2, f in folders.items()
+             if fid2 not in moving and f.get('parent_id') == target_folder_id}
+    for fid in to_move:
+        name = folders[fid]['name']
+        if name in taken:
+            return jsonify({'error': f'Папка «{name}» уже есть в целевой папке'}), 400
+        taken.add(name)
+
+    target_physical = get_folder_physical_path(target_folder_id, folders)
+    target_rel = os.path.relpath(target_physical, UPLOAD_FOLDER)
+    if safe_upload_path(target_rel, allow_root=True) is None:
+        return jsonify({'error': 'Небезопасный путь назначения'}), 400
+    os.makedirs(target_physical, exist_ok=True)
+
+    moved_ids = []
+    for fid in to_move:
+        old_dir = get_folder_physical_path(fid, folders)
+        old_rel_dir = os.path.relpath(old_dir, UPLOAD_FOLDER)
+        new_dir = os.path.join(target_physical, folders[fid]['name'])
+        new_rel_dir = os.path.relpath(new_dir, UPLOAD_FOLDER)
+
+        if safe_upload_path(old_rel_dir) is None or safe_upload_path(new_rel_dir) is None:
+            continue
+        if os.path.exists(new_dir):   # коллизия на диске (файл или папка)
+            continue
+
+        if os.path.exists(old_dir):
+            try:
+                os.rename(old_dir, new_dir)
+            except OSError as exc:
+                app.logger.error('Перемещение папки: не удалось переименовать %s: %s', old_rel_dir, exc)
+                continue
+
+        # Каталог переехал целиком — переписываем physical_path всех файлов поддерева.
+        for rec in db.values():
+            if rec.get('folder_id') not in subtrees[fid]:
+                continue
+            phys = rec.get('physical_path', rec.get('current_filename'))
+            if phys == old_rel_dir:
+                rec['physical_path'] = new_rel_dir
+            elif phys.startswith(old_rel_dir + os.sep):
+                rec['physical_path'] = new_rel_dir + phys[len(old_rel_dir):]
+
+        folders[fid]['parent_id'] = target_folder_id
+        moved_ids.append(fid)
+
+    save_db(db)
+    save_folders(folders)
+    return jsonify({'success': True, 'count': len(moved_ids), 'moved_ids': moved_ids})
 
 @app.route('/api/delete_file', methods=['POST'])
 @login_required
@@ -5647,40 +6406,85 @@ def delete_file():
 
     record = db[internal_id]
     physical_path = record.get('physical_path', record['current_filename'])
-    filepath = safe_upload_path(physical_path)
-    if filepath is None:
+    if safe_upload_path(physical_path) is None:
         return jsonify({'error': 'Небезопасный путь файла'}), 400
 
-    if os.path.exists(filepath):
-        try:
-            os.remove(filepath)
-        except Exception as e:
-            return jsonify({'error': f'Ошибка: {str(e)}'}), 500
-
-    del db[internal_id]
+    trash = load_trash()
+    entry_id = move_file_to_trash(internal_id, record, db, trash)
     save_db(db)
-    return jsonify({'success': True, 'deleted_ids': [internal_id]})
+    if entry_id:
+        save_trash(trash)
+    return jsonify({'success': True, 'deleted_ids': [internal_id],
+                    'trash_ids': [entry_id] if entry_id else []})
+
+@app.route('/api/trash/restore', methods=['POST'])
+@login_required
+@serialized_mutation
+def trash_restore():
+    """Возвращает файлы из корзины: в исходную папку или в корень."""
+    data = get_json_object()
+    if data is None:
+        return jsonify({'error': 'Ожидается JSON-объект'}), 400
+    entry_ids = data.get('entry_ids', [])
+    if not entry_ids:
+        return jsonify({'error': 'Не выбраны записи корзины'}), 400
+    view = data.get('view') if data.get('view') in BROWSE_VIEWS else 'table'
+    client_folder = data.get('folder_id') or None
+
+    trash = load_trash()
+    db = load_db()
+    folders = load_folders()
+    restored_ids, rows_html = restore_trash_entries(
+        entry_ids, folders, db, trash, view=view, client_folder=client_folder)
+
+    save_db(db)
+    save_trash(trash)
+    return jsonify({'success': True, 'count': len(restored_ids), 'restored_ids': restored_ids,
+                    'rows_html': rows_html, 'view': view})
+
+@app.route('/api/trash/purge', methods=['POST'])
+@login_required
+@serialized_mutation
+def trash_purge():
+    """Окончательно удаляет записи корзины (по ids или всю)."""
+    data = get_json_object() or {}
+    entry_ids = data.get('entry_ids') or []
+    trash = load_trash()
+    if entry_ids:
+        purged = sum(1 for entry_id in entry_ids if purge_trash_entry(entry_id, trash))
+    else:
+        purged = len(trash)
+        for entry_id in list(trash):
+            purge_trash_entry(entry_id, trash)
+    save_trash(trash)
+    return jsonify({'success': True, 'count': purged})
 
 @app.route('/api/get_all_folders')
 @login_required
 def get_all_folders():
     folders = load_folders()
     result = []
-    
-    def add_folder(fid, depth):
+
+    def add_folder(fid, depth, seen):
+        # seen защищает от циклов в parent_id (бесконечная рекурсия).
+        if fid in seen:
+            return
+        seen.add(fid)
+        # parent_id нужен клиенту, чтобы исключить перемещаемые папки и их потомков.
         result.append({
             'id': fid,
             'name': folders[fid]['name'],
-            'depth': depth
+            'depth': depth,
+            'parent_id': folders[fid].get('parent_id'),
         })
         for fid2, f in folders.items():
             if f.get('parent_id') == fid:
-                add_folder(fid2, depth + 1)
-    
+                add_folder(fid2, depth + 1, seen)
+
     for fid, f in folders.items():
         if f.get('parent_id') is None:
-            add_folder(fid, 0)
-    
+            add_folder(fid, 0, set())
+
     return jsonify(result)
 
 
