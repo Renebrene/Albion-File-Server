@@ -23,6 +23,7 @@ const allSteps = [
   '10 select all found across lazy pages, selection survives filter',
   '11 upload queue guard and filter auto-apply',
   '12 delete and move update rows without reload',
+  '13 keyboard focus and user chip',
 ];
 
 async function runStep(name, fn) {
@@ -432,6 +433,31 @@ await runStep('12 delete and move update rows without reload', async () => {
   assert.equal(await page.evaluate(() => window.__noReload), 'kept', 'перемещение не перезагружает страницу');
   assert.equal(await page.locator('#view-table .file-row').count(), rowsBeforeMove - 1,
     'перемещённая строка исчезла из текущей папки');
+});
+
+await runStep('13 keyboard focus and user chip', async () => {
+  await page.goto(FOLDER_URL);
+  await page.waitForSelector('#view-table .file-row');
+
+  // Шапка: индикатор вошедшего пользователя и роль.
+  const chip = page.locator('.user-chip');
+  assert.equal(await chip.count(), 1, 'чип пользователя в шапке');
+  const chipText = await chip.innerText();
+  assert.match(chipText, /e2e/, 'логин в чипе');
+  assert.match(chipText, /админ/i, 'бейдж роли');
+
+  // Строка таблицы фокусируема с клавиатуры, действия имеют aria-label.
+  const row = page.locator('#view-table .file-row').first();
+  assert.equal(await row.getAttribute('tabindex'), '0', 'строка фокусируема');
+  await row.focus();
+  const active = await page.evaluate(() => ({
+    inRow: !!document.activeElement?.closest?.('.file-row'),
+  }));
+  assert.ok(active.inRow, 'фокус остаётся на строке файла');
+
+  const editButton = row.locator('button[title="Редактировать"]');
+  const editLabel = await editButton.getAttribute('aria-label');
+  assert.ok(editLabel && editLabel.startsWith('Редактировать'), 'aria-label у кнопки редактирования');
 });
 
 } catch (error) {

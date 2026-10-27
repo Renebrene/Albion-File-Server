@@ -283,7 +283,8 @@ class ServerSmokeTests(unittest.TestCase):
         missing = self.client.post('/api/select_by_filter', json={'folder_id': 'нет-такой'})
         self.assertEqual(missing.status_code, 404)
         anon = server.app.test_client()
-        self.assertEqual(anon.post('/api/select_by_filter', json={}).status_code, 302)
+        # /api/ без сессии отвечает явным 401, чтобы fetch не следовал за редиректом.
+        self.assertEqual(anon.post('/api/select_by_filter', json={}).status_code, 401)
 
     def test_batch_move_and_delete(self):
         self.login()
@@ -379,6 +380,39 @@ class ServerSmokeTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(os.path.dirname(old_path), 'after.txt')),
                          'файл не должен быть переименован при ошибке алиаса')
         self.assertEqual(server.load_db()[fid]['current_filename'], 'before.txt')
+
+    def test_api_requires_login_returns_json_401(self):
+        """Для /api/ истёкшая сессия — явный 401, а не HTML-редирект."""
+        response = self.anon.post('/api/delete_file', json={'internal_id': 'x'})
+        self.assertEqual(response.status_code, 401)
+        self.assertIn('Сессия истекла', response.get_json()['error'])
+
+    def test_ui_accessibility_markup(self):
+        self.login()
+        self.client.post('/upload', data={'count': '1', 'file_0': (io.BytesIO(b'x'), 'ui.txt')},
+                         content_type='multipart/form-data')
+        self.client.post('/api/create_folder', json={'name': 'UIFolder'})
+        body = self.client.get('/f/').get_data(as_text=True)
+        self.assertIn('class="user-chip"', body)
+        self.assertIn('role-badge', body)
+        self.assertIn('data-label="Имя"', body)
+        self.assertIn('data-label="Размер"', body)
+        self.assertIn('aria-label="Редактировать ui.txt"', body)
+        self.assertIn('id="batchResult" role="status" aria-live="polite"', body)
+        self.assertIn('@keyframes albion-spin', body)
+        self.assertIn('td[data-label]::before', body)
+        self.assertIn('is-busy', body)
+
+    def test_public_page_accessibility_markup(self):
+        self.login()
+        folder = self.client.post('/api/create_folder', json={'name': 'Pub'}).get_json()['folder_id']
+        self.client.post('/upload', data={'count': '1', 'folder_id': folder,
+                                          'file_0': (io.BytesIO(b'x'), 'pub.txt')},
+                         content_type='multipart/form-data')
+        body = self.anon.get(f'/d/{folder}').get_data(as_text=True)
+        self.assertIn('aria-label="Показать ещё файлы"', body)
+        self.assertIn('id="publicLazyStatus" role="status" aria-live="polite"', body)
+        self.assertIn('lazy-more:focus-visible', body)
 
     def test_redis_budget_branch(self):
         class FakeRedis:

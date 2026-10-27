@@ -920,6 +920,9 @@ HTML_TEMPLATE = """
         .header-logo { height: 50px; width: auto; background: white; padding: 5px 8px; border-radius: 6px; }
         .header-title { font-size: 24px; font-weight: 700; margin: 0; }
         .header-subtitle { font-size: 13px; opacity: 0.85; margin-top: 2px; }
+        .header-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+        .user-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 14px; background: rgba(255,255,255,.14); font-size: 13px; white-space: nowrap; }
+        .role-badge { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .3px; padding: 1px 7px; border-radius: 9px; background: rgba(255,255,255,.28); }
 
         .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; padding: 15px 25px; gap: 12px; }
         .card { background: white; padding: 15px 20px; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); flex-shrink: 0; }
@@ -948,6 +951,9 @@ HTML_TEMPLATE = """
         button, .btn { background: #2563eb; color: white; padding: 8px 16px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; font-size: 13px; font-weight: 500; margin-top: 8px; transition: all 0.15s; }
         button:hover, .btn:hover { background: #1e3a8a; }
         button:disabled { background: #ccc; cursor: not-allowed; }
+        .btn:disabled, a.btn[aria-disabled="true"] { opacity: 0.6; cursor: not-allowed; }
+        @keyframes albion-spin { to { transform: rotate(360deg); } }
+        .btn.is-busy::before { content: ''; display: inline-block; width: 12px; height: 12px; margin-right: 6px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: albion-spin 0.7s linear infinite; vertical-align: -2px; }
         .btn-success { background: #28a745; }
         .btn-success:hover { background: #1e7e34; }
         .btn-danger { background: #dc3545; }
@@ -969,6 +975,7 @@ HTML_TEMPLATE = """
 
         .batch-result { padding: 8px 12px; margin-top: 8px; background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 6px; font-size: 13px; }
         .batch-result a { color: #047857; font-weight: 600; }
+        .batch-result.is-error { background: #fef2f2; border-color: #fecaca; color: #b91c1c; }
         .batch-actions { display: none; align-items: center; gap: 10px; padding: 10px 15px; background: #eff6ff; border-radius: 6px; margin-bottom: 12px; }
         .batch-actions.active { display: flex; }
         .batch-actions .count { font-weight: 600; color: #1e3a8a; }
@@ -990,6 +997,7 @@ HTML_TEMPLATE = """
         .files-table th { text-align: left; padding: 8px 12px; color: #1e3a8a; font-weight: 600; border-bottom: 2px solid #e2e8f0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.3px; }
         .files-table td { padding: 6px 12px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
         .files-table tr:hover { background: #f8fafc; }
+        .files-table tr:focus-visible { outline: 2px solid #f59e0b; outline-offset: -2px; background: #eff6ff; }
         .files-table .checkbox-cell { width: 40px; text-align: center; }
         .files-table .icon-cell { width: 40px; text-align: center; }
         .files-table .link-cell { width: 40px; text-align: center; }
@@ -1012,6 +1020,7 @@ HTML_TEMPLATE = """
         .files-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; padding: 4px; }
         .tile { background: white; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; transition: all 0.15s; display: flex; flex-direction: column; position: relative; }
         .tile:hover { border-color: #2563eb; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.15); transform: translateY(-2px); }
+        .tile:focus-within { border-color: #2563eb; box-shadow: 0 0 0 2px #f59e0b; }
         .tile.selected { border-color: #2563eb; background: #dbeafe; }
         .tile.drag-over { border: 2px dashed #2563eb; background: #dbeafe; }
         .tile.dragging { opacity: 0.5; }
@@ -1116,8 +1125,14 @@ HTML_TEMPLATE = """
             .main { padding: 10px; }
             .file-filters input[type="search"] { min-width: 100%; flex-basis: 100%; }
             .file-filters .filter-result { margin-left: 0; }
-            .files-content { overflow-x: auto; }
-            .files-table { min-width: 760px; }
+            .files-table, .files-table tbody, .files-table tr, .files-table td { display: block; width: 100%; box-sizing: border-box; }
+            .files-table { min-width: 0; }
+            .files-table thead { display: none; }
+            .files-table tr { border: 1px solid #e2e8f0; border-radius: 8px; margin-bottom: 10px; padding: 8px 10px; background: #fff; }
+            .files-table td { border: none; padding: 3px 0; }
+            .files-table td[data-label]::before { content: attr(data-label) ": "; color: #64748b; font-size: 12px; }
+            .files-table td.checkbox-cell, .files-table td.link-cell, .files-table td.icon-cell { display: inline-block; width: auto; vertical-align: middle; padding-right: 6px; }
+            .files-table td.actions-cell { padding-top: 6px; }
             .batch-actions { flex-wrap: wrap; }
             .status-bar { font-size: 11px; gap: 10px; padding: 6px 15px; height: auto; min-height: 38px; flex-wrap: wrap; }
         }
@@ -1130,13 +1145,22 @@ HTML_TEMPLATE = """
             <h1 class="header-title">АЛЬБИОН: Файлы</h1>
             <div class="header-subtitle">Файловый сервер для обмена документами</div>
         </div>
-        <a href="/password" class="btn btn-sm" style="margin:0 0 0 auto; background:rgba(255,255,255,.18);" title="Сменить свой пароль">🔒 Пароль</a>
-        {% if is_admin() %}
-        <a href="/settings/tokens" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="API-токены">🔑 Токены</a>
-        <a href="/settings/users" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Пользователи">👥 Пользователи</a>
-        <a href="/settings" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Настройки квот">⚙️ Настройки</a>
-        {% endif %}
-        <a href="/logout" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Завершить сессию">Выйти</a>
+        {% set me = current_user() %}
+        <div class="header-actions">
+            {% if me %}
+            <span class="user-chip" title="Вы вошли как {{ me.login }}">
+                👤 {{ me.display_name or me.login }}
+                <span class="role-badge">{{ 'админ' if me.role == 'admin' else 'пользователь' }}</span>
+            </span>
+            {% endif %}
+            <a href="/password" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Сменить свой пароль" aria-label="Сменить свой пароль">🔒 Пароль</a>
+            {% if is_admin() %}
+            <a href="/settings/tokens" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="API-токены" aria-label="API-токены">🔑 Токены</a>
+            <a href="/settings/users" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Пользователи" aria-label="Пользователи">👥 Пользователи</a>
+            <a href="/settings" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Настройки квот" aria-label="Настройки">⚙️ Настройки</a>
+            {% endif %}
+            <a href="/logout" class="btn btn-sm" style="margin:0; background:rgba(255,255,255,.18);" title="Завершить сессию" aria-label="Выйти">Выйти</a>
+        </div>
     </header>
 
     <div class="main">
@@ -1219,7 +1243,7 @@ HTML_TEMPLATE = """
                 <button class="btn btn-sm file-selection-action" onclick="openBatchMoveModal()">📁 Переместить</button>
                 <button class="btn btn-sm btn-secondary" onclick="clearSelection()">✕ Снять выделение</button>
             </div>
-            <div class="batch-result" id="batchResult" hidden></div>
+            <div class="batch-result" id="batchResult" role="status" aria-live="polite" hidden></div>
 
             <div class="view-switcher">
                 <button class="view-btn {% if view == 'table' %}active{% endif %}" data-view="table" aria-pressed="{{ 'true' if view == 'table' else 'false' }}">🗂 Таблица</button>
@@ -1254,24 +1278,24 @@ HTML_TEMPLATE = """
                             </thead>
                             <tbody>
                                 {% for folder in subfolders %}
-                                <tr class="folder-row" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
+                                <tr class="folder-row" tabindex="0" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
                                     <td class="checkbox-cell"><input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)"></td>
-                                    <td class="link-cell"><button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку">🔗</button></td>
+                                    <td class="link-cell"><button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку" aria-label="Копировать ссылку на папку">🔗</button></td>
                                     <td class="icon-cell"><span class="folder-icon">📁</span></td>
-                                    <td><a href="/f/{{ folder.id }}" style="font-weight: 600;">{{ folder.name }}</a></td>
-                                    <td class="size-col">{% if folder.file_count %}{{ folder.size }}{% else %}—{% endif %}</td>
-                                    <td class="date-col">{{ folder.created }}</td>
-                                    <td class="type-col">Папка · 📄 {{ folder.file_count }} · 📁 {{ folder.subdir_count }}</td>
-                                    <td class="dl-col">—</td>
-                                    <td class="actions-cell">
-                                        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить папку">🗑️</button>
+                                    <td data-label="Имя"><a href="/f/{{ folder.id }}" style="font-weight: 600;">{{ folder.name }}</a></td>
+                                    <td class="size-col" data-label="Размер">{% if folder.file_count %}{{ folder.size }}{% else %}—{% endif %}</td>
+                                    <td class="date-col" data-label="Изменён">{{ folder.created }}</td>
+                                    <td class="type-col" data-label="Тип">Папка · 📄 {{ folder.file_count }} · 📁 {{ folder.subdir_count }}</td>
+                                    <td class="dl-col" data-label="Скачивания">—</td>
+                                    <td class="actions-cell" data-label="Действия">
+                                        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить папку" aria-label="Удалить папку {{ folder.name }}">🗑️</button>
                                     </td>
                                 </tr>
                                 {% endfor %}
                                 {% for f in files %}
-                                <tr class="file-row" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
+                                <tr class="file-row" tabindex="0" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
                                     <td class="checkbox-cell"><input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)"></td>
-                                    <td class="link-cell"><button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку">🔗</button></td>
+                                    <td class="link-cell"><button class="btn btn-sm btn-icon" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку" aria-label="Копировать короткую ссылку">🔗</button></td>
                                     <td class="icon-cell">
                                         {% if f.is_image %}
                                             <img src="{{ f.thumb_url }}" class="thumb-sm" loading="lazy" decoding="async" alt="">
@@ -1279,7 +1303,7 @@ HTML_TEMPLATE = """
                                             <span class="emoji-icon">{{ f.icon }}</span>
                                         {% endif %}
                                     </td>
-                                    <td>
+                                    <td data-label="Имя">
                                         <span style="display: flex; align-items: center; flex-wrap: wrap; gap: 4px;">
                                             {% if f.is_image %}
                                                 <a href="{{ f.view_url }}" target="_blank">{{ f.name }}</a>
@@ -1291,16 +1315,16 @@ HTML_TEMPLATE = """
                                             {% endif %}
                                         </span>
                                     </td>
-                                    <td class="size-col">{{ f.size }}</td>
-                                    <td class="date-col">{{ f.mtime }}</td>
-                                    <td class="type-col">{{ f.ext }}</td>
-                                    <td class="dl-col"><span class="dl-badge">⬇ {{ f.download_count }} | 👁 {{ f.view_count }}</span></td>
-                                    <td class="actions-cell">
+                                    <td class="size-col" data-label="Размер">{{ f.size }}</td>
+                                    <td class="date-col" data-label="Изменён">{{ f.mtime }}</td>
+                                    <td class="type-col" data-label="Тип">{{ f.ext }}</td>
+                                    <td class="dl-col" data-label="Скачивания"><span class="dl-badge">⬇ {{ f.download_count }} | 👁 {{ f.view_count }}</span></td>
+                                    <td class="actions-cell" data-label="Действия">
                                         {% if current_folder %}
-                                        <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить на уровень выше">⬆️</button>
+                                        <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить на уровень выше" aria-label="Переместить на уровень выше">⬆️</button>
                                         {% endif %}
-                                        <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать">✏️</button>
-                                        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить">🗑️</button>
+                                        <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать" aria-label="Редактировать {{ f.name }}">✏️</button>
+                                        <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить" aria-label="Удалить {{ f.name }}">🗑️</button>
                                     </td>
                                 </tr>
                                 {% endfor %}
@@ -1318,8 +1342,8 @@ HTML_TEMPLATE = """
                                     <div class="tile-folder-name">{{ folder.name }}</div>
                                 </a>
                                 <div class="tile-name row-actions">
-                                    <button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку">🔗</button>
-                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить">🗑️</button>
+                                    <button class="btn btn-sm btn-icon" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку" aria-label="Копировать ссылку на папку">🔗</button>
+                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить" aria-label="Удалить папку {{ folder.name }}">🗑️</button>
                                 </div>
                             </div>
                             {% endfor %}
@@ -1328,11 +1352,11 @@ HTML_TEMPLATE = """
                                 <div class="tile-checkbox"><input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)"></div>
                                 <div class="tile-actions">
                                     {% if current_folder %}
-                                    <button onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше">⬆️</button>
+                                    <button onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше" aria-label="Переместить {{ f.name }} на уровень выше">⬆️</button>
                                     {% endif %}
-                                    <button onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать">✏️</button>
-                                    <button onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку">🔗</button>
-                                    <button class="del-btn" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить">🗑️</button>
+                                    <button onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать" aria-label="Редактировать {{ f.name }}">✏️</button>
+                                    <button onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку" aria-label="Копировать короткую ссылку">🔗</button>
+                                    <button class="del-btn" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить" aria-label="Удалить {{ f.name }}">🗑️</button>
                                 </div>
                                 {% if f.is_image %}
                                     <a href="{{ f.view_url }}" target="_blank" class="tile-preview-wrap">
@@ -1358,21 +1382,21 @@ HTML_TEMPLATE = """
                             {% for folder in subfolders %}
                             <div class="list-item folder-item" data-folder-id="{{ folder.id }}" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDropOnFolder(event, '{{ folder.id }}')">
                                 <input type="checkbox" class="folder-checkbox" data-folder-id="{{ folder.id }}" aria-label="Выбрать папку {{ folder.name }}" onchange="updateSelection(this)">
-                                <button class="btn btn-sm btn-icon list-link" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку">🔗</button>
+                                <button class="btn btn-sm btn-icon list-link" onclick='copyToClipboard("{{ base_url }}/d/{{ folder.slug or folder.id }}")' title="Копировать ссылку на папку" aria-label="Копировать ссылку на папку">🔗</button>
                                 <span class="emoji-icon-sm">📁</span>
                                 <div class="list-name-wrap">
                                     <a href="/f/{{ folder.id }}" class="list-name" style="font-weight: 600;">{{ folder.name }}</a>
                                 </div>
                                 <span class="list-date">{{ folder.created }}</span>
                                 <div class="list-actions">
-                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить">🗑️</button>
+                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDeleteFolder("{{ folder.id }}", {{ folder.name | tojson }})' title="Удалить" aria-label="Удалить папку {{ folder.name }}">🗑️</button>
                                 </div>
                             </div>
                             {% endfor %}
                             {% for f in files %}
                             <div class="list-item" draggable="true" ondragstart="handleDragStart(event, '{{ f.internal_id }}')" ondragend="handleDragEnd(event)" data-file-id="{{ f.internal_id }}">
                                 <input type="checkbox" class="file-checkbox" data-file-id="{{ f.internal_id }}" aria-label="Выбрать файл {{ f.name }}" onchange="updateSelection(this)">
-                                <button class="btn btn-sm btn-icon list-link" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку">🔗</button>
+                                <button class="btn btn-sm btn-icon list-link" onclick="copyToClipboard('{{ f.short_url }}')" title="Копировать короткую ссылку" aria-label="Копировать короткую ссылку">🔗</button>
                                 {% if f.is_image %}
                                     <img src="{{ f.thumb_url }}" class="thumb-xs" loading="lazy" decoding="async" alt="">
                                 {% else %}
@@ -1387,10 +1411,10 @@ HTML_TEMPLATE = """
                                 <span class="list-date">{{ f.mtime }}</span>
                                 <div class="list-actions">
                                     {% if current_folder %}
-                                    <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше">⬆️</button>
+                                    <button class="btn btn-sm btn-icon" onclick="moveFileUp('{{ f.internal_id }}')" title="Переместить выше" aria-label="Переместить {{ f.name }} на уровень выше">⬆️</button>
                                     {% endif %}
-                                    <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать">✏️</button>
-                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить">🗑️</button>
+                                    <button class="btn btn-sm btn-icon" onclick='openEditModal("{{ f.internal_id }}", {{ f.name | tojson }}, {{ f.current_filename | tojson }}, {{ f.custom_alias | tojson }}, "{{ f.folder_id or '' }}")' title="Редактировать" aria-label="Редактировать {{ f.name }}">✏️</button>
+                                    <button class="btn btn-sm btn-icon btn-icon-danger" onclick='confirmDelete("{{ f.internal_id }}", {{ f.name | tojson }})' title="Удалить" aria-label="Удалить {{ f.name }}">🗑️</button>
                                 </div>
                             </div>
                             {% endfor %}
@@ -1529,6 +1553,7 @@ HTML_TEMPLATE = """
         const currentView = '{{ view }}';
         const csrfToken = '{{ csrf_token }}';
         const nativeFetch = window.fetch.bind(window);
+        let authRedirectStarted = false;
         window.fetch = (input, init = {}) => {
             const method = (init.method || 'GET').toUpperCase();
             if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
@@ -1536,7 +1561,16 @@ HTML_TEMPLATE = """
                 headers.set('X-CSRF-Token', csrfToken);
                 init = { ...init, headers };
             }
-            return nativeFetch(input, init);
+            return nativeFetch(input, init).then((response) => {
+                // Сессия истекла (401 от /api/): сообщаем и уводим на вход.
+                if (response.status === 401 && !authRedirectStarted) {
+                    authRedirectStarted = true;
+                    showToast('Сессия истекла, войдите заново', true);
+                    const next = encodeURIComponent(window.location.pathname + window.location.search);
+                    setTimeout(() => window.location.assign(`/login?next=${next}`), 800);
+                }
+                return response;
+            });
         };
         let draggedFileId = null;
         let selectedFiles = new Set();
@@ -1685,7 +1719,7 @@ HTML_TEMPLATE = """
                     if (result.moved) removeRows([fileId]);
                 }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
-            } catch (err) { showToast('❌ Ошибка сети', true); }
+            } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally { unlockAction(actionKey); }
         }
 
@@ -1780,9 +1814,13 @@ HTML_TEMPLATE = """
         function setIdleLabel(btn, busyText) {
             if (!btn.dataset.idleLabel) btn.dataset.idleLabel = btn.textContent;
             btn.textContent = busyText;
+            btn.classList.add('is-busy');
+            btn.setAttribute('aria-busy', 'true');
         }
         function restoreIdleLabel(btn) {
             if (btn.dataset.idleLabel) btn.textContent = btn.dataset.idleLabel;
+            btn.classList.remove('is-busy');
+            btn.removeAttribute('aria-busy');
         }
 
         // Очередь загрузки нельзя сохранить между перезагрузками (File-объекты
@@ -1888,7 +1926,7 @@ HTML_TEMPLATE = """
                     showToast(`✅ Выделено найденных: ${selected}`);
                 }
             } catch (err) {
-                showToast('❌ Ошибка сети', true);
+                showToast('❌ Нет связи с сервером', true);
             } finally {
                 restoreIdleLabel(btn);
                 btn.disabled = selectionIncludesAllFound;
@@ -1932,6 +1970,11 @@ HTML_TEMPLATE = """
 
         function setBatchBusy(busy) {
             document.querySelectorAll('#batchActions button').forEach(btn => { btn.disabled = busy; });
+            const bar = document.getElementById('batchActions');
+            if (bar) {
+                if (busy) bar.setAttribute('aria-busy', 'true');
+                else bar.removeAttribute('aria-busy');
+            }
         }
 
         function showBatchResult(url, count, size) {
@@ -1944,6 +1987,16 @@ HTML_TEMPLATE = """
             link.textContent = `⬇ Скачать архив (${count} файл(ов), ${size})`;
             box.appendChild(link);
             box.hidden = false;
+        }
+
+        // Inline-статус в панели пакетных операций: сервер собирает архив одним
+        // ответом, поэтому показываем индетерминированное состояние, без процентов.
+        function showBatchStatus(text, isError = false) {
+            const box = document.getElementById('batchResult');
+            if (!box) return;
+            box.textContent = text;
+            box.classList.toggle('is-error', isError);
+            box.hidden = !text;
         }
 
         async function batchDelete() {
@@ -1964,7 +2017,7 @@ HTML_TEMPLATE = """
                     else reloadPreservingScroll(800);
                 }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
-            } catch (err) { showToast('❌ Ошибка', true); }
+            } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally {
                 if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
                 unlockAction('batch-delete');
@@ -1976,6 +2029,7 @@ HTML_TEMPLATE = """
             if (!lockAction('batch-zip')) return;
             const btn = document.getElementById('batchZipBtn');
             setBatchBusy(true);
+            showBatchStatus('⏳ Собираю архив…');
             if (btn) setIdleLabel(btn, '⏳ Создание архива…');
             try {
                 const response = await fetch('/api/export_zip', {
@@ -1988,8 +2042,15 @@ HTML_TEMPLATE = """
                     showBatchResult(result.url, result.count, result.size);
                     showToast(`✅ Архив готов: ${result.count} файл(ов), ${result.size}. Ссылка скопирована`);
                     setAllSelection(false);
-                } else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
-            } catch (err) { showToast('❌ Ошибка сети', true); }
+                } else {
+                    const message = result.error || 'Не удалось собрать архив';
+                    showBatchStatus('❌ ' + message, true);
+                    showToast('❌ ' + message, true);
+                }
+            } catch (err) {
+                showBatchStatus('❌ Нет связи с сервером', true);
+                showToast('❌ Нет связи с сервером', true);
+            }
             finally {
                 if (btn) restoreIdleLabel(btn);
                 setBatchBusy(false);
@@ -2023,7 +2084,7 @@ HTML_TEMPLATE = """
                     else reloadPreservingScroll(800);
                 }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
-            } catch (err) { showToast('❌ Ошибка', true); }
+            } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally {
                 if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
                 unlockAction('batch-move');
@@ -2044,7 +2105,7 @@ HTML_TEMPLATE = """
                     if (result.moved) removeRows([fileId]);
                 }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
-            } catch (err) { showToast('❌ Ошибка', true); }
+            } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally { unlockAction(actionKey); }
         }
 
@@ -2126,7 +2187,7 @@ HTML_TEMPLATE = """
                 const result = await parseResponseJson(response);
                 if (response.ok) { showToast('✅ Сохранено'); closeEditModal(); reloadPreservingScroll(800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
-            } catch (err) { showToast('❌ Ошибка', true); }
+            } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally {
                 if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
             }
@@ -2153,7 +2214,7 @@ HTML_TEMPLATE = """
                 const result = await parseResponseJson(response);
                 if (response.ok) { showToast('✅ Папка создана'); closeCreateFolderModal(); reloadPreservingScroll(800); }
                 else { showToast('❌ ' + (result.error || 'Ошибка'), true); }
-            } catch (err) { showToast('❌ Ошибка', true); }
+            } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally {
                 if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
             }
@@ -2180,7 +2241,7 @@ HTML_TEMPLATE = """
                     removeRows([internalId]);
                 }
                 else { const data = await parseResponseJson(response); showToast('❌ ' + (data.error || 'Ошибка'), true); }
-            } catch (err) { showToast('❌ Ошибка', true); }
+            } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally {
                 if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
             }
@@ -2207,7 +2268,7 @@ HTML_TEMPLATE = """
                     removeRows([], [folderId]);
                 }
                 else { const data = await parseResponseJson(response); showToast('❌ ' + (data.error || 'Ошибка'), true); }
-            } catch (err) { showToast('❌ Ошибка', true); }
+            } catch (err) { showToast('❌ Нет связи с сервером', true); }
             finally {
                 if (btn) { restoreIdleLabel(btn); btn.disabled = false; }
             }
@@ -2261,7 +2322,7 @@ HTML_TEMPLATE = """
                 const row = document.createElement('div');
                 row.className = 'file-item';
                 const prefix = item.mode === 'folder' ? '📁 ' : '';
-                row.innerHTML = `<span class="name">${prefix}${escapeHtml(item.path || item.file.name)}</span><span class="size">${formatSize(item.file.size)}</span><button class="remove" data-idx="${idx}">✕</button>`;
+                row.innerHTML = `<span class="name">${prefix}${escapeHtml(item.path || item.file.name)}</span><span class="size">${formatSize(item.file.size)}</span><button class="remove" data-idx="${idx}" aria-label="Убрать ${escapeHtml(item.path || item.file.name)} из очереди">✕</button>`;
                 fileList.appendChild(row);
             });
             fileList.querySelectorAll('.remove').forEach(btn => {
@@ -2583,6 +2644,8 @@ PUBLIC_FOLDER_TEMPLATE = """
         .page-link:hover, .lazy-more:hover { background: #eff6ff; }
         .page-link.active { background: #2563eb; border-color: #2563eb; color: white; font-weight: 600; }
         .page-ellipsis { color: #94a3b8; padding: 0 2px; }
+        .lazy-more:focus-visible, .item a:focus-visible, .page-link:focus-visible { outline: 2px solid #f59e0b; outline-offset: 2px; }
+        .lazy-more:disabled { opacity: 0.6; cursor: not-allowed; }
         .footer { text-align: center; color: #94a3b8; font-size: 11px; padding: 12px; }
         @media (max-width: 650px) {
             .header { padding: 12px 15px; }
@@ -2643,8 +2706,8 @@ PUBLIC_FOLDER_TEMPLATE = """
             {% endif %}
         </div>
         <div id="publicLazyLoader" class="lazy-loader" data-next-url="{{ next_url or '' }}" {% if not next_url %}hidden{% endif %}>
-            <button type="button" class="lazy-more" id="publicLoadMore" onclick="publicLoadNextPage()">Показать ещё</button>
-            <span id="publicLazyStatus"></span>
+            <button type="button" class="lazy-more" id="publicLoadMore" onclick="publicLoadNextPage()" aria-label="Показать ещё файлы">Показать ещё</button>
+            <span id="publicLazyStatus" role="status" aria-live="polite"></span>
         </div>
         <div class="footer">Файлов: {{ total_files }}</div>
     </div>
@@ -3237,6 +3300,10 @@ def login_required(f):
     def decorated_function(*args, **kwargs):
         if not _session_valid():
             session.clear()
+            # fetch() следует за 302 и получает HTML логина, из-за чего клиент
+            # не замечал истёкшую сессию. Для /api/ отдаём явный 401.
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'Сессия истекла, войдите заново'}), 401
             return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
     return decorated_function

@@ -30,7 +30,29 @@ try {
     { timeout: 15000 },
   );
   assert.deepEqual(errors, [], 'browser errors: ' + errors.join(' | '));
-  console.log('MOBILE_E2E_OK', JSON.stringify(metrics));
+
+  // Админ-страница на телефоне: таблица становится карточками без горизонтального скролла.
+  await page.goto(`${base}/login`);
+  await page.fill('input[name="username"]', 'e2e');
+  await page.fill('input[name="password"]', 'E2E-Password-2026!');
+  await Promise.all([
+    page.waitForURL((url) => url.pathname.startsWith('/f/'), { timeout: 15000 }),
+    page.click('button[type="submit"]'),
+  ]);
+  await page.goto(`${base}/f/11111111-1111-1111-1111-111111111111`);
+  await page.waitForSelector('#view-table .file-row');
+  const adminMetrics = await page.evaluate(() => ({
+    innerWidth,
+    scrollWidth: document.documentElement.scrollWidth,
+    theadDisplay: getComputedStyle(document.querySelector('.files-table thead')).display,
+    rowDisplay: getComputedStyle(document.querySelector('#view-table .file-row')).display,
+  }));
+  assert.equal(adminMetrics.theadDisplay, 'none', 'thead скрыт на мобильном');
+  assert.equal(adminMetrics.rowDisplay, 'block', 'строка таблицы — карточка');
+  assert.ok(adminMetrics.scrollWidth <= adminMetrics.innerWidth + 1,
+    `нет горизонтального скролла (${adminMetrics.scrollWidth} > ${adminMetrics.innerWidth})`);
+  assert.deepEqual(errors, [], 'browser errors: ' + errors.join(' | '));
+  console.log('MOBILE_E2E_OK', JSON.stringify(metrics), JSON.stringify(adminMetrics));
 } finally {
   await browser.close();
 }
